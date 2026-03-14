@@ -27,7 +27,7 @@ import org.iotsplab.akiba.managers.ConfigManager.config
 import org.iotsplab.akiba.managers.ConfigManager.mainConf
 import org.iotsplab.akiba.managers.ConfigManager.mergeConfigs
 import org.iotsplab.akiba.managers.ConfigManager.projectConf
-import org.iotsplab.akiba.utils.io.LoggerFactory
+import org.iotsplab.akiba.utils.LoggerFactory
 import java.io.Closeable
 import java.io.File
 import java.io.IOException

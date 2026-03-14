@@ -1,4 +1,4 @@
-package org.iotsplab.akiba.utils.io
+package org.iotsplab.akiba.utils
 
 import org.apache.logging.log4j.Level
 import org.apache.logging.log4j.LogManager

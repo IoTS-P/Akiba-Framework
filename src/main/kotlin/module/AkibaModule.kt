@@ -29,8 +29,8 @@ import org.iotsplab.akiba.managers.ConfigManager.mainConf
 import org.iotsplab.akiba.managers.ConfigManager.parseModuleConfig
 import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.utils.*
-import org.iotsplab.akiba.utils.ghidra.CoroutineTaskMonitor
-import org.iotsplab.akiba.utils.ghidra.CoroutineTaskMonitor.Companion.asCoroutineAware
+import org.iotsplab.akiba.utils.CoroutineTaskMonitor
+import org.iotsplab.akiba.utils.CoroutineTaskMonitor.Companion.asCoroutineAware
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files

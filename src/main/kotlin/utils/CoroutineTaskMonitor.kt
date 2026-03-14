@@ -1,4 +1,4 @@
-package org.iotsplab.akiba.utils.ghidra
+package org.iotsplab.akiba.utils
 
 import ghidra.util.exception.CancelledException
 import ghidra.util.task.CancelledListener
