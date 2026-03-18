@@ -11,7 +11,6 @@ import org.apache.logging.log4j.Level
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.module.AkibaModule.Companion.DEFAULT_TIMEOUT
-import org.iotsplab.akiba.module.AkibaPackage
 import java.io.File
 import java.net.URL
 import java.net.URLClassLoader
@@ -190,8 +189,7 @@ object ProcedureArgumentsDeserializer: JsonDeserializer<ProcedureArguments>() {
         val tempLoader = URLClassLoader(arrayOf(modulePath.toURI().toURL()))
         val mainClass = tempLoader.loadClass(className)
 
-        if (AkibaModule::class.java.isAssignableFrom(mainClass)
-            || AkibaPackage::class.java.isAssignableFrom(mainClass)) {
+        if (AkibaModule::class.java.isAssignableFrom(mainClass)) {
             globalLogger.info("Got: ${modulePath.name}")
             // If there are dependencies, load them
             getRequireModules(mainClass).forEach { dep ->
@@ -202,7 +200,7 @@ object ProcedureArgumentsDeserializer: JsonDeserializer<ProcedureArguments>() {
             jarNeeded.add(modulePath.toURI().toURL())
         } else
             throw ClassNotFoundException(
-                "Module invalid: $className is not a subclass of `AkibaModule` or `AkibaPackage`")
+                "Module invalid: $className is not a subclass of `AkibaModule`")
     }
 
     private fun getRequireModules(clazz: Class<*>): List<String> {
