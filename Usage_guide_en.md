@@ -304,23 +304,6 @@ Log files are uniformly saved in the `log` directory of the Akiba root directory
 
 ## 5. Script Files
 
-### match_progress_monitor.py
-
-This is a script used to monitor the progress of task processes.
-Usage: No parameters needed. You can modify `kotlin_server_url` to change the Kotlin server URL.
-Dependencies: tqdm
-
-### task_stage_monitor.py
-
-This is a script used to monitor the stage progress of task processes.
-Usage: No parameters needed. You can modify `kotlin_server_url` to change the Kotlin server URL.
-Dependencies: tqdm
-
-### start_monitor.sh
-
-A script used to start two scripts to monitor the progress and stage progress of task processes.
-Dependencies: tmux
-
 ### starter.py
 
 A script used to monitor the execution of the Kotlin process. When the log file has not been updated for more than 20 minutes (configurable), it will restart and resume the process (automatically perform breakpoint continuation).

@@ -300,23 +300,6 @@ Akiba 将不同二进制文件、不同模块产生的日志分开保存，便�
 
 ## 5. 脚本文件
 
-### match_progress_monitor.py
-
-这是一个脚本，用于监控任务进程的进度。
-用法：不需要任何参数，你可以修改 `kotlin_server_url` 来改变 kotlin 服务器的 url
-依赖包：tqdm
-
-### task_stage_monitor.py
-
-这是一个脚本，用于监控任务进程的阶段进度。
-用法：不需要任何参数，你可以修改 `kotlin_server_url` 来改变 kotlin 服务器的 url
-依赖包：tqdm
-
-### start_monitor.sh
-
-一个脚本，用于启动两个脚本，用于监控任务进程的进度和阶段进度。
-依赖：tmux
-
 ### starter.py
 
 一个脚本，用于监控 Kotlin 进程的执行，当日志文件没有更新超过 20 分钟（可配置）时，它将重新启动并恢复进程（自动进行断点续传）。
