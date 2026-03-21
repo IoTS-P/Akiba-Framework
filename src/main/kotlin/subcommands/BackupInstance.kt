@@ -1,6 +1,9 @@
 package org.iotsplab.akiba.subcommands
 
 import org.iotsplab.akiba.client.database.DatabaseClient
+import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.utils.Configs
+import org.iotsplab.akiba.utils.SqlSource
 import picocli.CommandLine
 import kotlin.system.exitProcess
 
@@ -62,6 +65,7 @@ object BackupInstance: Runnable {
     var description: String? = null
 
     override fun run() {
+        ConfigManager.config = Configs(sqlSource = SqlSource(serverIP = host, serverPort = port))
         if (backupType !in listOf("full", "incr")) {
             println("Invalid option, -t / --type must be 'full' / 'incr'")
             exitProcess(1)
@@ -72,7 +76,7 @@ object BackupInstance: Runnable {
         if (!DatabaseClient.testConnection())
             println("Cannot connect to database daemon")
 
-        if (password != null) {
+        if (password == null) {
             print("Enter password:")
             password = System.console().readPassword().joinToString("")
         }

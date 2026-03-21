@@ -1,6 +1,9 @@
 package org.iotsplab.akiba.subcommands
 
 import org.iotsplab.akiba.client.database.DatabaseClient
+import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.utils.Configs
+import org.iotsplab.akiba.utils.SqlSource
 import picocli.CommandLine
 import java.io.Console
 import java.util.concurrent.Callable
@@ -44,12 +47,13 @@ object CreateInstance: Runnable {
     var port: Int = 31777
 
     override fun run() {
+        ConfigManager.config = Configs(sqlSource = SqlSource(serverIP = host, serverPort = port))
         DatabaseClient.urlHeader = "http://$host:$port"
 
         if (!DatabaseClient.testConnection())
             println("Cannot connect to database daemon")
 
-        if (password != null) {
+        if (password == null) {
             print("Enter password:")
             password = System.console().readPassword().joinToString("")
         }

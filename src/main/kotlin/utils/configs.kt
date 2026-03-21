@@ -155,7 +155,7 @@ object ProcedureArgumentsDeserializer: JsonDeserializer<ProcedureArguments>() {
     fun peekAllModules() {
         File("modules").listFiles { _, name ->
             name.endsWith(".jar")
-        } .forEach { filename ->
+        } ?.forEach { filename ->
             val jarFile = JarFile(filename)
             val mainClassAttr: String = (jarFile.manifest.mainAttributes.getValue("Main-Class")) ?: run {
                 globalLogger.warn("Jar file $filename don't have attribute `Main-Class`, skipped")
@@ -166,6 +166,7 @@ object ProcedureArgumentsDeserializer: JsonDeserializer<ProcedureArguments>() {
                 throw IllegalStateException("Conflicted module main class: $it, " +
                         "in ${allModules[mainClassAttr]} and $filename")
             }
+            globalLogger.info("Found: $mainClassAttr in ${filename.name}")
             allModules[mainClassAttr] = filename.toPath()
         }
     }
@@ -219,6 +220,7 @@ object ProcedureArgumentsDeserializer: JsonDeserializer<ProcedureArguments>() {
         }
 
         jarLoaded.addAll(jarNeeded)
+        globalLogger.info("Loading modules: ${jarNeeded.map { it.file }}")
     }
 
     fun loadAllModules(tasks: List<ProcedureArguments>) {

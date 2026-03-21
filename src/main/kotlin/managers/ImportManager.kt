@@ -52,15 +52,15 @@ object ImportManager {
         readConfig()
 
         importList.mapIndexed { idx, entry ->
-            globalLogger.info("Importing [${idx + 1}/${importList.size}] ${entry.path}")
-            val originalChecksum = ProgramManager.getFileMD5Checksum(entry.path)
+            val originalPath = if (entry.path.startsWith("/")) entry.path.absolute()
+                               else Path.of(mainConf.importRoot!!).resolve(entry.path).absolute()
+
+            globalLogger.info("Importing [${idx + 1}/${importList.size}] $originalPath")
+            val originalChecksum = ProgramManager.getFileMD5Checksum(originalPath)
             if (DatabaseClient.checkMD5Duplicate(originalChecksum)) {
                 globalLogger.warn("Found duplicate checksum of ${entry.path}, skipped")
                 return@mapIndexed
             }
-
-            val originalPath = if (entry.path.startsWith("/")) entry.path.absolute()
-            else Path.of(mainConf.importRoot!!).resolve(entry.path).absolute()
 
             // Check if file exists
             if (originalPath.notExists() || !originalPath.isRegularFile()) {

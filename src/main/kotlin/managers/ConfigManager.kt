@@ -67,7 +67,8 @@ object ConfigManager {
 
             conf
         } catch (e: Exception) {
-            globalLogger.error("Exception occurred while loading configs.json: ${e.message}")
+            globalLogger.error("Exception(${e.javaClass.simpleName}) occurred while loading main config: ${e.message}")
+            e.printStackTrace()
             exitProcess(1)
         }
     }

@@ -18,6 +18,16 @@
   // 如假设该文件名为 config.json，则 -c 填充 config.json@main。默认配置即为 configs/config.json@/main
   // 注意：JSON 路径为 Jackson 格式，即以 "/" 分隔，与文件名类似。
   "main": {
+    // username: 用户名，不是 Linux 用户
+    "username": "akiba",
+    // password: 用户密码
+    "password": "akiba",
+    // usingInstance: 使用的数据库实例名称，Akiba 支持多数据库实例保存数据
+    "usingInstance": "akiba",
+    // globalConsoleLogLevel: 全局控制台日志等级。可选值：OFF，TRACE，DEBUG, INFO, WARN, ERROR。
+    "globalConsoleLogLevel": "INFO"
+    // globalFileLogLevel: 全局文件日志等级。可选值：OFF，TRACE，DEBUG, INFO, WARN, ERROR。
+    "globalFileLogLevel": "INFO"
     // general: 通用配置
     "general": {
       // binariesRoot: 二进制文件根目录。Akiba 在导入文件时，会将文件复制到指定目录，并统一命名为 <id>.bin。这里指定的是复制的目标目录。

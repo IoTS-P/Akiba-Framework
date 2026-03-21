@@ -19,6 +19,16 @@ Example configuration file:
   // For example, if the file name is config.json, then -c should be config.json@main. The default configuration is configs/config.json@/main
   // Note: JSON path uses Jackson format, i.e., separated by "/", similar to file names.
   "main": {
+    // username, not Linux user
+    "username": "akiba",
+    // password
+    "password": "akiba",
+    // usingInstance: Name of using database instance, Akiba supports multiple instances
+    "usingInstance": "akiba",
+    // globalConsoleLogLevel: Global console log level. Alternative: OFF, TRACE, DEBUG, INFO, WARN, ERROR
+    "globalConsoleLogLevel": "INFO"
+    // globalFileLogLevel: Global file log level. Alternative: OFF, TRACE, DEBUG, INFO, WARN, ERROR
+    "globalFileLogLevel": "INFO"
     // general: General configuration
     "general": {
       // binariesRoot: Root directory for binary files. When importing files, Akiba will copy files to the specified directory 

@@ -99,7 +99,7 @@ Akiba 还提供以下子命令用于管理数据库实例：
 # 创建名为 test_instance 的实例，用户为 admin，使用默认主机和端口
 ./bin/Akiba instance-create -n test_instance -u admin
 
-# 指定主机和端口
+# 指定 Akiba db daemon 所在主机和端口
 ./bin/Akiba instance-create -n my_instance -u admin -H 192.168.1.100 -p 31777
 ```
 

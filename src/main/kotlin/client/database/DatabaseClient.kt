@@ -33,6 +33,9 @@ import io.ktor.serialization.jackson.jackson
 import io.ktor.websocket.CloseReason
 import io.ktor.websocket.Frame
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.managers.ConfigManager.sqlSource
 import org.iotsplab.akiba.managers.BinaryMetadata
@@ -57,7 +60,7 @@ object DatabaseClient {
             }
         }
         install(WebSockets) {
-            pingInterval = 30.seconds
+            pingInterval = 15.seconds
             contentConverter = JacksonWebsocketContentConverter(
                 jacksonObjectMapper()
                     .registerKotlinModule()
@@ -358,6 +361,7 @@ object DatabaseClient {
     }
 
     fun createInstance(instanceName: String) = runBlocking {
+        globalLogger.info("[CreateInstance] Starting WebSocket connection")
         client.webSocket(
             method = HttpMethod.Get,
             host = sqlSource.serverIP,
@@ -381,6 +385,8 @@ object DatabaseClient {
                         HttpStatusCode.InternalServerError,
                         "Failed to create instance: ${closeMsg!!.message}"
                     )
+                else
+                    globalLogger.info("[CreateInstance] Connection closed normally")
             }
         }
     }
