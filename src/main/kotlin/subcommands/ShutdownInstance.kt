@@ -1,20 +1,18 @@
 package org.iotsplab.akiba.subcommands
 
-import org.iotsplab.akiba.client.database.DatabaseClient
-import org.iotsplab.akiba.managers.ConfigManager
-import org.iotsplab.akiba.utils.Configs
-import org.iotsplab.akiba.utils.SqlSource
 import picocli.CommandLine
-import java.io.Console
-import java.util.concurrent.Callable
+import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.utils.SqlSource
+import org.iotsplab.akiba.utils.Configs
+import org.iotsplab.akiba.client.database.DatabaseClient
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 
 @CommandLine.Command(
-    name = "instance-create",
+    name = "instance-shutdown",
     mixinStandardHelpOptions = true,
-    description = ["Create a new instance"]
+    description = ["Shut down an instance"]
 )
-object CreateInstance: Runnable {
+object ShutdownInstance: Runnable {
     @CommandLine.Option(
         names = ["-i", "--instance"],
         description = ["Name of the instance"],
@@ -67,10 +65,10 @@ object CreateInstance: Runnable {
         }
 
         try {
-            DatabaseClient.createInstance(name)
-            globalLogger.info("Instance $name created successfully")
+            DatabaseClient.shutdownInstance(name)
+            globalLogger.info("Instance $name shut down successfully")
         } catch (e: DatabaseClient.DatabaseDaemonException) {
-            globalLogger.error("Cannot create instance, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
+            globalLogger.error("Cannot shut down instance, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
         }
 
         DatabaseClient.logout()

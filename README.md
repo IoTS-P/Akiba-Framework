@@ -157,4 +157,79 @@ Akiba also provides the following subcommands for managing database instances:
 ./bin/Akiba instance-restore -n new_instance -l daily_backup -u admin -H 192.168.1.100
 ```
 
+#### 4. instance-start - Start a Database Instance
+
+```shell
+./bin/Akiba instance-start -i <instance> -u <user> [other options]
+```
+
+**Required Parameters:**
+- `-i`/`--instance <instance>`: Name of the instance to start
+- `-u`/`--user <username>`: Akiba database username
+
+**Optional Parameters:**
+- `-P`/`--password`: Akiba user password. If not specified, will be prompted interactively
+- `-H`/`--host <host>`: Database daemon host address, default is `127.0.0.1`
+- `-p`/`--port <port>`: Database daemon port, default is `31777`
+- `-h`/`--help`: Show help message and exit
+
+**Examples:**
+```shell
+# Start an instance named test_instance with user admin
+./bin/Akiba instance-start -i test_instance -u admin
+
+# Start an instance with specified host and port
+./bin/Akiba instance-start -i my_instance -u admin -H 192.168.1.100 -p 31777
+```
+
+#### 5. instance-shutdown - Shut Down a Database Instance
+
+```shell
+./bin/Akiba instance-shutdown -i <instance> -u <user> [other options]
+```
+
+**Required Parameters:**
+- `-i`/`--instance <instance>`: Name of the instance to shut down
+- `-u`/`--user <username>`: Akiba database username
+
+**Optional Parameters:**
+- `-P`/`--password`: Akiba user password. If not specified, will be prompted interactively
+- `-H`/`--host <host>`: Database daemon host address, default is `127.0.0.1`
+- `-p`/`--port <port>`: Database daemon port, default is `31777`
+- `-h`/`--help`: Show help message and exit
+
+**Examples:**
+```shell
+# Shut down an instance named test_instance
+./bin/Akiba instance-shutdown -i test_instance -u admin
+
+# Shut down an instance on a specific host
+./bin/Akiba instance-shutdown -i my_instance -u admin -H 192.168.1.100
+```
+
+#### 6. instance-delete - Delete a Database Instance
+
+```shell
+./bin/Akiba instance-delete -i <instance> -u <user> [other options]
+```
+
+**Required Parameters:**
+- `-i`/`--instance <instance>`: Name of the instance to delete
+- `-u`/`--user <username>`: Akiba database username
+
+**Optional Parameters:**
+- `-P`/`--password`: Akiba user password. If not specified, will be prompted interactively
+- `-H`/`--host <host>`: Database daemon host address, default is `127.0.0.1`
+- `-p`/`--port <port>`: Database daemon port, default is `31777`
+- `-h`/`--help`: Show help message and exit
+
+**Examples:**
+```shell
+# Delete an instance named test_instance
+./bin/Akiba instance-delete -i test_instance -u admin
+
+# Delete an instance on a specific host and port
+./bin/Akiba instance-delete -i my_instance -u admin -H 192.168.1.100 -p 31777
+```
+
 Other configuration files need to be saved in `src/main/resources/configs`. For details, see [Usage_guide_en.md](Usage_guide_en.md)

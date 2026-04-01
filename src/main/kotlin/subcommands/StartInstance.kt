@@ -1,20 +1,18 @@
 package org.iotsplab.akiba.subcommands
 
-import org.iotsplab.akiba.client.database.DatabaseClient
-import org.iotsplab.akiba.managers.ConfigManager
-import org.iotsplab.akiba.utils.Configs
-import org.iotsplab.akiba.utils.SqlSource
 import picocli.CommandLine
-import java.io.Console
-import java.util.concurrent.Callable
+import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.utils.SqlSource
+import org.iotsplab.akiba.utils.Configs
+import org.iotsplab.akiba.client.database.DatabaseClient
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 
 @CommandLine.Command(
-    name = "instance-create",
+    name = "instance-start",
     mixinStandardHelpOptions = true,
-    description = ["Create a new instance"]
+    description = ["Start an instance"]
 )
-object CreateInstance: Runnable {
+object StartInstance: Runnable { 
     @CommandLine.Option(
         names = ["-i", "--instance"],
         description = ["Name of the instance"],
@@ -50,7 +48,7 @@ object CreateInstance: Runnable {
     override fun run() {
         ConfigManager.config = Configs(sqlSource = SqlSource(serverIP = host, serverPort = port))
         DatabaseClient.urlHeader = "http://$host:$port"
-
+        
         if (!DatabaseClient.testConnection())
             globalLogger.error("Cannot connect to database daemon")
 
@@ -67,10 +65,11 @@ object CreateInstance: Runnable {
         }
 
         try {
-            DatabaseClient.createInstance(name)
-            globalLogger.info("Instance $name created successfully")
+            DatabaseClient.connectToInstance(name)
+            DatabaseClient.disconnectToInstance(name)
+            globalLogger.info("Instance $name started successfully")
         } catch (e: DatabaseClient.DatabaseDaemonException) {
-            globalLogger.error("Cannot create instance, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
+            globalLogger.error("Cannot start instance, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
         }
 
         DatabaseClient.logout()

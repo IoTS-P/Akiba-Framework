@@ -5,15 +5,16 @@ import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.utils.Configs
 import org.iotsplab.akiba.utils.SqlSource
 import picocli.CommandLine
+import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 
 @CommandLine.Command(
     name = "instance-restore",
     mixinStandardHelpOptions = true,
-    description = ["Restore to a backup of a new instance"]
+    description = ["Restore to a backup of a instance"]
 )
 object RestoreInstance: Runnable {
     @CommandLine.Option(
-        names = ["-n", "--name"],
+        names = ["-i", "--instance"],
         description = ["Name of the instance"],
         required = true
     )
@@ -56,14 +57,27 @@ object RestoreInstance: Runnable {
         DatabaseClient.urlHeader = "http://$host:$port"
 
         if (!DatabaseClient.testConnection())
-            println("Cannot connect to database daemon")
+            globalLogger.error("Cannot connect to database daemon")
 
         if (password == null) {
             print("Enter password:")
             password = System.console().readPassword().joinToString("")
         }
 
-        DatabaseClient.login(user, password!!)
-        DatabaseClient.restoreBackup(name, label)
+        try {
+            DatabaseClient.login(user, password!!)
+        } catch (e: DatabaseClient.DatabaseDaemonException) {
+            globalLogger.error("Cannot login to database daemon, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
+            return
+        }
+        
+        try {
+            DatabaseClient.restoreBackup(name, label)
+            globalLogger.info("Restore completed")
+        } catch (e: DatabaseClient.DatabaseDaemonException) {
+            globalLogger.error("Cannot restore backup, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
+        }
+
+        DatabaseClient.logout()
     }
 }

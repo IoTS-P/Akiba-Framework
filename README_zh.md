@@ -85,7 +85,7 @@ Akiba 还提供以下子命令用于管理数据库实例：
 ```
 
 **必需参数：**
-- `-n`/`--name <名称>`：实例名称
+- `-i`/`--name <名称>`：实例名称
 - `-u`/`--user <用户名>`：Akiba 数据库用户名
 
 **可选参数：**
@@ -138,7 +138,7 @@ Akiba 还提供以下子命令用于管理数据库实例：
 ```
 
 **必需参数：**
-- `-n`/`--name <实例名>`：要创建的恢复目标实例名称
+- `-i`/`--name <实例名>`：要创建的恢复目标实例名称
 - `-l`/`--label <标签>`：备份的标签或别名（来自 instance-backup 的 `-a` 参数）
 - `-u`/`--user <用户名>`：Akiba 数据库用户名
 
@@ -155,6 +155,81 @@ Akiba 还提供以下子命令用于管理数据库实例：
 
 # 从指定主机恢复
 ./bin/Akiba instance-restore -n new_instance -l daily_backup -u admin -H 192.168.1.100
+```
+
+#### 4. instance-start - 启动数据库实例
+
+```shell
+./bin/Akiba instance-start -i <实例名> -u <用户> [其他选项]
+```
+
+**必需参数：**
+- `-i`/`--instance <实例名>`：要启动的实例名称
+- `-u`/`--user <用户名>`：Akiba 数据库用户名
+
+**可选参数：**
+- `-P`/`--password`：Akiba 用户密码。如不指定，将在命令行交互提示输入
+- `-H`/`--host <主机>`：数据库守护程序主机地址，默认为 `127.0.0.1`
+- `-p`/`--port <端口>`：数据库守护程序端口，默认为 `31777`
+- `-h`/`--help`：显示帮助信息并退出
+
+**示例：**
+```shell
+# 启动名为 test_instance 的实例，用户为 admin
+./bin/Akiba instance-start -i test_instance -u admin
+
+# 指定主机和端口启动实例
+./bin/Akiba instance-start -i my_instance -u admin -H 192.168.1.100 -p 31777
+```
+
+#### 5. instance-shutdown - 关闭数据库实例
+
+```shell
+./bin/Akiba instance-shutdown -i <实例名> -u <用户> [其他选项]
+```
+
+**必需参数：**
+- `-i`/`--instance <实例名>`：要关闭的实例名称
+- `-u`/`--user <用户名>`：Akiba 数据库用户名
+
+**可选参数：**
+- `-P`/`--password`：Akiba 用户密码。如不指定，将在命令行交互提示输入
+- `-H`/`--host <主机>`：数据库守护程序主机地址，默认为 `127.0.0.1`
+- `-p`/`--port <端口>`：数据库守护程序端口，默认为 `31777`
+- `-h`/`--help`：显示帮助信息并退出
+
+**示例：**
+```shell
+# 关闭名为 test_instance 的实例
+./bin/Akiba instance-shutdown -i test_instance -u admin
+
+# 关闭指定主机上的实例
+./bin/Akiba instance-shutdown -i my_instance -u admin -H 192.168.1.100
+```
+
+#### 6. instance-delete - 删除数据库实例
+
+```shell
+./bin/Akiba instance-delete -i <实例名> -u <用户> [其他选项]
+```
+
+**必需参数：**
+- `-i`/`--instance <实例名>`：要删除的实例名称
+- `-u`/`--user <用户名>`：Akiba 数据库用户名
+
+**可选参数：**
+- `-P`/`--password`：Akiba 用户密码。如不指定，将在命令行交互提示输入
+- `-H`/`--host <主机>`：数据库守护程序主机地址，默认为 `127.0.0.1`
+- `-p`/`--port <端口>`：数据库守护程序端口，默认为 `31777`
+- `-h`/`--help`：显示帮助信息并退出
+
+**示例：**
+```shell
+# 删除名为 test_instance 的实例
+./bin/Akiba instance-delete -i test_instance -u admin
+
+# 删除指定主机和端口的实例
+./bin/Akiba instance-delete -i my_instance -u admin -H 192.168.1.100 -p 31777
 ```
 
 其他配置文件需要保存到 `src/main/resources/configs`。具体内容请查看 [Usage_guide_zh.md](Usage_guide_zh.md)

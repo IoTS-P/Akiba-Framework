@@ -6,6 +6,7 @@ import org.iotsplab.akiba.utils.Configs
 import org.iotsplab.akiba.utils.SqlSource
 import picocli.CommandLine
 import kotlin.system.exitProcess
+import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 
 @CommandLine.Command(
     name = "instance-backup",
@@ -14,9 +15,9 @@ import kotlin.system.exitProcess
 )
 object BackupInstance: Runnable {
     @CommandLine.Option(
-    names = ["-i", "--instance"],
-    description = ["Name of the instance"],
-    required = true
+        names = ["-i", "--instance"],
+        description = ["Name of the instance"],
+        required = true
     )
     lateinit var instanceName: String
 
@@ -67,21 +68,34 @@ object BackupInstance: Runnable {
     override fun run() {
         ConfigManager.config = Configs(sqlSource = SqlSource(serverIP = host, serverPort = port))
         if (backupType !in listOf("full", "incr")) {
-            println("Invalid option, -t / --type must be 'full' / 'incr'")
+            globalLogger.error("Invalid option, -t / --type must be 'full' / 'incr'")
             exitProcess(1)
         }
 
         DatabaseClient.urlHeader = "http://$host:$port"
 
         if (!DatabaseClient.testConnection())
-            println("Cannot connect to database daemon")
+            globalLogger.error("Cannot connect to database daemon")
 
         if (password == null) {
             print("Enter password:")
             password = System.console().readPassword().joinToString("")
         }
 
-        DatabaseClient.login(user, password!!)
-        DatabaseClient.createBackup(backupType == "full", instanceName, alias, description)
+        try {
+            DatabaseClient.login(user, password!!)
+        } catch (e: DatabaseClient.DatabaseDaemonException) {
+            globalLogger.error("Cannot login to database daemon, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
+            return
+        }
+        
+        try {
+            DatabaseClient.createBackup(backupType == "full", instanceName, alias, description)
+            globalLogger.info("Backup created successfully")
+        } catch (e: DatabaseClient.DatabaseDaemonException) {
+            globalLogger.error("Cannot create backup, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
+        }
+
+        DatabaseClient.logout()
     }
 }

@@ -274,7 +274,10 @@ abstract class AkibaModule (
             if (this.javaClass.annotations.any { it is FailOnCancelled })
                 failureSign = FAILED
         } else {
-            try { taskGlobalMonitor.cancel() } catch (_: Exception) {}
+            try {
+                if (job.isActive)
+                    taskGlobalMonitor.cancel()
+            } catch (_: Exception) {}
         }
 
         if (hasTable)

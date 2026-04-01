@@ -6,9 +6,7 @@ import org.iotsplab.akiba.client.database.DatabaseClient
 import org.iotsplab.akiba.managers.*
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 import org.iotsplab.akiba.managers.WorkspaceManager.project
-import org.iotsplab.akiba.subcommands.BackupInstance
-import org.iotsplab.akiba.subcommands.CreateInstance
-import org.iotsplab.akiba.subcommands.RestoreInstance
+import org.iotsplab.akiba.subcommands.*
 import picocli.CommandLine
 import picocli.CommandLine.ArgGroup
 import sun.misc.Signal
@@ -22,7 +20,10 @@ import kotlin.system.exitProcess
     subcommands = [
         CreateInstance::class,
         BackupInstance::class,
-        RestoreInstance::class
+        RestoreInstance::class,
+        DeleteInstance::class,
+        StartInstance::class,
+        ShutdownInstance::class
     ]
 )
 class Main : Runnable {
