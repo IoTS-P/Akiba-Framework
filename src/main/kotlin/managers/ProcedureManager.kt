@@ -43,11 +43,7 @@ object ProcedureManager {
         }
 
         withContext(coroutineContext + ModuleLogContext(instance.logger)) {
-            if (procedure.timeout < 0) {
-                instance.startProcess()
-            } else {
-                instance.startProcess(procedure.timeout)
-            }
+            instance.startProcess(procedure.timeout)
         }
 
         apiContext.lookup(instance)

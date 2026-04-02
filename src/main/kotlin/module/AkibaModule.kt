@@ -255,11 +255,6 @@ abstract class AkibaModule (
                 failureSign = RUNTIME_ERROR
                 if (hasTable)
                     updateErr("Process out of memory")
-            } catch (e: Exception) {
-                logger.error("Process exception: ${e.message}")
-                failureSign = RUNTIME_ERROR
-                if (hasTable)
-                    updateErr("Process exception: ${e.message}(${e.javaClass.simpleName})")
             } catch (e: Error) {
                 logger.error("Process error: ${e.message}")
                 failureSign = RUNTIME_ERROR
