@@ -1,0 +1,60 @@
+{
+  "metadata": {
+    "description": "Analyze base for ARM Cortex firmwares"
+  },
+  "main": {
+    "username": "akiba",
+    "password": "akiba",
+    "usingInstance": "firmware_dataset",
+    "general": {
+      "binariesRoot": "/data/hongyuan/Akiba/dataset",
+      "processor": "n/a",
+      "autoAnalysisTimeout": 180,
+      "threads": 64
+    },
+    "withGhidraProject": {
+      "projectRoot": "./ghidra_projects",
+      "name": "analyzed_base_backup",
+      "mode": "new",
+      "forkTo": null,
+      "continueLog": null,
+      "overwriteLog": true,
+      "saveProject": true,
+      "noCreateProgram": false
+    },
+    "sqlSource": {
+      "serverIP": "127.0.0.1",
+      "serverPort": "31777",
+      "useSnapshot": "current",
+      "constraint": "WHERE id = 1",
+      "disableUpdate": false
+    },
+    "dbImports": [
+      "firmxray_results.base_address"
+    ],
+    "tasks": [
+      {
+        "mainClassName": "org.iotsplab.akiba.process.FuzzwareGateway",
+        "configKey": "@@/FuzzwareGateway",
+        "consoleLogLevel": "debug",
+        "fileLogLevel": "debug"
+      },
+      {
+        "mainClassName": "org.iotsplab.akiba.process.FirmXRayOnFuzzwareReplay",
+        "configKey": "@@/FirmXRayOnFuzzwareReplayConfig",
+        "tableName": "firmxray_on_fuzzware_replay_results",
+        "consoleLogLevel": "debug",
+        "fileLogLevel": "debug"
+      }
+    ]
+  },
+  "FuzzwareGateway": {
+    "cmdPrefix": ["/bin/zsh", "-ic"],
+    "cmdPredo": "source ~/.zshrc && source /usr/share/virtualenvwrapper/virtualenvwrapper.sh",
+    "regenerateConfig": true,
+    "projectRoot": "fuzzware_on_firmxray"
+  },
+  "FirmXRayOnFuzzwareReplayConfig": {
+    "maxThreads": 64
+  }
+}

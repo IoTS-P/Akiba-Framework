@@ -1,0 +1,41 @@
+{
+  "metadata": {
+    "description": "Akiba Test"
+  },
+  "main": {
+    "username": "akiba",
+    "password": "akiba",
+    "usingInstance": "firmware_dataset",
+    "globalConsoleLogLevel": "INFO",
+    "globalFileLogLevel": "DEBUG",
+    "general": {
+      "binariesRoot": "/data/hongyuan/Akiba/dataset",
+      "importRoot": "/",
+      "processor": "n/a",
+      "autoAnalysisTimeout": 180,
+      "threads": 1
+    },
+    "withGhidraProject": {
+      "projectRoot": "./ghidra_projects",
+      "name": "first_import_2",
+      "mode": "new",
+      "forkTo": null,
+      "continueLog": null,
+      "overwriteLog": true,
+      "saveProject": true,
+      "noCreateProgram": false
+    },
+    "sqlSource": {
+      "serverIP": "127.0.0.1",
+      "serverPort": "31777",
+      "useSnapshot": "current",
+      "constraint": "",
+      "disableUpdate": false
+    },
+    "dbImports": [
+      "firmxray_results",
+      "convert_firm_to_elf_results"
+    ],
+    "tasks": []
+  }
+}
