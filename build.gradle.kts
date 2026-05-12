@@ -58,17 +58,18 @@ dependencies {
 }
 
 application {
+    applicationName = "akiba"
     applicationDefaultJvmArgs = listOf(
         "-Dlog4j.configurationFile=configs/log4j2.xml", "-Dlog4j.skipJansi=false", "-Xss100m")
     mainClass.set("org.iotsplab.akiba.Main")
 }
 
 tasks.distZip {
-    into("akiba_framework-$version/configs/") {
+    into("akiba-$version/configs/") {
         from("src/main/resources/configs/log4j2.xml")
         from("src/main/resources/configs/ghidra_log.xml")
     }
-    into("akiba_framework-$version/scripts") {
+    into("akiba-$version/scripts") {
         from("src/main/scripts/match_progress_monitor.py")
         from("src/main/scripts/task_stage_monitor.py")
         from("src/main/scripts/start_monitor.sh")
@@ -76,7 +77,7 @@ tasks.distZip {
         from("src/main/scripts/starter.py")
         from("src/main/scripts/clear_cache.sh")
     }
-    into("akiba_framework-$version/scripts/util") {
+    into("akiba-$version/scripts/util") {
         from("src/main/scripts/util/colorama_extension.py")
     }
 }

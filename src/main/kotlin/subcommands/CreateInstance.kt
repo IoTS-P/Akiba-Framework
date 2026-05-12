@@ -1,6 +1,6 @@
 package org.iotsplab.akiba.subcommands
 
-import org.iotsplab.akiba.client.database.DatabaseClient
+import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.utils.Configs
 import org.iotsplab.akiba.utils.SqlSource

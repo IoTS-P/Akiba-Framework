@@ -1,4 +1,4 @@
-package org.iotsplab.akiba.client.database
+package org.iotsplab.akiba.data.database
 
 import org.iotsplab.akiba.managers.ConfigManager.config
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
@@ -9,10 +9,10 @@ object LocalCacheDatabase {
     var dataSource: PGSimpleDataSource? = null
 
     init {
-        if (config.sqlSource.useLocalCache != null) {
+        if (config.dataTarget.database.useLocalCache != null) {
             try {
                 dataSource = PGSimpleDataSource().apply {
-                    setUrl("jdbc:postgresql:///${config.sqlSource.useLocalCache}")
+                    setUrl("jdbc:postgresql:///${config.dataTarget.database.useLocalCache}")
                     user = "akiba"
                 }
                 if (dataSource != null) {

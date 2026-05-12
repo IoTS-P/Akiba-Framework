@@ -21,7 +21,7 @@ import org.apache.logging.log4j.core.filter.ThresholdFilter
 import org.apache.logging.log4j.core.layout.PatternLayout
 import org.iotsplab.akiba.Main
 import org.iotsplab.akiba.Main.Companion.mainConfigPath
-import org.iotsplab.akiba.client.database.DatabaseClient
+import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.ConfigManager.KEY_SEPARATOR
 import org.iotsplab.akiba.managers.ConfigManager.config
 import org.iotsplab.akiba.managers.ConfigManager.mainConf

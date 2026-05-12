@@ -16,7 +16,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.serialization.json.Json
 import org.iotsplab.akiba.Main
-import org.iotsplab.akiba.client.database.DatabaseClient
+import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.ConfigManager.config
 import org.iotsplab.akiba.managers.ConfigManager.mainConf
 import org.iotsplab.akiba.managers.ConfigManager.projectConf
@@ -291,7 +291,7 @@ object ProgramManager {
                 .associate { it.viewName to it.creationSql }
                 .forEach { viewName, viewSQL ->
                     try {
-                        DatabaseClient.createView(viewName, viewSQL)
+                        DatabaseClient.createView(viewName, viewSQL, false)
                     } catch (e: DatabaseClient.DatabaseDaemonException) {
                         if (e.statusCode == HttpStatusCode.Conflict)
                             globalLogger.warn(e.statusMsg)

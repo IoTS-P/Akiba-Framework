@@ -1,8 +1,7 @@
-package org.iotsplab.akiba.client.database
+package org.iotsplab.akiba.data.database
 
 import com.fasterxml.jackson.core.JsonParser
 import com.fasterxml.jackson.core.StreamReadConstraints
-import com.fasterxml.jackson.core.StreamWriteConstraints
 import com.fasterxml.jackson.databind.DeserializationContext
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.JsonDeserializer
@@ -33,22 +32,20 @@ import io.ktor.serialization.jackson.jackson
 import io.ktor.websocket.CloseReason
 import io.ktor.websocket.Frame
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.managers.ConfigManager.sqlSource
 import org.iotsplab.akiba.managers.BinaryMetadata
 import org.iotsplab.akiba.managers.ProgramManager
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 import org.iotsplab.akiba.module.Log
+import org.iotsplab.akiba.data.operator.DataOperator
 import java.nio.file.Path
 import java.time.Instant
 import java.time.OffsetDateTime
 import java.time.ZoneOffset
 import kotlin.time.Duration.Companion.seconds
 
-object DatabaseClient {
+object DatabaseClient : DataOperator {
     val client: HttpClient = HttpClient {
         install(ContentNegotiation) {
             jackson {
@@ -84,7 +81,7 @@ object DatabaseClient {
 
     class DatabaseDaemonException(val statusCode: HttpStatusCode?, val statusMsg: String? = null): Exception()
 
-    fun testConnection(): Boolean = runBlocking {
+    override fun testConnection(): Boolean = runBlocking {
         try {
             val response = client.get("$urlHeader/test")
             if (response.status == HttpStatusCode.OK) {
@@ -127,7 +124,7 @@ object DatabaseClient {
     /*   Queries   */
 
     @Throws(DatabaseDaemonException::class)
-    fun getIdInSQL(sql: String): List<Long> = runBlocking {
+    override fun getIdInSQL(sql: String): List<Long> = runBlocking {
         val response = post("/get/id/sql", mapOf("sql" to sql)).let {
             if (it.first == HttpStatusCode.OK)
                 it.second
@@ -138,7 +135,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun getMetadata(id: Long): BinaryMetadata = runBlocking {
+    override fun getMetadata(id: Long): BinaryMetadata = runBlocking {
         val response = post("/get/metadata", id).let {
             if (it.first == HttpStatusCode.OK)
                 it.second
@@ -149,7 +146,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun getModuleData(id: Long, tableName: String, columns: List<String>? = null): Map<String, Any?> = runBlocking {
+    override fun getModuleData(id: Long, tableName: String, columns: List<String>?): Map<String, Any?> = runBlocking {
         val data = mapOf(
             "tableName" to tableName,
             "id" to id,
@@ -174,7 +171,7 @@ object DatabaseClient {
     private var md5CheckID: Int = 1
 
     @Throws(DatabaseDaemonException::class)
-    fun checkMD5Duplicate(md5: String): Boolean = runBlocking {
+    override fun checkMD5Duplicate(md5: String): Boolean = runBlocking {
         val response = post("/insert/check_md5", md5).let {
             if (it.first == HttpStatusCode.OK)
                 it.second
@@ -185,7 +182,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun checkMD5Duplicate(path: Path): Boolean {
+    override fun checkMD5Duplicate(path: Path): Boolean {
         val checksum = ProgramManager.getFileMD5Checksum(path)
         val isDuplicate: Boolean = checkMD5Duplicate(checksum)
         globalLogger.info("[$md5CheckID] Checking MD5 duplicate for $path ($checksum): $isDuplicate")
@@ -207,7 +204,7 @@ object DatabaseClient {
     )
 
     @Throws(DatabaseDaemonException::class)
-    fun insertBinary(data: InsertData): Long = runBlocking {
+    override fun insertBinary(data: DatabaseClient.InsertData): Long = runBlocking {
         val response = post("/insert/insert_bin", data).let {
             if (it.first == HttpStatusCode.OK)
                 it.second
@@ -220,7 +217,7 @@ object DatabaseClient {
     /*   Modules   */
 
     @Throws(DatabaseDaemonException::class)
-    fun createModuleTable(tableName: String, columns: Map<String, String>) = runBlocking {
+    override fun createModuleTable(tableName: String, columns: Map<String, String>) = runBlocking {
         LocalCacheDatabase.createTable(tableName, columns)
         post("/module/create_table", mapOf(
             "name" to tableName,
@@ -232,7 +229,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun createView(viewName: String, sql: String, overwrite: Boolean = false) = runBlocking {
+    override fun createView(viewName: String, sql: String, overwrite: Boolean) = runBlocking {
         post("/module/create_view", mapOf(
             "viewName" to viewName,
             "viewSQL" to sql,
@@ -244,29 +241,33 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun tableLock(tableName: String) = runBlocking {
-        post("/module/lock_table", mapOf(
-            "tableName" to tableName
-        )).let {
-            if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+    override fun tableLock(tableName: String) {
+        runBlocking {
+            post("/module/lock_table", mapOf(
+                "tableName" to tableName
+            )).let {
+                if (it.first != HttpStatusCode.OK)
+                    throw DatabaseDaemonException(it.first, it.first.description)
+            }
+            lockedTables.add(tableName)
         }
-        lockedTables.add(tableName)
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun tableUnlock(tableName: String) = runBlocking {
-        post("/module/unlock_table", mapOf(
-            "tableName" to tableName
-        )).let {
-            if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+    override fun tableUnlock(tableName: String) {
+        runBlocking {
+            post("/module/unlock_table", mapOf(
+                "tableName" to tableName
+            )).let {
+                if (it.first != HttpStatusCode.OK)
+                    throw DatabaseDaemonException(it.first, it.first.description)
+            }
+            lockedTables.remove(tableName)
         }
-        lockedTables.remove(tableName)
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun updateData(tableName: String, id: Long, data: Map<String, Any?>) = runBlocking {
+    override fun updateData(tableName: String, id: Long, data: Map<String, Any?>) = runBlocking {
         val body = mapOf(
             "tableName" to tableName,
             "id" to id,
@@ -284,7 +285,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun startTask(tableName: String, id: Long) = runBlocking {
+    override fun startTask(tableName: String, id: Long) = runBlocking {
         post("/module/start", mapOf(
             "tableName" to tableName,
             "id" to id
@@ -295,7 +296,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun finishTask(tableName: String, id: Long) = runBlocking {
+    override fun finishTask(tableName: String, id: Long) = runBlocking {
         post("/module/finish", mapOf(
             "tableName" to tableName,
             "id" to id
@@ -308,7 +309,7 @@ object DatabaseClient {
     /*   Controls   */
 
     @Throws(DatabaseDaemonException::class)
-    fun enableRoute(route: String) = runBlocking {
+    override fun enableRoute(route: String) = runBlocking {
         post("/control/enable", mapOf(
             "route" to route
         )).let {
@@ -318,7 +319,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun disableRoute(route: String) = runBlocking {
+    override fun disableRoute(route: String) = runBlocking {
         post("/control/disable", mapOf(
             "route" to route
         )).let {
@@ -328,7 +329,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun sendHeartbeat() = runBlocking {
+    override fun sendHeartbeat() = runBlocking {
         post("/heartbeat", null).let {
             if (it.first != HttpStatusCode.NoContent)
                 throw DatabaseDaemonException(it.first, it.first.description)
@@ -338,7 +339,7 @@ object DatabaseClient {
     /*   PGInstances   */
 
     @Throws(DatabaseDaemonException::class)
-    fun login(userName: String, password: String) = runBlocking {
+    override fun login(userName: String, password: String) = runBlocking {
         val response = post("/instance/login", mapOf(
             "username" to userName,
             "password" to password
@@ -353,14 +354,14 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun logout() = runBlocking {
+    override fun logout() = runBlocking {
         post("/instance/logout", null).let {
             if (it.first != HttpStatusCode.OK)
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
     }
 
-    fun createInstance(instanceName: String) = runBlocking {
+    override fun createInstance(instanceName: String) = runBlocking {
         globalLogger.info("[CreateInstance] Starting WebSocket connection")
         client.webSocket(
             method = HttpMethod.Get,
@@ -392,7 +393,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun connectToInstance(instanceName: String) = runBlocking {
+    override fun connectToInstance(instanceName: String) = runBlocking {
         post("/instance/connect", mapOf(
             "instanceName" to instanceName,
         )).let {
@@ -402,7 +403,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun disconnectToInstance(instanceName: String) = runBlocking {
+    override fun disconnectToInstance(instanceName: String) = runBlocking {
         post("/instance/disconnect", mapOf(
             "instanceName" to instanceName,
         )).let {
@@ -412,7 +413,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun shutdownInstance(instanceName: String) = runBlocking {
+    override fun shutdownInstance(instanceName: String) = runBlocking {
         post("/instance/shutdown", mapOf(
             "instanceName" to instanceName,
         )).let {
@@ -422,7 +423,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun deleteInstance(instanceName: String) = runBlocking {
+    override fun deleteInstance(instanceName: String) = runBlocking {
         post("/instance/delete", mapOf(
             "instanceName" to instanceName,
         )).let {
@@ -434,11 +435,11 @@ object DatabaseClient {
     /*   Backups   */
 
     @Throws(DatabaseDaemonException::class)
-    fun createBackup(
+    override fun createBackup(
         isFull: Boolean,
         instanceName: String,
-        alias: String? = null,
-        description: String? = null
+        alias: String?,
+        description: String?
     ): String = runBlocking {
         var label: String? = null
 
@@ -514,7 +515,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun peekBackups(instanceName: String): List<BackupNode> = runBlocking {
+    override fun peekBackups(instanceName: String): List<DatabaseClient.BackupNode> = runBlocking {
         post("/backup/peek", instanceName).let {
             if (it.first != HttpStatusCode.OK)
                 throw DatabaseDaemonException(it.first, it.first.description)
@@ -529,7 +530,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun restoreBackup(instanceName: String, aliasOrLabel: String) = runBlocking {
+    override fun restoreBackup(instanceName: String, aliasOrLabel: String) = runBlocking {
         client.webSocket(
             method = HttpMethod.Get,
             host = sqlSource.serverIP,

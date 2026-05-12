@@ -38,7 +38,7 @@ object ConfigManager {
         get() = config.withGhidraProject!!
 
     lateinit var mainConfigFile: File
-    var mainConfigJsonPath: String = "."    // . means all content of the YAML document
+    var mainConfigJsonPath: String = "."    // . means all content of the JSON document
 
     const val KEY_SEPARATOR: String = "@"
 

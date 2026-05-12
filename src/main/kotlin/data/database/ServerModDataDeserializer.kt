@@ -1,4 +1,4 @@
-package org.iotsplab.akiba.client.database
+package org.iotsplab.akiba.data.database
 
 import com.fasterxml.jackson.core.JsonParser
 import com.fasterxml.jackson.databind.DeserializationContext
@@ -27,7 +27,13 @@ object ServerModDataDeserializer: JsonDeserializer<Map<String, Any?>>() {
                     return@forEach
                 }
                 data[name] = when (entry["type"].textValue().lowercase()) {
-                    in listOf("text", "json", "jsonb") -> entry["value"].textValue()
+                    in listOf("text", "json", "jsonb") -> {
+                        val valueNode = entry["value"]
+                        if (valueNode.isObject && valueNode.has("value")) {
+                            valueNode["value"].textValue()
+                        } else
+                            valueNode.textValue()
+                    }
                     in listOf("int4", "integer") -> entry["value"].intValue()
                     in listOf("int8", "bigint") -> entry["value"].longValue()
                     "double precision" -> entry["value"].doubleValue()

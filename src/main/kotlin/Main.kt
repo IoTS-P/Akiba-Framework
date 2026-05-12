@@ -2,7 +2,7 @@ package org.iotsplab.akiba
 
 import kotlinx.coroutines.*
 import org.fusesource.jansi.AnsiConsole
-import org.iotsplab.akiba.client.database.DatabaseClient
+import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.*
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 import org.iotsplab.akiba.managers.WorkspaceManager.project
@@ -130,13 +130,19 @@ class Main : Runnable {
 
         @JvmStatic
         fun main(args: Array<String>): Unit = runBlocking {
+            val source = Main::class.java.protectionDomain.codeSource
+            val jarFile = source.location.toURI()
+            val appHome = java.io.File(jarFile).parentFile.parentFile.absolutePath
+            System.setProperty("user.dir", appHome)
+            println("Working directory: $appHome")
+
             // Set timezone
             TimeZone.setDefault(TimeZone.getTimeZone("Asia/Shanghai"))
 
-            globalLogger.info("Max runtime memory: ${Runtime.getRuntime().maxMemory() / 1024.0 / 1024.0}MB")
+            println("Max runtime memory: ${Runtime.getRuntime().maxMemory() / 1024.0 / 1024.0}MB")
 
             // Register signal handler
-            globalLogger.debug("Registering signal handler")
+            println("Registering signal handler")
             listOf("INT", "TERM").forEach { signalName ->
                 Signal.handle(Signal(signalName)) {
                     interruptHandler()

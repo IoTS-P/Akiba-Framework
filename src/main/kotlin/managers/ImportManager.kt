@@ -7,7 +7,7 @@ import ghidra.program.model.listing.Program
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import org.iotsplab.akiba.Main.Companion.importConfig
-import org.iotsplab.akiba.client.database.DatabaseClient
+import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.ConfigManager.mainConf
 import org.iotsplab.akiba.managers.ProgramManager.autoAnalyzeInTimeout
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
