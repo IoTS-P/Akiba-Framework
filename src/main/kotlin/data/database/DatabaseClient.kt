@@ -38,14 +38,13 @@ import org.iotsplab.akiba.managers.BinaryMetadata
 import org.iotsplab.akiba.managers.ProgramManager
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 import org.iotsplab.akiba.module.Log
-import org.iotsplab.akiba.data.operator.DataOperator
 import java.nio.file.Path
 import java.time.Instant
 import java.time.OffsetDateTime
 import java.time.ZoneOffset
 import kotlin.time.Duration.Companion.seconds
 
-object DatabaseClient : DataOperator {
+object DatabaseClient {
     val client: HttpClient = HttpClient {
         install(ContentNegotiation) {
             jackson {
@@ -81,7 +80,7 @@ object DatabaseClient : DataOperator {
 
     class DatabaseDaemonException(val statusCode: HttpStatusCode?, val statusMsg: String? = null): Exception()
 
-    override fun testConnection(): Boolean = runBlocking {
+    fun testConnection(): Boolean = runBlocking {
         try {
             val response = client.get("$urlHeader/test")
             if (response.status == HttpStatusCode.OK) {
@@ -124,7 +123,7 @@ object DatabaseClient : DataOperator {
     /*   Queries   */
 
     @Throws(DatabaseDaemonException::class)
-    override fun getIdInSQL(sql: String): List<Long> = runBlocking {
+    fun getIdInSQL(sql: String): List<Long> = runBlocking {
         val response = post("/get/id/sql", mapOf("sql" to sql)).let {
             if (it.first == HttpStatusCode.OK)
                 it.second
@@ -135,7 +134,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun getMetadata(id: Long): BinaryMetadata = runBlocking {
+    fun getMetadata(id: Long): BinaryMetadata = runBlocking {
         val response = post("/get/metadata", id).let {
             if (it.first == HttpStatusCode.OK)
                 it.second
@@ -146,7 +145,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun getModuleData(id: Long, tableName: String, columns: List<String>?): Map<String, Any?> = runBlocking {
+    fun getModuleData(id: Long, tableName: String, columns: List<String>?): Map<String, Any?> = runBlocking {
         val data = mapOf(
             "tableName" to tableName,
             "id" to id,
@@ -171,7 +170,7 @@ object DatabaseClient : DataOperator {
     private var md5CheckID: Int = 1
 
     @Throws(DatabaseDaemonException::class)
-    override fun checkMD5Duplicate(md5: String): Boolean = runBlocking {
+    fun checkMD5Duplicate(md5: String): Boolean = runBlocking {
         val response = post("/insert/check_md5", md5).let {
             if (it.first == HttpStatusCode.OK)
                 it.second
@@ -182,7 +181,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun checkMD5Duplicate(path: Path): Boolean {
+    fun checkMD5Duplicate(path: Path): Boolean {
         val checksum = ProgramManager.getFileMD5Checksum(path)
         val isDuplicate: Boolean = checkMD5Duplicate(checksum)
         globalLogger.info("[$md5CheckID] Checking MD5 duplicate for $path ($checksum): $isDuplicate")
@@ -204,7 +203,7 @@ object DatabaseClient : DataOperator {
     )
 
     @Throws(DatabaseDaemonException::class)
-    override fun insertBinary(data: DatabaseClient.InsertData): Long = runBlocking {
+    fun insertBinary(data: DatabaseClient.InsertData): Long = runBlocking {
         val response = post("/insert/insert_bin", data).let {
             if (it.first == HttpStatusCode.OK)
                 it.second
@@ -217,7 +216,7 @@ object DatabaseClient : DataOperator {
     /*   Modules   */
 
     @Throws(DatabaseDaemonException::class)
-    override fun createModuleTable(tableName: String, columns: Map<String, String>) = runBlocking {
+    fun createModuleTable(tableName: String, columns: Map<String, String>) = runBlocking {
         LocalCacheDatabase.createTable(tableName, columns)
         post("/module/create_table", mapOf(
             "name" to tableName,
@@ -229,7 +228,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun createView(viewName: String, sql: String, overwrite: Boolean) = runBlocking {
+    fun createView(viewName: String, sql: String, overwrite: Boolean) = runBlocking {
         post("/module/create_view", mapOf(
             "viewName" to viewName,
             "viewSQL" to sql,
@@ -241,7 +240,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun tableLock(tableName: String) {
+    fun tableLock(tableName: String) {
         runBlocking {
             post("/module/lock_table", mapOf(
                 "tableName" to tableName
@@ -254,7 +253,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun tableUnlock(tableName: String) {
+    fun tableUnlock(tableName: String) {
         runBlocking {
             post("/module/unlock_table", mapOf(
                 "tableName" to tableName
@@ -267,7 +266,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun updateData(tableName: String, id: Long, data: Map<String, Any?>) = runBlocking {
+    fun updateData(tableName: String, id: Long, data: Map<String, Any?>) = runBlocking {
         val body = mapOf(
             "tableName" to tableName,
             "id" to id,
@@ -285,7 +284,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun startTask(tableName: String, id: Long) = runBlocking {
+    fun startTask(tableName: String, id: Long) = runBlocking {
         post("/module/start", mapOf(
             "tableName" to tableName,
             "id" to id
@@ -296,7 +295,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun finishTask(tableName: String, id: Long) = runBlocking {
+    fun finishTask(tableName: String, id: Long) = runBlocking {
         post("/module/finish", mapOf(
             "tableName" to tableName,
             "id" to id
@@ -309,7 +308,7 @@ object DatabaseClient : DataOperator {
     /*   Controls   */
 
     @Throws(DatabaseDaemonException::class)
-    override fun enableRoute(route: String) = runBlocking {
+    fun enableRoute(route: String) = runBlocking {
         post("/control/enable", mapOf(
             "route" to route
         )).let {
@@ -319,7 +318,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun disableRoute(route: String) = runBlocking {
+    fun disableRoute(route: String) = runBlocking {
         post("/control/disable", mapOf(
             "route" to route
         )).let {
@@ -329,7 +328,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun sendHeartbeat() = runBlocking {
+    fun sendHeartbeat() = runBlocking {
         post("/heartbeat", null).let {
             if (it.first != HttpStatusCode.NoContent)
                 throw DatabaseDaemonException(it.first, it.first.description)
@@ -339,7 +338,7 @@ object DatabaseClient : DataOperator {
     /*   PGInstances   */
 
     @Throws(DatabaseDaemonException::class)
-    override fun login(userName: String, password: String) = runBlocking {
+    fun login(userName: String, password: String) = runBlocking {
         val response = post("/instance/login", mapOf(
             "username" to userName,
             "password" to password
@@ -354,14 +353,14 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun logout() = runBlocking {
+    fun logout() = runBlocking {
         post("/instance/logout", null).let {
             if (it.first != HttpStatusCode.OK)
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
     }
 
-    override fun createInstance(instanceName: String) = runBlocking {
+    fun createInstance(instanceName: String) = runBlocking {
         globalLogger.info("[CreateInstance] Starting WebSocket connection")
         client.webSocket(
             method = HttpMethod.Get,
@@ -393,7 +392,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun connectToInstance(instanceName: String) = runBlocking {
+    fun connectToInstance(instanceName: String) = runBlocking {
         post("/instance/connect", mapOf(
             "instanceName" to instanceName,
         )).let {
@@ -403,7 +402,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun disconnectToInstance(instanceName: String) = runBlocking {
+    fun disconnectToInstance(instanceName: String) = runBlocking {
         post("/instance/disconnect", mapOf(
             "instanceName" to instanceName,
         )).let {
@@ -413,7 +412,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun shutdownInstance(instanceName: String) = runBlocking {
+    fun shutdownInstance(instanceName: String) = runBlocking {
         post("/instance/shutdown", mapOf(
             "instanceName" to instanceName,
         )).let {
@@ -423,7 +422,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun deleteInstance(instanceName: String) = runBlocking {
+    fun deleteInstance(instanceName: String) = runBlocking {
         post("/instance/delete", mapOf(
             "instanceName" to instanceName,
         )).let {
@@ -435,7 +434,7 @@ object DatabaseClient : DataOperator {
     /*   Backups   */
 
     @Throws(DatabaseDaemonException::class)
-    override fun createBackup(
+    fun createBackup(
         isFull: Boolean,
         instanceName: String,
         alias: String?,
@@ -515,7 +514,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun peekBackups(instanceName: String): List<DatabaseClient.BackupNode> = runBlocking {
+    fun peekBackups(instanceName: String): List<DatabaseClient.BackupNode> = runBlocking {
         post("/backup/peek", instanceName).let {
             if (it.first != HttpStatusCode.OK)
                 throw DatabaseDaemonException(it.first, it.first.description)
@@ -530,7 +529,7 @@ object DatabaseClient : DataOperator {
     }
 
     @Throws(DatabaseDaemonException::class)
-    override fun restoreBackup(instanceName: String, aliasOrLabel: String) = runBlocking {
+    fun restoreBackup(instanceName: String, aliasOrLabel: String) = runBlocking {
         client.webSocket(
             method = HttpMethod.Get,
             host = sqlSource.serverIP,

@@ -27,6 +27,7 @@ import org.iotsplab.akiba.managers.WorkspaceManager.logRootDir
 import org.iotsplab.akiba.managers.WorkspaceManager.projectName
 import org.iotsplab.akiba.module.*
 import org.iotsplab.akiba.module.AkibaModule.Companion.pascalToSnake
+import org.apache.logging.log4j.Level
 import org.iotsplab.akiba.utils.DoNotCreateTable
 import org.iotsplab.akiba.utils.WithTableColumn
 import org.iotsplab.akiba.utils.ProcedureArguments
@@ -115,11 +116,13 @@ object ProgramManager {
         }
 
         // read metadata
-        metadata = readMetadata()
+        if (sqlSource.constraint != "server") {
+            metadata = readMetadata()
 
-        if (metadata.isEmpty()) {
-            globalLogger.error("Empty query results, quit immediately")
-            return false
+            if (metadata.isEmpty()) {
+                globalLogger.error("Empty query results, quit immediately")
+                return false
+            }
         }
 
         setSkipList()
@@ -204,6 +207,11 @@ object ProgramManager {
     fun startProcess(project: GhidraProject) = runBlocking {
         createTablesAndViews()
 
+        if (sqlSource.constraint == "server") {
+            invokeServerMode()
+            return@runBlocking
+        }
+
         taskSemaphore = Semaphore(mainConf.threads)
         val limitedDispatcher = Dispatchers.Default.limitedParallelism(mainConf.threads)
 
@@ -241,6 +249,47 @@ object ProgramManager {
             } catch (e: Exception) {
                 globalLogger.error("Failed to unlock table $it: ${e.message}")
                 throw IllegalStateException("Failed to unlock table $it")
+            }
+        }
+    }
+
+    private fun invokeServerMode() {
+        globalLogger.info("invokeServerMode() called, tasks count = ${config.tasks.size}")
+        config.tasks.forEach { task ->
+            globalLogger.info("Task: ${task.mainClassName}, mainClass = ${task.mainClass}")
+            task.mainClass?.let { clazz ->
+                globalLogger.info("Checking clazz.simpleName = ${clazz.simpleName}")
+                if (clazz.simpleName == "AkibaUtils") {
+                    try {
+                        val constructor = clazz.getDeclaredConstructor(
+                            String::class.java,
+                            Any::class.java,
+                            Int::class.javaPrimitiveType,
+                            Program::class.java,
+                            Map::class.java,
+                            Level::class.java,
+                            Level::class.java,
+                            String::class.java
+                        )
+                        constructor.isAccessible = true
+                        @Suppress("UNCHECKED_CAST")
+                        val module = constructor.newInstance(
+                            task.configKey, null, -1, null, emptyMap<String, String?>(),
+                            Level.INFO, Level.INFO, "akiba_server_results"
+                        ) as? AkibaModule
+                        if (module != null) {
+                            globalLogger.info("Calling module.startProcess()")
+                            runBlocking {
+                                module.startProcess()
+                            }
+                        } else {
+                            globalLogger.error("module is null for AkibaUtils!")
+                        }
+                    } catch (e: Exception) {
+                        globalLogger.error("Failed to create AkibaUtils instance: ${e.message}")
+                        e.printStackTrace()
+                    }
+                }
             }
         }
     }

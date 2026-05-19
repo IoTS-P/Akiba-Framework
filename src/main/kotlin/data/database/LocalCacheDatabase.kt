@@ -9,10 +9,10 @@ object LocalCacheDatabase {
     var dataSource: PGSimpleDataSource? = null
 
     init {
-        if (config.dataTarget.database.useLocalCache != null) {
+        if (config.sqlSource.useLocalCache != null) {
             try {
                 dataSource = PGSimpleDataSource().apply {
-                    setUrl("jdbc:postgresql:///${config.dataTarget.database.useLocalCache}")
+                    setUrl("jdbc:postgresql:///${config.sqlSource.useLocalCache}")
                     user = "akiba"
                 }
                 if (dataSource != null) {

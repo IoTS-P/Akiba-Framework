@@ -1,7 +1,7 @@
 package org.iotsplab.akiba.utils
 
-import com.google.gson.JsonDeserializer
-import com.google.gson.JsonSerializer
+import com.fasterxml.jackson.databind.JsonDeserializer
+import com.fasterxml.jackson.databind.JsonSerializer
 import kotlin.reflect.KClass
 
 /**
@@ -19,7 +19,7 @@ annotation class WithConfigClass(val clazz: KClass<*>)
 annotation class WithConfigSerializer(val serializer: KClass<out JsonSerializer<*>>)
 
 /**
- * WithConfigDeSerializer: Used in any subclass of `AkibaModule` to specify the deserializer for this module's config class
+ * WithConfigDeserializer: Used in any subclass of `AkibaModule` to specify the deserializer for this module's config class
  */
 @Target(AnnotationTarget.CLASS)
 @Retention(AnnotationRetention.RUNTIME)

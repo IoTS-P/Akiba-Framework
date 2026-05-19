@@ -18,6 +18,8 @@ repositories {
 dependencies {
     testImplementation(kotlin("test"))
 
+    implementation(project(":akiba_mod_utils"))
+
     implementation("org.fusesource.jansi:jansi:2.4.3")
 
     // Jackson supports
@@ -45,13 +47,28 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.10.0")
     implementation("org.jline:jline:4.0.10")
 
-    // Ktor client supports
+    // Ktor server supports
     implementation(platform("io.ktor:ktor-bom:3.4.2"))
-    implementation("io.ktor:ktor-client-core")
-    implementation("io.ktor:ktor-client-cio")
-    implementation("io.ktor:ktor-client-content-negotiation")
-    implementation("io.ktor:ktor-client-websockets")
-    implementation("io.ktor:ktor-serialization-jackson-jvm")
+    implementation("io.ktor:ktor-server:3.4.2")
+    implementation("io.ktor:ktor-server-netty:3.4.2")
+    implementation("io.ktor:ktor-server-websockets:3.4.2")
+    implementation("io.ktor:ktor-server-cors:3.4.2")
+    implementation("io.ktor:ktor-server-compression:3.4.2")
+    implementation("io.ktor:ktor-server-content-negotiation:3.4.2")
+
+    // Ktor client supports (for internal use)
+    implementation("io.ktor:ktor-client-core:3.4.2")
+    implementation("io.ktor:ktor-client-cio:3.4.2")
+    implementation("io.ktor:ktor-client-content-negotiation:3.4.2")
+    implementation("io.ktor:ktor-client-websockets:3.4.2")
+    implementation("io.ktor:ktor-serialization-jackson-jvm:3.4.2")
+
+    // JWT for authentication
+    implementation("io.jsonwebtoken:jjwt:0.12.6")
+    implementation("org.mindrot:jbcrypt:0.4")
+
+    // Kotlin compiler for runtime script compilation
+    implementation("org.jetbrains.kotlin:kotlin-compiler-embeddable:1.9.22")
 
     // For debug
     // implementation(fileTree("modules"))

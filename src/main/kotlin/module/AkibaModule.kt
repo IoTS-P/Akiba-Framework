@@ -21,7 +21,7 @@ import org.apache.logging.log4j.core.appender.ConsoleAppender
 import org.apache.logging.log4j.core.appender.FileAppender
 import org.apache.logging.log4j.core.config.LoggerConfig
 import org.apache.logging.log4j.core.layout.PatternLayout
-import org.iotsplab.akiba.client.database.DatabaseClient
+import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.BinaryMetadata
 import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.managers.ConfigManager.KEY_SEPARATOR
@@ -132,18 +132,18 @@ abstract class AkibaModule (
     }
 
     @Throws(NoSuchElementException::class)
-    suspend fun getTaskData(key: String?): Any? {
+    open suspend fun getTaskData(key: String?): Any? {
         return if (key == null)
             coroutineContext[ModuleContext.Key]!!.data
         else
             coroutineContext[ModuleContext.Key]!!.data.getValue(key)
     }
 
-    suspend fun setTaskData(key: String, value: Any?) {
+    open suspend fun setTaskData(key: String, value: Any?) {
         coroutineContext[ModuleContext.Key]!!.data[key] = value
     }
 
-    suspend fun getMetadata(): BinaryMetadata {
+    open suspend fun getMetadata(): BinaryMetadata {
         return coroutineContext[ModuleContext.Key]!!.metadata
     }
 
@@ -298,7 +298,7 @@ abstract class AkibaModule (
     open suspend fun timeoutHandler() {}
 
     @Throws(DatabaseClient.DatabaseDaemonException::class)
-    protected fun updateData(data: Map<String, Any?>) {
+    protected open fun updateData(data: Map<String, Any?>) {
         if (hasTable)
             DatabaseClient.updateData(dbTableName, id.toLong(), data)
         else
@@ -307,13 +307,13 @@ abstract class AkibaModule (
     }
 
     @Throws(DatabaseClient.DatabaseDaemonException::class)
-    protected fun updateErr(msg: String) {
+    protected open fun updateErr(msg: String) {
         if (hasTable)
             DatabaseClient.updateData(dbTableName, id.toLong(), mapOf("err_msg" to msg))
     }
 
     @Throws(DatabaseClient.DatabaseDaemonException::class)
-    protected fun clearErr() {
+    protected open fun clearErr() {
         if (hasTable)
             DatabaseClient.updateData(dbTableName, id.toLong(), mapOf("err_msg" to null))
     }
