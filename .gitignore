@@ -12,3 +12,5 @@ src/main/resources/configs/*
 
 logs
 modules
+.DS_Store
+.DS_Store

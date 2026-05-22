@@ -109,7 +109,7 @@ class Main : Runnable {
         class RestoreModeGroup {
             @CommandLine.Option(
                 names = ["-f", "--fail-only"],
-                description = ["Only process failed programs，if -r not specified, this option will be ignored"],
+                description = ["Only process failed programs, if -r not specified, this option will be ignored"],
                 required = false
             )
             var restoreFailedOnly: Boolean = false
