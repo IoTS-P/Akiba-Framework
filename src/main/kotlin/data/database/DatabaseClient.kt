@@ -200,6 +200,13 @@ object DatabaseClient {
         val arch: String,
         val format: String,
         val compilerSpec: String,
+        // Provenance for files imported at runtime by an AkibaModule:
+        //   sourceId     = id of the binary being analyzed when this file was imported
+        //                  (null for top-level imports done by `ImportManager`)
+        //   sourceModule = simple class name of the importing `AkibaModule`
+        //                  (null for top-level imports done by `ImportManager`)
+        val sourceId: Int? = null,
+        val sourceModule: String? = null,
     )
 
     @Throws(DatabaseDaemonException::class)

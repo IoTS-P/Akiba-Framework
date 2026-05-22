@@ -56,11 +56,6 @@ object ImportManager {
                                else Path.of(mainConf.importRoot!!).resolve(entry.path).absolute()
 
             globalLogger.info("Importing [${idx + 1}/${importList.size}] $originalPath")
-            val originalChecksum = ProgramManager.getFileMD5Checksum(originalPath)
-            if (DatabaseClient.checkMD5Duplicate(originalChecksum)) {
-                globalLogger.warn("Found duplicate checksum of ${entry.path}, skipped")
-                return@mapIndexed
-            }
 
             // Check if file exists
             if (originalPath.notExists() || !originalPath.isRegularFile()) {
@@ -70,76 +65,128 @@ object ImportManager {
 
             // We have removed all duplicated files in `readConfig`, no need to check it again here
 
-            // If Ghidra can automatically detect the file format, import directly and insert it to database
-            ProgramManager.tryCreateProgramWithAutoDetect(project, originalPath)?.let {
-                // Ghidra successfully identified the binary format, import directly
-                val id = DatabaseClient.insertBinary(
-                    DatabaseClient.InsertData(
-                        originalPath = originalPath.absolutePathString(),
-                        processedPath = null,
-                        checksum = originalChecksum,
-                        processedChecksum = null,
-                        size = originalPath.fileSize(),
-                        processedSize = -1,
-                        loadProperties = null,
-                        arch = it.languageID.idAsString,
-                        format = it.executableFormat,
-                        compilerSpec = it.compiler
-                    )
-                )
-                originalPath.copyTo(WorkspaceManager.binaryPath.resolve("$id.bin"))
-
-                project.close(it)
-                return@mapIndexed
-            }
-
-            // Preprocess binaries, now only contains removing unnecessary continuous \x00 segments
-            val preprocessed: Pair<Path, List<FileSegment>>? = preprocessFile(originalPath)
-            val program: Program? = entry.arch?.let {
-                val prog = project.importProgram(
-                    originalPath.toFile(),
-                    languageProvider.getLanguage(it.languageID),
-                    null
-                )
-                autoAnalyzeInTimeout(prog, mainConf.autoAnalysisTimeout)
-                prog
-            } ?: ProgramManager.tryCreateProgramWithoutLang(
-                project = project,
-                path = preprocessed?.first ?: originalPath,
-                loadProperties = preprocessed?.second ?: listOf()
-            ) ?: run {
-                globalLogger.warn("Failed to guess language: $originalPath")
-                null
-            }
-
-            // If no arch is specified, try to guess its arch, if no arch matched, use 'n/a'
-            val arch = entry.arch?.languageID?.toString() ?: program?.languageID?.toString() ?: "n/a"
-
-            val id = DatabaseClient.insertBinary(DatabaseClient.InsertData(
-                originalPath = originalPath.absolutePathString(),
-                processedPath = preprocessed?.first?.absolutePathString(),
-                checksum = originalChecksum,
-                processedChecksum = preprocessed?.let { ProgramManager.getFileMD5Checksum(it.first) },
-                size = originalPath.fileSize(),
-                processedSize = preprocessed?.first?.fileSize() ?: -1,
-                loadProperties = preprocessed?.let { jacksonObjectMapper().writeValueAsString(it.second) },
-                arch = arch,
-                format = program?.executableFormat?:"n/a",
-                compilerSpec = program?.compiler?:"n/a"
-            ))
-            originalPath.copyTo(
-                WorkspaceManager.binaryPath.resolve("$id.bin"), overwrite = true)
-            preprocessed?.first?.moveTo(
-                WorkspaceManager.processedBinaryPath.resolve("$id.bin"), overwrite = true)
-
-            program ?.let {
-                it.name = "$id-${originalPath.fileName}"
-                project.saveAs(it, "/", it.name, false)
-                project.close(program)
+            try {
+                importSingleFile(originalPath, entry.arch)
+            } catch (e: DuplicateChecksumException) {
+                globalLogger.warn("Found duplicate checksum of ${entry.path}, skipped")
             }
         }
 
         unlockImport()
+    }
+
+    class DuplicateChecksumException(checksum: String) :
+        IllegalStateException("Duplicate checksum: $checksum")
+
+    /**
+     * Import a single binary file into the project and register it in the database.
+     *
+     * This is the runtime/single-file counterpart of [import] (which iterates the import config
+     * file). It is used both by the import-config code path and by [AkibaModule.importFile] for
+     * binaries that are produced/discovered by a module while it is analyzing another binary.
+     *
+     * @param originalPath Absolute path to the source file. The file MUST already exist.
+     * @param arch         Optional language hint. If null, Ghidra format auto-detection is
+     *                     attempted first, then language guessing if that fails.
+     * @param sourceId     Provenance: id of the binary being analyzed when this file is being
+     *                     imported. `null` for top-level imports done by [import].
+     * @param sourceModule Provenance: simple class name of the importing [AkibaModule]. `null`
+     *                     for top-level imports done by [import].
+     * @return The id assigned to the newly registered binary in the database.
+     * @throws DuplicateChecksumException If a binary with the same MD5 checksum already exists.
+     * @throws IllegalArgumentException   If [originalPath] does not exist / is not a regular file.
+     */
+    @Throws(
+        DuplicateChecksumException::class,
+        IllegalArgumentException::class,
+        IllegalStateException::class,
+    )
+    fun importSingleFile(
+        originalPath: Path,
+        arch: Language? = null,
+        sourceId: Int? = null,
+        sourceModule: String? = null,
+    ): Long {
+        require(originalPath.exists() && originalPath.isRegularFile()) {
+            "File not found or not a regular file: $originalPath"
+        }
+
+        val originalChecksum = ProgramManager.getFileMD5Checksum(originalPath)
+        if (DatabaseClient.checkMD5Duplicate(originalChecksum))
+            throw DuplicateChecksumException(originalChecksum)
+
+        // If Ghidra can automatically detect the file format, import directly and insert it to database
+        ProgramManager.tryCreateProgramWithAutoDetect(project, originalPath)?.let {
+            // Ghidra successfully identified the binary format, import directly
+            val id = DatabaseClient.insertBinary(
+                DatabaseClient.InsertData(
+                    originalPath = originalPath.absolutePathString(),
+                    processedPath = null,
+                    checksum = originalChecksum,
+                    processedChecksum = null,
+                    size = originalPath.fileSize(),
+                    processedSize = -1,
+                    loadProperties = null,
+                    arch = it.languageID.idAsString,
+                    format = it.executableFormat,
+                    compilerSpec = it.compiler,
+                    sourceId = sourceId,
+                    sourceModule = sourceModule,
+                )
+            )
+            originalPath.copyTo(WorkspaceManager.binaryPath.resolve("$id.bin"), overwrite = true)
+            project.close(it)
+            return id
+        }
+
+        // Preprocess binaries, now only contains removing unnecessary continuous \x00 segments
+        val preprocessed: Pair<Path, List<FileSegment>>? = preprocessFile(originalPath)
+        val program: Program? = arch?.let {
+            val prog = project.importProgram(
+                originalPath.toFile(),
+                languageProvider.getLanguage(it.languageID),
+                null
+            )
+            autoAnalyzeInTimeout(prog, mainConf.autoAnalysisTimeout)
+            prog
+        } ?: ProgramManager.tryCreateProgramWithoutLang(
+            project = project,
+            path = preprocessed?.first ?: originalPath,
+            loadProperties = preprocessed?.second ?: listOf()
+        ) ?: run {
+            globalLogger.warn("Failed to guess language: $originalPath")
+            null
+        }
+
+        // If no arch is specified, try to guess its arch, if no arch matched, use 'n/a'
+        val resolvedArch = arch?.languageID?.toString() ?: program?.languageID?.toString() ?: "n/a"
+
+        val id = DatabaseClient.insertBinary(DatabaseClient.InsertData(
+            originalPath = originalPath.absolutePathString(),
+            processedPath = preprocessed?.first?.absolutePathString(),
+            checksum = originalChecksum,
+            processedChecksum = preprocessed?.let { ProgramManager.getFileMD5Checksum(it.first) },
+            size = originalPath.fileSize(),
+            processedSize = preprocessed?.first?.fileSize() ?: -1,
+            loadProperties = preprocessed?.let { jacksonObjectMapper().writeValueAsString(it.second) },
+            arch = resolvedArch,
+            format = program?.executableFormat ?: "n/a",
+            compilerSpec = program?.compiler ?: "n/a",
+            sourceId = sourceId,
+            sourceModule = sourceModule,
+        ))
+        originalPath.copyTo(
+            WorkspaceManager.binaryPath.resolve("$id.bin"), overwrite = true)
+        preprocessed?.first?.moveTo(
+            WorkspaceManager.processedBinaryPath.resolve("$id.bin"), overwrite = true)
+
+        program?.let {
+            it.name = "$id-${originalPath.fileName}"
+            project.saveAs(it, "/", it.name, false)
+            project.close(program)
+        }
+
+        return id
     }
 
     @Throws(IllegalStateException::class)

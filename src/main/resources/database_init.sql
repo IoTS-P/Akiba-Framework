@@ -6,7 +6,16 @@ CREATE TABLE IF NOT EXISTS binaries (
     size            INTEGER,                -- file size (original file)
     arch            TEXT,                   -- architecture
     format          TEXT,                   -- binary format, like ELF, EXE, etc.
-    compiler_spec   TEXT                    -- compiler spec, like eabi, Visual studio, etc.
+    compiler_spec   TEXT,                   -- compiler spec, like eabi, Visual studio, etc.
+    -- For files imported at runtime by a module while analyzing another file:
+    -- `source_id`     references the binary that was being analyzed when this file was
+    --                  imported (NULL for top-level imports made by ImportManager).
+    -- `source_module` is the simple class name of the AkibaModule that imported it
+    --                  (NULL for top-level imports).
+    source_id       INTEGER REFERENCES binaries (id)
+                        ON DELETE SET NULL
+                        ON UPDATE CASCADE,
+    source_module   TEXT
 );
 
 -- Some binaries are processed when imported and may generate new files, so we need to save them

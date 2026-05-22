@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonSerializer
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.module.SimpleModule
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import ghidra.program.model.lang.Language
 import ghidra.program.model.listing.Program
 import ghidra.util.exception.CancelledException
 import ghidra.util.task.TaskMonitorAdapter
@@ -27,6 +28,7 @@ import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.managers.ConfigManager.KEY_SEPARATOR
 import org.iotsplab.akiba.managers.ConfigManager.mainConf
 import org.iotsplab.akiba.managers.ConfigManager.parseModuleConfig
+import org.iotsplab.akiba.managers.ImportManager
 import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.utils.*
 import org.iotsplab.akiba.utils.CoroutineTaskMonitor
@@ -45,6 +47,7 @@ import kotlin.io.path.notExists
 import kotlin.reflect.KClass
 import kotlin.reflect.KFunction
 import kotlin.reflect.full.findAnnotation
+import kotlin.reflect.full.primaryConstructor
 import kotlin.system.exitProcess
 import kotlin.system.measureTimeMillis
 
@@ -145,6 +148,247 @@ abstract class AkibaModule (
 
     open suspend fun getMetadata(): BinaryMetadata {
         return coroutineContext[ModuleContext.Key]!!.metadata
+    }
+
+    /**
+     * Override the config object that was loaded during construction.
+     *
+     * `AkibaModule`'s constructor only knows how to read configs from disk (via [configPath] /
+     * [parseModuleConfig]) or from the [defaultConfig] fallback. When a module is invoked
+     * dynamically by another module via [callModule], the caller usually wants to pass an
+     * in-memory config object directly — without round-tripping through a temp file. This
+     * method is the supported entry point for doing that.
+     *
+     * The new value MUST be either `null` or an instance of the class declared by the module's
+     * [WithConfigClass] annotation. If [WithConfigClass] is absent (i.e. the module does not
+     * declare a config class), this method is a no-op except for logging.
+     *
+     * Calling this after the module's `startProcess` has already started has undefined effects
+     * and is not supported.
+     *
+     * @param newConfig The replacement config. Pass `null` to clear the config.
+     * @throws IllegalArgumentException If [newConfig] is not assignable to the module's declared
+     *                                  config class.
+     */
+    @Throws(IllegalArgumentException::class)
+    open fun replaceConfig(newConfig: Any?) {
+        val declared = configClass
+        if (declared == null) {
+            logger.debug("replaceConfig() ignored: module has no @WithConfigClass")
+            return
+        }
+        if (newConfig != null) {
+            require(declared.java.isInstance(newConfig)) {
+                "replaceConfig: provided config is of type ${newConfig.javaClass.name}, " +
+                "but module ${this.javaClass.simpleName} declares config class " +
+                "${declared.qualifiedName}"
+            }
+        }
+        config = newConfig
+    }
+
+    /**
+     * Dynamically invoke another module on the binary currently being analyzed by this module
+     * (or on an arbitrary binary id, if [targetId] is supplied).
+     *
+     * Unlike the static task list in `config.tasks` (which is resolved before any analysis
+     * starts), this method allows a running module to schedule another module on demand. The
+     * called module shares this module's coroutine context — including the [ModuleContext] that
+     * holds the per-binary task data and the registered task APIs — so that data exchange via
+     * [setTaskData] / [getTaskData] keeps working as expected.
+     *
+     * The called module's lifecycle is fully run here: it is constructed, [startProcess] is
+     * invoked (subject to [timeout]), and the instance is closed unless it is annotated with
+     * [NoNeedToClose]. Its task interfaces are registered into the current [ModuleContext] via
+     * [ModuleContext.lookup] just as `ProcedureManager.invokeProcedure` does, so this module can
+     * then call its `@TaskInterface` methods through [callTaskAPI] after the call returns.
+     *
+     * ### Configuration
+     *
+     * Three mutually-exclusive ways to provide the called module's configuration are supported,
+     * listed here in priority order (the first non-null wins; later parameters are ignored):
+     *
+     *  1. **[config] — in-memory object.**
+     *      Pass an already-constructed instance of the called module's `@WithConfigClass`. This
+     *      avoids any disk I/O. The object is installed into the new module via [replaceConfig]
+     *      *after* construction, replacing whatever the constructor's default-loading path
+     *      produced. This is the recommended path for runtime/programmatic invocations.
+     *
+     *  2. **[configJson] — JSON snippet.**
+     *      Pass a raw JSON string. It is parsed using the called module's own
+     *      `@WithConfigDeserializer` (via [getDeserializerMapper]) into the declared config
+     *      class, then installed via [replaceConfig]. Useful when the parent has a JSON tree on
+     *      hand (e.g. forwarded from the user) but does not want to write it to disk first.
+     *
+     *  3. **[configKey] — disk-file pointer.**
+     *      The traditional `<file>@<json-pointer>` form (or `@@<json-pointer>` to refer to a
+     *      key in the main config file). This is forwarded to the called module's constructor
+     *      and read by it the usual way. Provided for parity with the static config path.
+     *
+     * If all three are null, the called module is constructed with no `configPath`, falling
+     * back to whatever its constructor does for the no-config case (typically `defaultConfig`,
+     * i.e. `null`).
+     *
+     * @param mainClassName Fully-qualified class name of the [AkibaModule] subclass to invoke.
+     *                      The corresponding jar must be present under `modules/`.
+     * @param config        Optional in-memory config object. Highest priority. See above.
+     * @param configJson    Optional JSON string. Second priority. See above.
+     * @param configKey     Optional disk-file config-key path. Lowest priority. Same semantics
+     *                      as `tasks[*].configKey` in the global config file.
+     * @param targetId      Binary id the called module should operate on. Defaults to this
+     *                      module's own [id], i.e. the binary currently under analysis.
+     * @param timeout       Per-invocation timeout (seconds). 0 disables the runtime timeout.
+     * @param consoleLogLevel Console log level for the spawned module.
+     * @param fileLogLevel    File log level for the spawned module.
+     * @param tableName     Optional override for the result table name.
+     * @return The newly created [AkibaModule] instance after it has finished running. Inspect
+     *         [AkibaModule.failureSign] to determine whether the call succeeded.
+     * @throws ClassNotFoundException   If [mainClassName] cannot be resolved as an [AkibaModule].
+     * @throws IllegalArgumentException If [config] is of a type incompatible with the called
+     *                                  module's declared config class.
+     */
+    @Throws(ClassNotFoundException::class, IllegalArgumentException::class, Exception::class)
+    open suspend fun callModule(
+        mainClassName: String,
+        config: Any? = null,
+        configJson: String? = null,
+        configKey: String? = null,
+        targetId: Int = this.id,
+        timeout: Int = DEFAULT_TIMEOUT,
+        consoleLogLevel: Level = Level.INFO,
+        fileLogLevel: Level = Level.INFO,
+        tableName: String? = null,
+    ): AkibaModule {
+        val moduleCtx = coroutineContext[ModuleContext.Key]
+            ?: throw IllegalStateException(
+                "callModule must be invoked from within a coroutine carrying a ModuleContext " +
+                "(typically from inside startProcess of an AkibaModule)")
+
+        // Resolve the target class. If it is not yet on the classpath, ProcedureArgumentsDeserializer
+        // will locate the jar under modules/ and load all its dependencies.
+        ProcedureArgumentsDeserializer.resolveModule(mainClassName)
+        val mainClass: Class<*> = try {
+            Class.forName(mainClassName)
+        } catch (_: ClassNotFoundException) {
+            ProcedureArgumentsDeserializer.loader.loadClass(mainClassName)
+        }
+        require(AkibaModule::class.java.isAssignableFrom(mainClass)) {
+            "$mainClassName is not a subclass of AkibaModule"
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        val mainClassKClass = mainClass.kotlin as KClass<out AkibaModule>
+
+        // Resolve in-memory config: object > JSON > disk-key.
+        // We pre-validate `config` here (before constructing the instance) so a clear error
+        // is raised on the parent's stack rather than after a successful but no-op construction.
+        val resolvedInMemoryConfig: Any? = when {
+            config != null -> {
+                val declared = mainClassKClass.findAnnotation<WithConfigClass>()?.clazz
+                require(declared != null) {
+                    "Cannot pass `config` to $mainClassName: it has no @WithConfigClass"
+                }
+                require(declared.java.isInstance(config)) {
+                    "config is of type ${config.javaClass.name}, but $mainClassName declares " +
+                    "config class ${declared.qualifiedName}"
+                }
+                config
+            }
+            configJson != null -> {
+                val declared = mainClassKClass.findAnnotation<WithConfigClass>()?.clazz
+                require(declared != null) {
+                    "Cannot pass `configJson` to $mainClassName: it has no @WithConfigClass"
+                }
+                getDeserializerMapper(mainClassKClass).readValue(configJson, declared.java)
+            }
+            else -> null
+        }
+
+        // Only forward `configKey` to the constructor when no in-memory config was provided.
+        // Otherwise the constructor's disk-loading branch would run uselessly (and could fail
+        // on a stale path) before we override the result via replaceConfig().
+        val ctorConfigPath = if (resolvedInMemoryConfig == null) configKey else null
+
+        val args = hashMapOf<String, Any?>(
+            "configPath" to ctorConfigPath,
+            "id" to targetId,
+            // Reuse the program loaded for this module if the call targets the same binary,
+            // otherwise pass null and let the called module decide.
+            "program" to if (targetId == this.id) program else null,
+            "consoleLogLevel" to consoleLogLevel,
+            "fileLogLevel" to fileLogLevel,
+            "tableName" to tableName,
+        )
+
+        // Construct the instance the same way ProcedureManager does, but capture it here so we
+        // can return it to the caller.
+        val constructor = mainClass.kotlin.primaryConstructor
+            ?: throw IllegalStateException("$mainClassName has no primary constructor")
+        val instance = constructor.call(
+            *constructor.parameters.map { args[it.name] }.toTypedArray()
+        ) as AkibaModule
+
+        // Apply in-memory config override now that the instance exists.
+        if (resolvedInMemoryConfig != null)
+            instance.replaceConfig(resolvedInMemoryConfig)
+
+        kotlinx.coroutines.withContext(coroutineContext + ModuleLogContext(instance.logger)) {
+            instance.startProcess(timeout)
+        }
+
+        // Register the called module's @TaskInterface methods into the current context so that
+        // after this call returns, the parent module can callTaskAPI() into the spawned one.
+        moduleCtx.lookup(instance)
+
+        if (instance.javaClass.annotations.none { it is NoNeedToClose })
+            instance.close()
+
+        if (instance.failureSign == FAILED || instance.failureSign == RUNTIME_ERROR) {
+            logger.warn("callModule(${mainClassName}) finished with failureSign=" +
+                "${instance.failureSign}")
+        }
+
+        return instance
+    }
+
+    /**
+     * Import a new binary file at runtime and register it in the database.
+     *
+     * This is the runtime counterpart of the static import config consumed by `ImportManager`.
+     * It is intended for modules that discover or generate additional binaries while analyzing
+     * another file (e.g. unpacked payloads, embedded firmware blobs, decrypted images). The new
+     * binary is recorded with provenance information — `source_id` set to this module's [id] and
+     * `source_module` set to this module's simple class name — so the imported file can be
+     * traced back to the analysis run that produced it.
+     *
+     * The file is copied to `<binariesRoot>/original/<newId>.bin` (and, if preprocessing is
+     * applied, to `<binariesRoot>/processed/<newId>.bin`) just like a top-level import. The
+     * caller may continue analyzing the new binary by passing the returned id to [callModule].
+     *
+     * @param path Absolute path to the file to import.
+     * @param arch Optional language hint. If null, Ghidra format auto-detection is attempted
+     *             first, then language guessing falls back if that fails.
+     * @return The id assigned to the newly registered binary. The returned value is suitable
+     *         for use as [callModule]'s `targetId` parameter.
+     * @throws IllegalArgumentException If [path] does not point to an existing regular file.
+     * @throws ImportManager.DuplicateChecksumException If a binary with the same MD5 checksum
+     *         is already registered (the file is *not* re-imported in this case).
+     */
+    @Throws(
+        IllegalArgumentException::class,
+        ImportManager.DuplicateChecksumException::class,
+    )
+    open fun importFile(path: Path, arch: Language? = null): Int {
+        val newId = ImportManager.importSingleFile(
+            originalPath = path,
+            arch = arch,
+            sourceId = if (this.id >= 0) this.id else null,
+            sourceModule = this.javaClass.simpleName,
+        )
+        logger.info("Imported $path as binary id=$newId " +
+            "(sourceId=${this.id}, sourceModule=${this.javaClass.simpleName})")
+        // The database column is INTEGER (int4); cast is safe.
+        return newId.toInt()
     }
 
     fun initLogger(logDir: Path, consoleLogLevel: Level = Level.INFO,
