@@ -135,6 +135,9 @@ object ImportManager {
                 )
             )
             originalPath.copyTo(WorkspaceManager.binaryPath.resolve("$id.bin"), overwrite = true)
+
+            it.name = "$id-${originalPath.fileName}"
+            project.saveAs(it, "/", it.name, false)
             project.close(it)
             return id
         }

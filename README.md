@@ -14,11 +14,35 @@ The Akiba Runtime Framework is the runtime entry point for the Akiba tool.
 
 ### Ghidra Preprocessing
 
-1. Download Ghidra 11.3.2 from here: [Link](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3.2_build/ghidra_11.3.2_PUBLIC_20250826.zip)
+1. Download Ghidra 12.1 from here: [Link](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1_build/ghidra_12.1_PUBLIC_20260513.zip)
 2. Extract Ghidra.zip
 3. (Optional but may be required by some modules) Extract some Ghidra official extensions (zip files) to `/Ghidra/Features`, so that Ghidra can package these extensions into `ghidra.jar` when building the JAR (by default, the `MachineLearning` extension is packaged)
 4. Go to the `/support` directory and run the `buildGhidraJar` script file (run `buildGhidraJar.bat` on Windows)
 5. If everything goes well, you can find the `ghidra.jar` file in `/support`. This is one of the dependencies Akiba needs. Copy it to `/path/to/Akiba/lib`
+
+Note: Akiba has so far only been verified on x64. If you need to run Ghidra and Akiba on a non-x64 processor, first go to the `support/gradle` subdirectory under the Ghidra root and run:
+```shell
+gradle buildNatives
+```
+On macOS Apple Silicon, the command above may not succeed out of the box. The workarounds below are provided for reference:
+
+#### Missing `binutils-2.41.tar.bz2`
+
+The `GnuDisassembler` extension needs the GNU binutils source code in order to compile `gdis`. This archive is not shipped with the Ghidra release and must be downloaded manually.
+
+Workaround: download it from https://ftp.gnu.org/pub/gnu/binutils/binutils-2.41.tar.bz2 and place it under `Ghidra/Extensions/GnuDisassembler/`.
+
+#### `fdopen` macro in zlib conflicts with the macOS SDK
+
+In the zlib bundled with binutils 2.41, `zutil.h` defines `#define fdopen(fd,mode) NULL` whenever `TARGET_OS_MAC` is detected. This collides with the `fdopen` function declaration in `_stdio.h` shipped by recent macOS SDKs (Xcode / Command Line Tools).
+
+Workaround: edit `build/binutils-2.41/zlib/zutil.h` and guard that macro definition with `!defined(__APPLE__)` so the broken macro is not introduced under modern Apple toolchains.
+
+#### Missing `makeinfo` tool
+
+Building binutils' documentation requires `makeinfo` (from the `texinfo` package), which is not installed on macOS by default.
+
+Workaround: install it via `brew install texinfo`.
 
 ### Build
 

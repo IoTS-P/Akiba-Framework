@@ -53,6 +53,15 @@ object WorkspaceManager: Closeable {
     lateinit var logRootDir: Path
     lateinit var taskConfigPath: File
 
+    /**
+     * Public accessor for `::logRootDir.isInitialized`. Kotlin only allows the
+     * `isInitialized` reference on a `lateinit` property to be queried from inside the
+     * declaring class/object, so callers outside this object (e.g. `ServerCommand`, which
+     * bootstraps a fallback log root because it bypasses [initWorkspace]) need this bridge.
+     */
+    val isLogRootDirInitialized: Boolean
+        get() = ::logRootDir.isInitialized
+
     val globalLogger: Logger = LogManager.getRootLogger()
 
     private var proj: GhidraProject? = null

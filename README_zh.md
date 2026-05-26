@@ -14,11 +14,38 @@ Akiba 运行框架是 Akiba 工具的运行入口。
 
 ### Ghidra 预处理
 
-1. 在这里下载 Ghidra 11.3.2：[链接](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.3.2_build/ghidra_11.3.2_PUBLIC_20250826.zip)
+1. 在这里下载 Ghidra 12.1：[链接](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1_build/ghidra_12.1_PUBLIC_20260513.zip)
 2. 解压 Ghidra.zip
 3. (可选但一些模块可能需要) 解压一些 Ghidra 官方扩展 (zip 文件) 到 `/Ghidra/Features`，这样 Ghidra 在 Jar 打包时可以将这些扩展打包进 `ghidra.jar` （默认打包 `MachineLearning` 扩展）
 4. 到 `/support` 目录运行 `buildGhidraJar` 脚本文件（在 Windows 上运行`buildGhidraJar.bat`）
 5. 如果一切顺利，你可以在 `/support` 找到 `ghidra.jar` 文件，这就是 Akiba 需要的依赖之一，将其复制到 `/path/to/Akiba/lib`
+
+注意：Akiba 目前仅在 x64 架构中测试运行成功，如果你需要在非 x64 架构处理器上运行 Ghidra 及 Akiba，你需要首先转到 Ghidra 根目录下的 support/gradle 子目录，运行下面的命令：
+```shell
+gradle buildNatives
+```
+在 MacOS X Apple Silicon 系统上，直接运行上述命令可能无法成功，可尝试下面的方法（仅供参考）： 
+
+#### 缺少 binutils-2.41.tar.bz2
+
+GnuDisassembler 扩展需要 GNU binutils 的源代码来编译 gdis。这个文件不包含在 Ghidra 发行包中，需要手动下载。
+
+解决方案：从 https://ftp.gnu.org/pub/gnu/binutils/binutils-2.41.tar.bz2 下载并放到 Ghidra/Extensions/GnuDisassembler/
+目录下。
+
+#### zlib 中 fdopen 宏与 macOS SDK 冲突
+
+binutils 2.41 自带的 zlib 中，`zutil.h` 在检测到 `TARGET_OS_MAC` 时会定义 `#define fdopen(fd,mode) NULL`，这与新版 macOS SDK
+(Xcode/CommandLineTools) 中 `_stdio.h` 的 `fdopen` 函数声明冲突。
+
+解决方案：修改 `build/binutils-2.41/zlib/zutil.h`，在该宏定义处增加 `!defined(__APPLE__)` 条件判断，避免在现代 Apple
+编译器下定义这个有问题的宏。
+
+#### 缺少 makeinfo 工具
+
+binutils 编译文档时需要 makeinfo（texinfo 包），macOS 默认未安装。
+
+解决方案：通过 `brew install texinfo` 安装。
 
 ### 编译
 

@@ -42,6 +42,7 @@ class Main : Runnable {
         try {
             importConfig ?.let {
                 ImportManager.import()
+                finally()
                 return@runBlocking
             }
         } catch (e: Exception) {

@@ -10,6 +10,7 @@ import ghidra.program.model.listing.Program
 import ghidra.util.exception.CancelledException
 import ghidra.util.task.TaskMonitorAdapter
 import ghidra.util.task.TimeoutTaskMonitor
+import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.job
@@ -37,6 +38,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
+import java.time.Instant
 import java.util.*
 import java.util.concurrent.TimeUnit
 import java.util.jar.JarFile
@@ -62,6 +64,15 @@ import kotlin.system.measureTimeMillis
  * @param properties Other properties of the program, optional.
  * @param consoleLogLevel The log level for the console, optional and default INFO.
  * @param fileLogLevel The log level for the file, optional and default INFO.
+ * @param tableName Override for the result table name, optional.
+ * @param runtimeReport Optional sink that mirrors this module's runtime side-effects
+ *                      ([updateData], [updateErr], `startTask` / `finishTask` timestamps and
+ *                      total execution time) into an in-memory map. The parent module that
+ *                      invoked this one via [callModule] uses it to inspect what the child
+ *                      did *without* round-tripping through the database. Top-level modules
+ *                      launched by `ProcedureManager` receive `null`, in which case nothing
+ *                      is mirrored and behavior is identical to before this parameter was
+ *                      added. See [RuntimeReport] for the schema.
  */
 abstract class AkibaModule (
     private val configPath: String? = null,
@@ -72,14 +83,37 @@ abstract class AkibaModule (
     consoleLogLevel: Level = Level.INFO,
     fileLogLevel: Level = Level.INFO,
     tableName: String? = null,
+    runtimeReport: RuntimeReport? = null,
 ) : AutoCloseable {
+    /**
+     * Internal sink used to mirror this module's runtime side-effects for the parent module
+     * that invoked it. Initialized from the constructor parameter; [callModule] also writes
+     * it directly via [installRuntimeReport] right after construction so that subclasses
+     * which do not (yet) forward `runtimeReport` to their `super(...)` call still benefit
+     * from the mirroring.
+     */
+    private var runtimeReport: RuntimeReport? = runtimeReport
     val logDir: Path = WorkspaceManager.logRootDir.resolve(id.toString())
     var logger: Logger = initLogger(logDir, consoleLogLevel, fileLogLevel)
     private val hasTable: Boolean = this::class.annotations.none { it is DoNotCreateTable }
+    internal val hasResultTable: Boolean
+        get() = hasTable
     protected var config: Any? = null
     private var loggerConfig: LoggerConfig? = null
     // failureSign is used to skip all latter tasks. If it is true, then all latter tasks will be skipped.
     var failureSign: Int = SUCCESS
+
+    /**
+     * Read-only view of this module's [RuntimeReport], if one was supplied at construction
+     * time (typically by [callModule]). Returns `null` for top-level modules launched
+     * directly by `ProcedureManager`, since they have no parent to report to.
+     *
+     * Reading this map *before* `startProcess` returns is supported but the contents are
+     * still being filled in; the parent should normally consume it only after the
+     * [callModule] coroutine call has resumed. See [RuntimeReport] for the schema.
+     */
+    val runtimeReportView: Map<String, Any?>?
+        get() = runtimeReport?.view
 
     protected val dbTableName: String =
         tableName ?: "${pascalToSnake(this.javaClass.simpleName)}_results"
@@ -188,6 +222,23 @@ abstract class AkibaModule (
     }
 
     /**
+     * Install (or replace) the [RuntimeReport] that mirrors this module's runtime
+     * side-effects for the parent module.
+     *
+     * This is called by [callModule] right after constructing the child instance, so that a
+     * subclass which does not (yet) thread the `runtimeReport` constructor parameter
+     * through to `super(...)` still gets the mirroring for free. It is **not** intended for
+     * end-user code; modules should declare a `runtimeReport` constructor parameter and
+     * forward it to `super(...)` instead, which is more explicit.
+     *
+     * Calling this after `startProcess` has already completed is supported but pointless —
+     * the side-effects worth mirroring have already happened.
+     */
+    internal fun installRuntimeReport(report: RuntimeReport?) {
+        this.runtimeReport = report
+    }
+
+    /**
      * Dynamically invoke another module on the binary currently being analyzed by this module
      * (or on an arbitrary binary id, if [targetId] is supplied).
      *
@@ -242,13 +293,17 @@ abstract class AkibaModule (
      * @param fileLogLevel    File log level for the spawned module.
      * @param tableName     Optional override for the result table name.
      * @return The newly created [AkibaModule] instance after it has finished running. Inspect
-     *         [AkibaModule.failureSign] to determine whether the call succeeded.
+     *         [AkibaModule.failureSign] to determine whether the call succeeded, and read
+     *         [AkibaModule.runtimeReportView] to observe the child's runtime side-effects
+     *         (data written via `updateData` / `updateErr`, plus the start / end timestamps
+     *         and total execution time) without having to query the database.
      * @throws ClassNotFoundException   If [mainClassName] cannot be resolved as an [AkibaModule].
      * @throws IllegalArgumentException If [config] is of a type incompatible with the called
      *                                  module's declared config class.
      */
     @Throws(ClassNotFoundException::class, IllegalArgumentException::class, Exception::class)
     open suspend fun callModule(
+        program: Program?,
         mainClassName: String,
         config: Any? = null,
         configJson: String? = null,
@@ -309,15 +364,22 @@ abstract class AkibaModule (
         // on a stale path) before we override the result via replaceConfig().
         val ctorConfigPath = if (resolvedInMemoryConfig == null) configKey else null
 
-        val args = hashMapOf<String, Any?>(
+        // Create a fresh runtime report for the child. We pass it both via the constructor
+        // arg map (in case the subclass forwards a `runtimeReport` parameter to super()) and
+        // via installRuntimeReport() after construction (so the mirroring works even when the
+        // subclass does not declare such a parameter — which is the common case).
+        val childReport = RuntimeReport()
+
+        val args = hashMapOf(
             "configPath" to ctorConfigPath,
             "id" to targetId,
             // Reuse the program loaded for this module if the call targets the same binary,
             // otherwise pass null and let the called module decide.
-            "program" to if (targetId == this.id) program else null,
+            "program" to program,
             "consoleLogLevel" to consoleLogLevel,
             "fileLogLevel" to fileLogLevel,
             "tableName" to tableName,
+            "runtimeReport" to childReport,
         )
 
         // Construct the instance the same way ProcedureManager does, but capture it here so we
@@ -331,6 +393,24 @@ abstract class AkibaModule (
         // Apply in-memory config override now that the instance exists.
         if (resolvedInMemoryConfig != null)
             instance.replaceConfig(resolvedInMemoryConfig)
+
+        instance.installRuntimeReport(childReport)
+        if (instance.hasResultTable) {
+            try {
+                DatabaseClient.createModuleTable(instance.dbTableName, instance.allDefinedDbColumns)
+            } catch (e: DatabaseClient.DatabaseDaemonException) {
+                if (e.statusCode == HttpStatusCode.Conflict)
+                    logger.debug("callModule: child table ${instance.dbTableName} already exists")
+                else throw e
+            }
+            try {
+                DatabaseClient.tableLock(instance.dbTableName)
+            } catch (e: DatabaseClient.DatabaseDaemonException) {
+                if (e.statusCode == HttpStatusCode.Conflict)
+                    logger.debug("callModule: child table ${instance.dbTableName} already locked")
+                else throw e
+            }
+        }
 
         kotlinx.coroutines.withContext(coroutineContext + ModuleLogContext(instance.logger)) {
             instance.startProcess(timeout)
@@ -467,6 +547,11 @@ abstract class AkibaModule (
      */
     @Throws(Exception::class)
     open suspend fun startProcess(timeout: Int = 0) {
+        // Record the canonical "start" timestamp into the runtime report, regardless of
+        // whether the module owns a database table — the report is an independent mirror,
+        // and the time at which startProcess() was entered is meaningful in either case.
+        runtimeReport?.recordStart(Instant.now())
+
         if (hasTable)
             DatabaseClient.startTask(dbTableName, id.toLong())
 
@@ -508,6 +593,7 @@ abstract class AkibaModule (
         }
 
         logger.debug("execution time: $executionTime ms")
+        runtimeReport?.recordExecutionTime(executionTime)
 
         if (taskGlobalMonitor.isCancelled) {        // Timeout occurred
             if (this.javaClass.annotations.any { it is FailOnCancelled })
@@ -518,6 +604,8 @@ abstract class AkibaModule (
                     taskGlobalMonitor.cancel()
             } catch (_: Exception) {}
         }
+
+        runtimeReport?.recordEnd(Instant.now())
 
         if (hasTable)
             DatabaseClient.finishTask(dbTableName, id.toLong())
@@ -543,6 +631,9 @@ abstract class AkibaModule (
 
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     protected open fun updateData(data: Map<String, Any?>) {
+        // Mirror into the runtime report first so the parent observes the data even when
+        // this module has DoNotCreateTable (no DB write happens then).
+        runtimeReport?.recordUpdateData(data)
         if (hasTable)
             DatabaseClient.updateData(dbTableName, id.toLong(), data)
         else
@@ -552,12 +643,14 @@ abstract class AkibaModule (
 
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     protected open fun updateErr(msg: String) {
+        runtimeReport?.recordErr(msg)
         if (hasTable)
             DatabaseClient.updateData(dbTableName, id.toLong(), mapOf("err_msg" to msg))
     }
 
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     protected open fun clearErr() {
+        runtimeReport?.recordErr(null)
         if (hasTable)
             DatabaseClient.updateData(dbTableName, id.toLong(), mapOf("err_msg" to null))
     }

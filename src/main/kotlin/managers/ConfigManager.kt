@@ -30,6 +30,9 @@ import kotlin.system.exitProcess
 object ConfigManager {
     lateinit var config: Configs
 
+    val isConfigInitialized: Boolean
+        get() = ::config.isInitialized
+
     val sqlSource: SqlSource
         get() = config.sqlSource
     val mainConf: General

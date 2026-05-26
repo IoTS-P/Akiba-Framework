@@ -2,13 +2,18 @@ package org.iotsplab.akiba.subcommands
 
 import ghidra.program.model.listing.Program
 import org.apache.logging.log4j.Level
+import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.utils.ProcedureArguments
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer.loadAllModules
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer.resolveModule
 import picocli.CommandLine
+import java.io.File
 import java.io.File.createTempFile
+import java.nio.file.Files
+import java.nio.file.Path
 import kotlin.String
 import kotlin.reflect.full.primaryConstructor
 
@@ -31,6 +36,13 @@ class ServerCommand : Runnable {
         required = false
     )
     var host: String = "0.0.0.0"
+
+    @CommandLine.Option(
+        names = ["--bin-root"],
+        description = ["Root directory for binary files"],
+        required = false
+    )
+    var binRoot: String = System.getProperty("user.home") + "/.akiba"
 
     @CommandLine.Option(
         names = ["--jwt-secret"],
@@ -91,6 +103,80 @@ class ServerCommand : Runnable {
     override fun run() {
         System.err.println("DEBUG: ServerCommand.run() called")
 
+        if (!WorkspaceManager.isLogRootDirInitialized) {
+            val serverLogDir: Path = Path.of("logs/server")
+            Files.createDirectories(serverLogDir)
+            WorkspaceManager.logRootDir = serverLogDir
+            System.err.println("DEBUG: Bootstrapped WorkspaceManager.logRootDir = ${serverLogDir.toAbsolutePath()}")
+        }
+
+        if (!ConfigManager.isConfigInitialized) {
+            val (operatorConfigFile, _) = ConfigManager.parseJsonPath(
+                org.iotsplab.akiba.Main.mainConfigPath
+            )
+            val configFileToLoad: String = if (File(operatorConfigFile).isFile) {
+                System.err.println("DEBUG: Using existing main config at $operatorConfigFile")
+                org.iotsplab.akiba.Main.mainConfigPath
+            } else {
+                val binariesRoot = Path.of(binRoot)
+                Files.createDirectories(binariesRoot.resolve("original"))
+                Files.createDirectories(binariesRoot.resolve("processed"))
+                val binariesRootJson = binariesRoot.toAbsolutePath().toString()
+                    .replace("\\", "\\\\")
+                    .replace("\"", "\\\"")
+
+                val syntheticConfig = """
+                    {
+                      "main": {
+                        "username": "$dbUser",
+                        "password": "$dbPassword",
+                        "usingInstance": null,
+                        "globalConsoleLogLevel": "INFO",
+                        "globalFileLogLevel": "DEBUG",
+                        "general": {
+                          "binariesRoot": "$binariesRootJson",
+                          "importRoot": null,
+                          "processor": "n/a",
+                          "autoAnalysisTimeout": 180,
+                          "threads": 1
+                        },
+                        "withGhidraProject": {
+                          "projectRoot": "ghidra_projects",
+                          "name": "server",
+                          "mode": "new",
+                          "forkTo": null,
+                          "forkOnTask": false,
+                          "continueLog": null,
+                          "overwriteProject": false,
+                          "deletePreviousProgram": false,
+                          "overwriteLog": false,
+                          "saveProject": false,
+                          "noCreateProgram": false
+                        },
+                        "sqlSource": {
+                          "serverIP": "$daemonHost",
+                          "serverPort": $daemonPort,
+                          "useSnapshot": "current",
+                          "constraint": "",
+                          "disableUpdate": false,
+                          "useLocalCache": null
+                        },
+                        "globalPreTasks": [],
+                        "packages": null,
+                        "dbImports": null,
+                        "tasks": []
+                      }
+                    }
+                """.trimIndent()
+                val syntheticFile = createTempFile("akiba_server_main_config", ".json")
+                syntheticFile.writeText(syntheticConfig)
+                syntheticFile.deleteOnExit()
+                System.err.println("DEBUG: Synthesized main config at ${syntheticFile.absolutePath}")
+                syntheticFile.absolutePath + ConfigManager.KEY_SEPARATOR + "/main"
+            }
+            ConfigManager.config = ConfigManager.loadGlobalConfig(configFileToLoad)
+        }
+
         val serverConfigJson = """
             {
                 "mode": "server",
@@ -113,8 +199,6 @@ class ServerCommand : Runnable {
         tempFile.writeText(serverConfigJson)
         tempFile.deleteOnExit()
 
-        System.err.println("DEBUG: Config file created at ${tempFile.absolutePath}")
-
         resolveModule("org.iotsplab.akiba.module.AkibaUtils")
 
         val task = ProcedureArguments(
@@ -122,20 +206,13 @@ class ServerCommand : Runnable {
             configKey = tempFile.absolutePath
         )
         loadAllModules(listOf(task))
-        System.err.println("DEBUG: Modules loaded, task.mainClass = ${task.mainClass}")
 
-        val mainClass = task.mainClass
-        if (mainClass == null) {
-            System.err.println("ERROR: task.mainClass is null!")
-            return
-        }
+        val mainClass = task.mainClass ?: return
 
-        System.err.println("DEBUG: Using Java reflection to get constructor...")
         val constructor = mainClass.kotlin.primaryConstructor!!
 
         val instance = constructor.call(tempFile.absolutePath) as AkibaModule
 
-        System.err.println("DEBUG: Module created via Java reflection: $instance, calling startProcess()")
         kotlinx.coroutines.runBlocking {
             instance.startProcess()
         }
