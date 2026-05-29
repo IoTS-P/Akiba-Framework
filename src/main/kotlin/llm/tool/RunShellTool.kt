@@ -52,12 +52,22 @@ fun RunShellTool(
     name = "run_shell",
     description = buildString {
         appendLine("Execute a shell command in the module's workspace directory.")
-        appendLine("The working directory is a sandboxed workspace folder.")
-        appendLine("IMPORTANT: Avoid using absolute paths unless strictly necessary.")
-        appendLine("IMPORTANT: Each command execution requires user confirmation.")
-        appendLine("Use this for: file operations, compiling code, running tools like objdump/readelf,")
-        appendLine("grep/find within the workspace, or other analysis utilities.")
-        appendLine("Do NOT use this for destructive system-wide operations (rm -rf /, shutdown, etc).")
+        appendLine()
+        appendLine("⚠️  WARNING: This tool is a LAST RESORT. Before using it, consider:")
+        appendLine("  - Use `run_script` for ANY Ghidra binary analysis (listing functions,")
+        appendLine("    decompiling, finding references, reading memory, etc.)")
+        appendLine("  - Use `query_ghidra_api` to look up API classes and methods")
+        appendLine("  - Use `query_module_data` to retrieve data from other modules")
+        appendLine()
+        appendLine("Only use run_shell when you need system utilities that cannot be accessed")
+        appendLine("through Ghidra APIs or other tools (e.g. downloading a file, converting formats).")
+        appendLine()
+        appendLine("Constraints:")
+        appendLine("  - Each command requires user confirmation (execution may be denied)")
+        appendLine("  - The workspace directory is EMPTY by default — no binary files are in it")
+        appendLine("  - The loaded binary is accessible ONLY via `currentProgram` in run_script")
+        appendLine("  - Do NOT use shell for: objdump, readelf, strings, nm — use run_script instead,")
+        appendLine("    which has direct access to the same information via Ghidra APIs")
     },
     parameters = listOf(
         ToolParameter(

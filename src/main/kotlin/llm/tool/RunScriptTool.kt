@@ -53,22 +53,93 @@ import kotlin.system.measureTimeMillis
 fun RunScriptTool(parent: AkibaModule): Tool = Tool(
     name = "run_script",
     description = buildString {
-        appendLine("Compile and run a Kotlin script that analyzes the current binary.")
+        appendLine("Compile and run a Kotlin script that analyzes the current binary loaded in Ghidra.")
         appendLine("The script must define a class extending AkibaScript with an execute() method.")
-        appendLine("Inside execute(), you can use currentProgram to access the Ghidra Program,")
-        appendLine("appendOutput()/appendLine() to produce text output, and updateData() for structured results.")
+        appendLine("Inside execute(), use `currentProgram` to access the Ghidra Program object,")
+        appendLine("`appendOutput()`/`appendLine()` to produce text output, and `updateData()` for structured results.")
         appendLine("Each run uses an isolated ClassLoader, so class name conflicts are avoided.")
-        appendLine("Use this for one-off analysis tasks that don't warrant a full module.")
+        appendLine()
+        appendLine("IMPORTANT: Scripts are written in Kotlin, NOT Java or Jython.")
+        appendLine("- `currentProgram` is the loaded Ghidra Program (same as `program` in standard Ghidra scripts)")
+        appendLine("- All Ghidra API packages (ghidra.program.model.*, ghidra.app.decompiler.*, etc.) are available")
+        appendLine("- Use `appendLine(text)` instead of `println()` — println output is not captured")
+        appendLine("- The execute() method is `suspend` but you can call blocking Ghidra APIs directly")
+        appendLine()
+        appendLine("=== EXAMPLE 1: List all functions ===")
+        appendLine("```kotlin")
+        appendLine("import org.iotsplab.akiba.script.AkibaScript")
+        appendLine("")
+        appendLine("class ListFunctions : AkibaScript() {")
+        appendLine("    override suspend fun execute() {")
+        appendLine("        val fm = currentProgram!!.functionManager")
+        appendLine("        val iter = fm.getFunctions(true)")
+        appendLine("        var count = 0")
+        appendLine("        while (iter.hasNext()) {")
+        appendLine("            val func = iter.next()")
+        appendLine($$"            appendLine(\"${func.name} @ ${func.entryPoint}\")")
+        appendLine("            count++")
+        appendLine("        }")
+        appendLine($$"        appendLine(\"Total: $count functions\")")
+        appendLine("    }")
+        appendLine("}")
+        appendLine("```")
+        appendLine()
+        appendLine("=== EXAMPLE 2: Decompile a function ===")
+        appendLine("```kotlin")
+        appendLine("import org.iotsplab.akiba.script.AkibaScript")
+        appendLine("import ghidra.app.decompiler.DecompInterface")
+        appendLine("")
+        appendLine("class DecompileMain : AkibaScript() {")
+        appendLine("    override suspend fun execute() {")
+        appendLine("        val decomp = DecompInterface()")
+        appendLine("        decomp.openProgram(currentProgram)")
+        appendLine("        val func = currentProgram!!.functionManager.getFunctionAt(")
+        appendLine("            currentProgram!!.minAddress")
+        appendLine("        ) ?: run { appendLine(\"No function at min address\"); return }")
+        appendLine("        val result = decomp.decompileFunction(func, 30, null)")
+        appendLine("        appendLine(result.decompiledFunction?.c ?: \"Decompile failed\")")
+        appendLine("        decomp.dispose()")
+        appendLine("    }")
+        appendLine("}")
+        appendLine("```")
+        appendLine()
+        appendLine("=== EXAMPLE 3: Find calls to dangerous functions ===")
+        appendLine("```kotlin")
+        appendLine("import org.iotsplab.akiba.script.AkibaScript")
+        appendLine("import ghidra.program.model.symbol.ReferenceManager")
+        appendLine("")
+        appendLine("class FindDangerousCalls : AkibaScript() {")
+        appendLine("    override suspend fun execute() {")
+        appendLine("        val dangerousFns = listOf(\"gets\", \"strcpy\", \"sprintf\", \"strcat\", \"scanf\")")
+        appendLine("        val fm = currentProgram!!.functionManager")
+        appendLine("        val iter = fm.getFunctions(true)")
+        appendLine("        while (iter.hasNext()) {")
+        appendLine("            val func = iter.next()")
+        appendLine("            if (func.name in dangerousFns) {")
+        appendLine("                val refs = currentProgram!!.referenceManager")
+        appendLine("                    .getReferencesTo(func.entryPoint)")
+        appendLine($$"                appendLine(\"${func.name} @ ${func.entryPoint} — called from:\")")
+        appendLine("                refs.forEach { ref ->")
+        appendLine("                    val caller = fm.getFunctionContaining(ref.fromAddress)")
+        appendLine($$"                    appendLine(\"  ${caller?.name ?: \"unknown\"} @ ${ref.fromAddress}\")")
+        appendLine("                }")
+        appendLine("            }")
+        appendLine("        }")
+        appendLine("    }")
+        appendLine("}")
+        appendLine("```")
     },
     parameters = listOf(
         ToolParameter(
             "source", "string",
-            "Full Kotlin source code of the script. Must define a class extending AkibaScript.",
+            "Full Kotlin source code of the script. Must define a class extending AkibaScript " +
+                "with `override suspend fun execute()`. Use appendLine() for output.",
             required = true
         ),
         ToolParameter(
             "className", "string",
-            "Simple class name for the script. Defaults to 'AkibaDynamicScript'.",
+            "Simple class name for the script (must match the class name in source). " +
+                "Defaults to 'AkibaDynamicScript'.",
             required = false
         ),
         ToolParameter(
@@ -90,41 +161,56 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
 
     val mapper = jacksonObjectMapper()
 
-    // 1. Validate
+    // 1. Record the script in the per-instance DB (best-effort, before any processing)
+    var executionId: Int? = null
+    try {
+        val scriptId = AgentDatabaseClient.createScript(
+            name = className,
+            code = source,
+            saveResult = false,
+            maxOutputSize = 10 * 1024 * 1024
+        )
+        executionId = AgentDatabaseClient.createScriptExecution(scriptId, targetId)
+        AgentDatabaseClient.updateScriptExecution(executionId, null, "running", null)
+    } catch (_: Exception) {
+        // Recording is best-effort; don't block execution if it fails
+    }
+
+    // 2. Validate
     val validationIssues = ScriptCompiler.validate(source)
     if (validationIssues.isNotEmpty()) {
+        val errorMsg = "Validation failed: ${validationIssues.joinToString("; ")}"
+        try {
+            if (executionId != null) {
+                AgentDatabaseClient.updateScriptExecution(executionId, null, "failed", errorMsg)
+            }
+        } catch (_: Exception) { }
         return@Tool "Error: script validation failed: ${validationIssues.joinToString("; ")}"
     }
 
-    // 2. Resolve program
+    // 3. Resolve program
     val targetProgram = if (targetId == parent.id) {
         parent.currentProgram
     } else {
         parent.getProgram(targetId)
-            ?: return@Tool mapper.writeValueAsString(mapOf(
-                "success" to false,
-                "error" to "Program not found for binary id=$targetId"
-            ))
+            ?: run {
+                try {
+                    if (executionId != null) {
+                        AgentDatabaseClient.updateScriptExecution(
+                            executionId, null, "failed", "Program not found for binary id=$targetId"
+                        )
+                    }
+                } catch (_: Exception) { }
+                return@Tool mapper.writeValueAsString(mapOf(
+                    "success" to false,
+                    "error" to "Program not found for binary id=$targetId"
+                ))
+            }
     }
 
-    // 3. Compile, load, run
+    // 4. Compile, load, run
     try {
         var resultJson = ""
-
-        // 3a. Record the script execution in the per-instance DB
-        var executionId: Int? = null
-        try {
-            val scriptId = AgentDatabaseClient.createScript(
-                name = className,
-                code = source,
-                saveResult = false,
-                maxOutputSize = 10 * 1024 * 1024
-            )
-            executionId = AgentDatabaseClient.createScriptExecution(scriptId, targetId)
-            AgentDatabaseClient.updateScriptExecution(executionId, null, "running", null)
-        } catch (_: Exception) {
-            // Recording is best-effort; don't block execution if it fails
-        }
 
         val totalElapsed = measureTimeMillis {
             runBlocking {
@@ -163,7 +249,7 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
             resultJson
         }
 
-        // 3b. Update the execution record
+        // Update execution record as completed
         try {
             if (executionId != null) {
                 val output = (mapper.readTree(finalResult)["output"]?.asText() ?: "").take(10000)
@@ -175,10 +261,35 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
 
         finalResult
     } catch (e: org.iotsplab.akiba.script.CompilationException) {
+        // Update execution record with compilation error
+        try {
+            if (executionId != null) {
+                AgentDatabaseClient.updateScriptExecution(
+                    executionId, null, "failed", "Compilation error: ${e.message}"
+                )
+            }
+        } catch (_: Exception) { }
         "Error: script compilation failed: ${e.message}"
     } catch (e: IllegalStateException) {
+        // Update execution record with instantiation error
+        try {
+            if (executionId != null) {
+                AgentDatabaseClient.updateScriptExecution(
+                    executionId, null, "failed", "Instantiation error: ${e.message}"
+                )
+            }
+        } catch (_: Exception) { }
         "Error: script instantiation failed: ${e.message}"
     } catch (e: Exception) {
+        // Update execution record with runtime error
+        try {
+            if (executionId != null) {
+                val errorMsg = "${e.javaClass.simpleName}: ${e.message}"
+                AgentDatabaseClient.updateScriptExecution(
+                    executionId, null, "failed", errorMsg
+                )
+            }
+        } catch (_: Exception) { }
         "Error running script: ${e.message}"
     }
 }

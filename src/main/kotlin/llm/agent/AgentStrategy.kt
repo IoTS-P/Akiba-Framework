@@ -54,7 +54,8 @@ class StrategyContext(
     val maxIterations: Int,
     val enrichSystemPromptWithMemory: Boolean,
     val auditToolCalls: Boolean,
-    val logger: org.apache.logging.log4j.Logger = LogManager.getLogger(StrategyContext::class.java)
+    val logger: org.apache.logging.log4j.Logger = LogManager.getLogger(StrategyContext::class.java),
+    val transcript: AgentTranscriptWriter? = null
 ) {
     /** Accumulated counters during the loop. Mutable, shared across the strategy. */
     @Suppress("LeakingThis")
@@ -103,8 +104,14 @@ class StrategyContext(
         val tool = toolRegistry.get(toolCall.name)
         if (tool == null) {
             val errMsg = "Unknown tool: ${toolCall.name}. Available: ${toolRegistry.names()}"
+            transcript?.writeToolResult(toolCall.name, errMsg)
             return errMsg
         }
+
+        // Write tool call to transcript
+        transcript?.writeToolCall(
+            toolCall.name, toolCall.argumentsJson, toolCall.arguments, stats.iterations
+        )
 
         var result: String
         val durationMs = measureTimeMillis {
@@ -112,6 +119,9 @@ class StrategyContext(
         }
 
         stats.toolCallsMade++
+
+        // Write tool result to transcript
+        transcript?.writeToolResult(toolCall.name, result, durationMs)
 
         // Audit to database
         if (auditToolCalls && sessionId != null) {
@@ -460,6 +470,9 @@ class ReActStrategy : AgentStrategy {
     override fun execute(ctx: StrategyContext): AgentResult {
         val logger = ctx.logger
 
+        // Write system prompt to transcript (only on first iteration)
+        ctx.transcript?.writeSystemPrompt(ctx.buildEffectiveSystemPrompt(REACT_INSTRUCTION))
+
         while (ctx.stats.iterations < ctx.maxIterations) {
             ctx.stats.iterations++
             logger.debug("[ReAct] iteration ${ctx.stats.iterations}/${ctx.maxIterations}")
@@ -480,6 +493,7 @@ class ReActStrategy : AgentStrategy {
             ctx.memory.addAssistantMessage(assistantText)
 
             logger.info("[ReAct] Assistant (${assistantText.length} chars): ${assistantText.take(300)}...")
+            ctx.transcript?.writeAssistantMessage(assistantText, ctx.stats.iterations)
 
             // Parse tool call (native first, then text-based fallback)
             val toolCall = ToolCallParser.parseFromCompletion(completion)
@@ -507,22 +521,20 @@ class ReActStrategy : AgentStrategy {
                 if (finalAnswer != null) {
                     // LLM explicitly signaled it's done
                     ctx.updateSessionStatus("completed")
-                    return ctx.stats.toResult(
+                    val result = ctx.stats.toResult(
                         output = finalAnswer,
                         stopReason = StopReason.COMPLETED
                     )
+                    ctx.transcript?.writeSessionEnd(result)
+                    return result
                 }
 
                 // LLM did not provide a Final Answer nor a valid tool call.
-                // This likely means it's still reasoning or used an incorrect
-                // format. Give it another chance by injecting a format reminder
-                // with a concrete example and available tool names.
                 logger.warn("[ReAct] No tool call or final answer detected in response. " +
                     "Text preview: ${assistantText.take(500)}")
 
                 val toolNames = ctx.toolRegistry.names().joinToString(", ")
-                ctx.memory.addUserMessage(
-                    "Your previous response did not contain a valid tool call or a **Final Answer:**.\n\n" +
+                val reminder = "Your previous response did not contain a valid tool call or a **Final Answer:**.\n\n" +
                     "You MUST use this exact JSON format for tool calls:\n" +
                     "```json\n{\"tool_call\": {\"name\": \"<tool_name>\", \"arguments\": {<args>}}}\n```\n\n" +
                     "Available tools: $toolNames\n\n" +
@@ -530,18 +542,21 @@ class ReActStrategy : AgentStrategy {
                     "```json\n{\"tool_call\": {\"name\": \"list_modules\", \"arguments\": {}}}\n```\n\n" +
                     "Please respond with **Thought:** followed by either a valid **Action:** with the JSON above, " +
                     "or a **Final Answer:** if you have enough information."
-                )
+                ctx.memory.addUserMessage(reminder)
+                ctx.transcript?.writeFormatReminder(reminder)
             }
         }
 
         // Max iterations
         logger.warn("[ReAct] reached max iterations (${ctx.maxIterations})")
         ctx.updateSessionStatus("error")
-        return ctx.stats.toResult(
+        val result = ctx.stats.toResult(
             output = extractLastAnswer(ctx.memory)
                 ?: "Agent reached maximum iterations without producing a final answer.",
             stopReason = StopReason.MAX_ITERATIONS
         )
+        ctx.transcript?.writeSessionEnd(result)
+        return result
     }
 
     /** Extract the Final Answer portion from a ReAct response. */
@@ -681,6 +696,9 @@ class PlanExecuteStrategy(
         val logger = ctx.logger
         var replanCycle = 0
 
+        // Write system prompt to transcript at start
+        ctx.transcript?.writeSystemPrompt(ctx.buildEffectiveSystemPrompt(PLANNING_INSTRUCTION))
+
         while (replanCycle <= maxReplanCycles) {
             // ── Phase 1: Planning ──────────────────────────────────────
             val plan = if (replanCycle == 0) {
@@ -694,10 +712,12 @@ class PlanExecuteStrategy(
             if (plan.isEmpty()) {
                 logger.warn("[PlanExec] Failed to create a plan, falling back to direct answer")
                 ctx.updateSessionStatus("completed")
-                return ctx.stats.toResult(
+                val result = ctx.stats.toResult(
                     output = "Agent could not formulate a plan for this task.",
                     stopReason = StopReason.ERROR
                 )
+                ctx.transcript?.writeSessionEnd(result)
+                return result
             }
 
             // Store plan in memory
@@ -723,10 +743,12 @@ class PlanExecuteStrategy(
                     // ── Phase 3: Reflection ────────────────────────────
                     val finalAnswer = reflect(ctx)
                     ctx.updateSessionStatus("completed")
-                    return ctx.stats.toResult(
+                    val result = ctx.stats.toResult(
                         output = finalAnswer,
                         stopReason = StopReason.COMPLETED
                     )
+                    ctx.transcript?.writeSessionEnd(result)
+                    return result
                 }
                 is ExecResult.ReplanNeeded -> {
                     replanCycle++
@@ -735,18 +757,22 @@ class PlanExecuteStrategy(
                 }
                 is ExecResult.MaxIterations -> {
                     ctx.updateSessionStatus("error")
-                    return ctx.stats.toResult(
+                    val result = ctx.stats.toResult(
                         output = extractLastAnswer(ctx.memory)
                             ?: "Agent reached maximum iterations during plan execution.",
                         stopReason = StopReason.MAX_ITERATIONS
                     )
+                    ctx.transcript?.writeSessionEnd(result)
+                    return result
                 }
                 is ExecResult.Error -> {
                     ctx.updateSessionStatus("error")
-                    return ctx.stats.toResult(
+                    val result = ctx.stats.toResult(
                         output = "Agent error: ${executionResult.message}",
                         stopReason = StopReason.ERROR
                     )
+                    ctx.transcript?.writeSessionEnd(result)
+                    return result
                 }
             }
         }
@@ -755,10 +781,12 @@ class PlanExecuteStrategy(
         logger.warn("[PlanExec] Exceeded max replan cycles ($maxReplanCycles)")
         val finalAnswer = reflect(ctx)
         ctx.updateSessionStatus("completed")
-        return ctx.stats.toResult(
+        val result = ctx.stats.toResult(
             output = finalAnswer,
             stopReason = StopReason.COMPLETED
         )
+        ctx.transcript?.writeSessionEnd(result)
+        return result
     }
 
     // ---- Phase 1: Planning ────────────────────────────────────────────
@@ -879,6 +907,7 @@ class PlanExecuteStrategy(
 
                 val assistantText = completion.content
                 ctx.memory.addAssistantMessage(assistantText)
+                ctx.transcript?.writeAssistantMessage(assistantText, ctx.stats.iterations)
 
                 // Check for replan request
                 if (assistantText.contains("Replan Needed:", ignoreCase = true)) {

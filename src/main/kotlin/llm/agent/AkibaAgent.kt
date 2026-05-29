@@ -106,7 +106,12 @@ class AkibaAgent(
     /** Logger for strategy execution. When provided (e.g. from AgentModule),
      *  logs go to the module's per-binary log file, making multi-threaded
      *  debugging possible. Falls back to a class-level logger. */
-    val logger: Logger = LogManager.getLogger(AkibaAgent::class.java)
+    val logger: Logger = LogManager.getLogger(AkibaAgent::class.java),
+
+    /** Transcript writer for detailed Markdown-formatted interaction log.
+     *  When provided, all LLM interactions, tool calls, and results are
+     *  written to a readable file at `<logDir>/agent_transcript.md`. */
+    val transcript: AgentTranscriptWriter? = null
 ) {
 
     // ---- Public API ------------------------------------------------------
@@ -157,7 +162,8 @@ class AkibaAgent(
             maxIterations = maxIterations,
             enrichSystemPromptWithMemory = enrichSystemPromptWithMemory,
             auditToolCalls = auditToolCalls,
-            logger = logger
+            logger = logger,
+            transcript = transcript
         )
         return strategy.execute(ctx)
     }

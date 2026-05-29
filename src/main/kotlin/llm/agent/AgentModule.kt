@@ -320,9 +320,12 @@ abstract class AgentModule(
 
         logger.info("Agent tools: ${toolRegistry.names()}")
 
-        // 6. Build agent
+        // 6. Build agent with transcript writer
         val strategy = agentStrategy()
         logger.info("Agent strategy: ${strategy.name}")
+
+        val transcript = AgentTranscriptWriter(logDir)
+        val modelName = resolveModelName()
 
         val agent = AkibaAgent(
             client = llmClient,
@@ -335,13 +338,23 @@ abstract class AgentModule(
             enrichSystemPromptWithMemory = true,
             auditToolCalls = true,
             strategy = strategy,
-            logger = logger
+            logger = logger,
+            transcript = transcript
         )
         this.agent = agent
+
+        // Write session start to transcript
+        transcript.writeSessionStart(
+            moduleName = this::class.simpleName ?: "AgentModule",
+            binaryId = id,
+            modelName = modelName,
+            strategy = strategy.name
+        )
 
         // 7. Run agent
         val prompt = taskPrompt()
         logger.info("Agent task: ${prompt.take(200)}")
+        transcript.writeUserMessage(prompt)
 
         try {
             val result = agent.run(prompt)
@@ -372,6 +385,7 @@ abstract class AgentModule(
                 } catch (_: Exception) {}
             }
         } finally {
+            transcript.close()
             llmClient.close()
         }
     }
