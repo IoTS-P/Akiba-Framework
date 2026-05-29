@@ -24,7 +24,8 @@ import kotlin.system.exitProcess
         DeleteInstance::class,
         StartInstance::class,
         ShutdownInstance::class,
-        ServerCommand::class
+        ServerCommand::class,
+        MeltdownCommand::class
     ]
 )
 class Main : Runnable {

@@ -63,12 +63,24 @@ dependencies {
     implementation("io.ktor:ktor-client-websockets:3.4.2")
     implementation("io.ktor:ktor-serialization-jackson-jvm:3.4.2")
 
+    // Langchain4j core + providers
+    implementation("dev.langchain4j:langchain4j:1.15.0")
+    implementation("dev.langchain4j:langchain4j-open-ai:1.15.0")
+    implementation("dev.langchain4j:langchain4j-anthropic:1.15.0")
+    implementation("dev.langchain4j:langchain4j-google-ai-gemini:1.15.0")
+    implementation("dev.langchain4j:langchain4j-mistral-ai:1.15.0")
+    implementation("dev.langchain4j:langchain4j-ollama:1.15.0")
+    implementation("dev.langchain4j:langchain4j-azure-open-ai:1.15.0")
+
     // JWT for authentication
     implementation("io.jsonwebtoken:jjwt:0.12.6")
     implementation("org.mindrot:jbcrypt:0.4")
 
-    // Kotlin compiler for runtime script compilation
-    implementation("org.jetbrains.kotlin:kotlin-compiler-embeddable:1.9.22")
+    // Kotlin compiler for runtime script compilation. Pinned to the same
+    // version as the project's `kotlin("jvm")` plugin so that runtime-compiled
+    // scripts can read the metadata of the framework's own classes (and of
+    // transitive deps such as Ktor compiled with the same Kotlin).
+    implementation("org.jetbrains.kotlin:kotlin-compiler-embeddable:2.3.20")
 
     // For debug
     // implementation(fileTree("modules"))
@@ -106,6 +118,20 @@ tasks.distTar {
 tasks.test {
     useJUnitPlatform()
     maxHeapSize = "8g"
+    // Ghidra 12.x installs a global serial filter factory during application
+    // initialization, but only the very first such installation per JVM is
+    // allowed. Gradle's test executor pre-installs its own factory, which
+    // makes Ghidra fail with "Cannot replace filter factory: ...". Pinning
+    // Ghidra's factory via this system property defers initialization until
+    // first use and avoids the conflict (see GhidraSerialFilterFactory docs).
+    systemProperty(
+        "jdk.serialFilterFactory",
+        "ghidra.framework.remote.GhidraSerialFilterFactory"
+    )
+    // Use the same log4j2 configuration as the application so AkibaModule's
+    // logger setup (which looks up the "Console" appender) finds it.
+    systemProperty("log4j.configurationFile", "configs/log4j2.xml")
+    systemProperty("log4j.skipJansi", "true")
 }
 
 kotlin {

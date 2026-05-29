@@ -1,21 +1,14 @@
 package org.iotsplab.akiba.subcommands
 
-import ghidra.program.model.listing.Program
-import org.apache.logging.log4j.Level
 import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.managers.WorkspaceManager
-import org.iotsplab.akiba.module.AkibaModule
-import org.iotsplab.akiba.utils.ProcedureArguments
-import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
-import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer.loadAllModules
-import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer.resolveModule
+import org.iotsplab.akiba.server.AkibaServer
+import org.iotsplab.akiba.server.ServerConfig
 import picocli.CommandLine
 import java.io.File
 import java.io.File.createTempFile
 import java.nio.file.Files
 import java.nio.file.Path
-import kotlin.String
-import kotlin.reflect.full.primaryConstructor
 
 @CommandLine.Command(
     name = "server",
@@ -101,13 +94,10 @@ class ServerCommand : Runnable {
     var daemonPort: Int = 31777
 
     override fun run() {
-        System.err.println("DEBUG: ServerCommand.run() called")
-
         if (!WorkspaceManager.isLogRootDirInitialized) {
-            val serverLogDir: Path = Path.of("logs/server")
+            val serverLogDir: Path = Path.of(System.getProperty("user.home"), ".akiba", "logs", "server")
             Files.createDirectories(serverLogDir)
             WorkspaceManager.logRootDir = serverLogDir
-            System.err.println("DEBUG: Bootstrapped WorkspaceManager.logRootDir = ${serverLogDir.toAbsolutePath()}")
         }
 
         if (!ConfigManager.isConfigInitialized) {
@@ -115,7 +105,6 @@ class ServerCommand : Runnable {
                 org.iotsplab.akiba.Main.mainConfigPath
             )
             val configFileToLoad: String = if (File(operatorConfigFile).isFile) {
-                System.err.println("DEBUG: Using existing main config at $operatorConfigFile")
                 org.iotsplab.akiba.Main.mainConfigPath
             } else {
                 val binariesRoot = Path.of(binRoot)
@@ -171,50 +160,22 @@ class ServerCommand : Runnable {
                 val syntheticFile = createTempFile("akiba_server_main_config", ".json")
                 syntheticFile.writeText(syntheticConfig)
                 syntheticFile.deleteOnExit()
-                System.err.println("DEBUG: Synthesized main config at ${syntheticFile.absolutePath}")
                 syntheticFile.absolutePath + ConfigManager.KEY_SEPARATOR + "/main"
             }
             ConfigManager.config = ConfigManager.loadGlobalConfig(configFileToLoad)
         }
 
-        val serverConfigJson = """
-            {
-                "mode": "server",
-                "server": {
-                    "host": "$host",
-                    "port": $port,
-                    "jwtSecret": "$jwtSecret",
-                    "dbHost": "$dbHost",
-                    "dbPort": $dbPort,
-                    "dbName": "$dbName",
-                    "dbUser": "$dbUser",
-                    "dbPassword": "$dbPassword",
-                    "daemonHost": "$daemonHost",
-                    "daemonPort": $daemonPort
-                }
-            }
-        """.trimIndent()
-
-        val tempFile = createTempFile("akiba_server_config", ".json")
-        tempFile.writeText(serverConfigJson)
-        tempFile.deleteOnExit()
-
-        resolveModule("org.iotsplab.akiba.module.AkibaUtils")
-
-        val task = ProcedureArguments(
-            mainClassName = "org.iotsplab.akiba.module.AkibaUtils",
-            configKey = tempFile.absolutePath
-        )
-        loadAllModules(listOf(task))
-
-        val mainClass = task.mainClass ?: return
-
-        val constructor = mainClass.kotlin.primaryConstructor!!
-
-        val instance = constructor.call(tempFile.absolutePath) as AkibaModule
-
-        kotlinx.coroutines.runBlocking {
-            instance.startProcess()
-        }
+        AkibaServer.start(ServerConfig(
+            host = host,
+            port = port,
+            jwtSecret = jwtSecret,
+            dbHost = dbHost,
+            dbPort = dbPort,
+            dbName = dbName,
+            dbUser = dbUser,
+            dbPassword = dbPassword,
+            daemonHost = daemonHost,
+            daemonPort = daemonPort
+        ))
     }
 }

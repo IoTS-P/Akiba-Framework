@@ -65,7 +65,7 @@ import kotlin.system.measureTimeMillis
  * @param consoleLogLevel The log level for the console, optional and default INFO.
  * @param fileLogLevel The log level for the file, optional and default INFO.
  * @param tableName Override for the result table name, optional.
- * @param runtimeReport Optional sink that mirrors this module's runtime side-effects
+ * @param runtimeReport Optional sink that mirrors this module's runtime side effects
  *                      ([updateData], [updateErr], `startTask` / `finishTask` timestamps and
  *                      total execution time) into an in-memory map. The parent module that
  *                      invoked this one via [callModule] uses it to inspect what the child
@@ -73,6 +73,16 @@ import kotlin.system.measureTimeMillis
  *                      launched by `ProcedureManager` receive `null`, in which case nothing
  *                      is mirrored and behavior is identical to before this parameter was
  *                      added. See [RuntimeReport] for the schema.
+ * @param skipDbWrite When `true`, [updateData], [updateErr] and [clearErr] will **only**
+ *                    write to the in-memory [RuntimeReport] and skip all database
+ *                    operations ([DatabaseClient.updateData], [DatabaseClient.startTask],
+ *                    [DatabaseClient.finishTask], table creation/locking).
+ *                    This is useful when a module is invoked via [callModule] by an
+ *                    agent that only needs the result returned through the
+ *                    [runtimeReportView] and does not want side effects in the
+ *                    database (e.g. to avoid stale rows or to keep the analysis
+ *                    transient).
+ *                    Default is `false` — data is written to the database as usual.
  */
 abstract class AkibaModule (
     private val configPath: String? = null,
@@ -83,16 +93,9 @@ abstract class AkibaModule (
     consoleLogLevel: Level = Level.INFO,
     fileLogLevel: Level = Level.INFO,
     tableName: String? = null,
-    runtimeReport: RuntimeReport? = null,
+    private var runtimeReport: RuntimeReport? = null,
+    val skipDbWrite: Boolean = false,
 ) : AutoCloseable {
-    /**
-     * Internal sink used to mirror this module's runtime side-effects for the parent module
-     * that invoked it. Initialized from the constructor parameter; [callModule] also writes
-     * it directly via [installRuntimeReport] right after construction so that subclasses
-     * which do not (yet) forward `runtimeReport` to their `super(...)` call still benefit
-     * from the mirroring.
-     */
-    private var runtimeReport: RuntimeReport? = runtimeReport
     val logDir: Path = WorkspaceManager.logRootDir.resolve(id.toString())
     var logger: Logger = initLogger(logDir, consoleLogLevel, fileLogLevel)
     private val hasTable: Boolean = this::class.annotations.none { it is DoNotCreateTable }
@@ -118,8 +121,7 @@ abstract class AkibaModule (
     protected val dbTableName: String =
         tableName ?: "${pascalToSnake(this.javaClass.simpleName)}_results"
     protected val allDefinedDbColumns: Map<String, String> = this.javaClass.kotlin.annotations
-        .filter{ it is WithTableColumn }
-        .map{ it as WithTableColumn }
+        .filterIsInstance<WithTableColumn>()
         .associate{ it.name to it.type }
 
     val configClass: KClass<*>?
@@ -130,6 +132,122 @@ abstract class AkibaModule (
         if (it.exists()) it else null
     }
     val usingFile: File = processedFile ?: originalFile
+
+    // ============================================================
+    //  Module workspace — persistent file storage for modules
+    // ============================================================
+
+    /**
+     * Per-module workspace directory.
+     *
+     * Path: `<workspaceRoot>/<ModuleClassName>/<id>/`
+     *
+     * Modules can use this to persist intermediate results, downloaded
+     * resources, temp scripts, shell command outputs, etc. The directory
+     * is created lazily on first access.
+     *
+     * The root (`workspaceRoot`) defaults to `~/.akiba/workspace` and can
+     * be overridden in the main config JSON via `general.workspaceRoot`.
+     */
+    val workspaceDir: Path by lazy {
+        val dir = Path.of(mainConf.workspaceRoot)
+            .resolve(this.javaClass.simpleName)
+            .resolve(id.toString())
+        if (!Files.exists(dir)) Files.createDirectories(dir)
+        dir
+    }
+
+    /**
+     * Resolve a file path within this module's workspace directory.
+     *
+     * ```kotlin
+     * val output = resolveWorkspacePath("result.json")
+     * output.writeText(jsonString)
+     * ```
+     *
+     * @param relativePath Relative path within the workspace dir.
+     * @return Absolute [Path] to the file (parent dirs are created).
+     */
+    fun resolveWorkspacePath(relativePath: String): Path {
+        val resolved = workspaceDir.resolve(relativePath)
+        val parent = resolved.parent
+        if (parent != null && !Files.exists(parent)) {
+            Files.createDirectories(parent)
+        }
+        return resolved
+    }
+
+    /**
+     * Write text content to a file in this module's workspace.
+     *
+     * @param relativePath Relative path within the workspace dir.
+     * @param content      Text content to write.
+     * @return The absolute [Path] of the written file.
+     */
+    fun writeWorkspaceFile(relativePath: String, content: String): Path {
+        val target = resolveWorkspacePath(relativePath)
+        Files.writeString(target, content)
+        return target
+    }
+
+    /**
+     * Read text content from a file in this module's workspace.
+     *
+     * @param relativePath Relative path within the workspace dir.
+     * @return File content as [String], or null if the file does not exist.
+     */
+    fun readWorkspaceFile(relativePath: String): String? {
+        val target = workspaceDir.resolve(relativePath)
+        return if (Files.exists(target)) Files.readString(target) else null
+    }
+
+    /**
+     * List files in this module's workspace directory (non-recursive).
+     *
+     * @param subdirectory Optional subdirectory within the workspace.
+     * @return List of file names, or empty if directory does not exist.
+     */
+    fun listWorkspaceFiles(subdirectory: String? = null): List<String> {
+        val dir = if (subdirectory != null) workspaceDir.resolve(subdirectory) else workspaceDir
+        if (!Files.exists(dir) || !Files.isDirectory(dir)) return emptyList()
+        return Files.list(dir).use { stream ->
+            stream.map { it.fileName.toString() }.toList()
+        }
+    }
+
+    /**
+     * Public read-only accessor for this module's [program].
+     *
+     * Use this when code outside the module hierarchy (e.g. built-in
+     * tools) needs to inspect the current program but should not be
+     * granted `protected` access.
+     */
+    val currentProgram: Program? get() = program
+
+    /**
+     * Resolve the Ghidra [Program] for a given binary [targetId].
+     *
+     * This encapsulates the common pattern (shown in `AkibaExample4`)
+     * of computing the program name as `"<id>-<filename>"` and opening
+     * it from the project root. If the project has no program matching
+     * the expected name, `null` is returned.
+     *
+     * @param targetId The binary ID whose program should be opened.
+     * @return The resolved [Program], or `null` if not found.
+     */
+    fun getProgram(targetId: Int): Program? {
+        val project = WorkspaceManager.project
+        val file = File("${mainConf.binariesRoot}/processed/$targetId.bin")
+            .let { if (it.exists()) it else File("${mainConf.binariesRoot}/original/$targetId.bin") }
+        if (!file.exists()) return null
+
+        val programName = "$targetId-${file.name}"
+        return try {
+            project.openProgram("/", programName, false)
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     lateinit var taskGlobalMonitor: CoroutineTaskMonitor
 
@@ -292,6 +410,12 @@ abstract class AkibaModule (
      * @param consoleLogLevel Console log level for the spawned module.
      * @param fileLogLevel    File log level for the spawned module.
      * @param tableName     Optional override for the result table name.
+     * @param skipDbWrite  When `true`, the child module's [updateData] / [updateErr] /
+     *                     [clearErr] will only write to the in-memory [RuntimeReport] and skip
+     *                     all database operations (table creation, locking, start/finish task,
+     *                     data updates). Useful when the caller only needs the result through
+     *                     [runtimeReportView] and does not want database side-effects.
+     *                     Defaults to `false`.
      * @return The newly created [AkibaModule] instance after it has finished running. Inspect
      *         [AkibaModule.failureSign] to determine whether the call succeeded, and read
      *         [AkibaModule.runtimeReportView] to observe the child's runtime side-effects
@@ -313,6 +437,7 @@ abstract class AkibaModule (
         consoleLogLevel: Level = Level.INFO,
         fileLogLevel: Level = Level.INFO,
         tableName: String? = null,
+        skipDbWrite: Boolean = false,
     ): AkibaModule {
         val moduleCtx = coroutineContext[ModuleContext.Key]
             ?: throw IllegalStateException(
@@ -373,13 +498,12 @@ abstract class AkibaModule (
         val args = hashMapOf(
             "configPath" to ctorConfigPath,
             "id" to targetId,
-            // Reuse the program loaded for this module if the call targets the same binary,
-            // otherwise pass null and let the called module decide.
             "program" to program,
             "consoleLogLevel" to consoleLogLevel,
             "fileLogLevel" to fileLogLevel,
             "tableName" to tableName,
             "runtimeReport" to childReport,
+            "skipDbWrite" to skipDbWrite,
         )
 
         // Construct the instance the same way ProcedureManager does, but capture it here so we
@@ -395,7 +519,7 @@ abstract class AkibaModule (
             instance.replaceConfig(resolvedInMemoryConfig)
 
         instance.installRuntimeReport(childReport)
-        if (instance.hasResultTable) {
+        if (!skipDbWrite && instance.hasResultTable) {
             try {
                 DatabaseClient.createModuleTable(instance.dbTableName, instance.allDefinedDbColumns)
             } catch (e: DatabaseClient.DatabaseDaemonException) {
@@ -552,7 +676,7 @@ abstract class AkibaModule (
         // and the time at which startProcess() was entered is meaningful in either case.
         runtimeReport?.recordStart(Instant.now())
 
-        if (hasTable)
+        if (hasTable && !skipDbWrite)
             DatabaseClient.startTask(dbTableName, id.toLong())
 
         val job = CoroutineScope(coroutineContext).launch(start = CoroutineStart.LAZY) {
@@ -607,7 +731,7 @@ abstract class AkibaModule (
 
         runtimeReport?.recordEnd(Instant.now())
 
-        if (hasTable)
+        if (hasTable && !skipDbWrite)
             DatabaseClient.finishTask(dbTableName, id.toLong())
 
         if (failureSign == SUCCESS)
@@ -634,6 +758,10 @@ abstract class AkibaModule (
         // Mirror into the runtime report first so the parent observes the data even when
         // this module has DoNotCreateTable (no DB write happens then).
         runtimeReport?.recordUpdateData(data)
+        if (skipDbWrite) {
+            logger.debug("skipDbWrite=true: data written to runtimeReport only, DB write skipped")
+            return
+        }
         if (hasTable)
             DatabaseClient.updateData(dbTableName, id.toLong(), data)
         else
@@ -644,6 +772,7 @@ abstract class AkibaModule (
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     protected open fun updateErr(msg: String) {
         runtimeReport?.recordErr(msg)
+        if (skipDbWrite) return
         if (hasTable)
             DatabaseClient.updateData(dbTableName, id.toLong(), mapOf("err_msg" to msg))
     }
@@ -651,6 +780,7 @@ abstract class AkibaModule (
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     protected open fun clearErr() {
         runtimeReport?.recordErr(null)
+        if (skipDbWrite) return
         if (hasTable)
             DatabaseClient.updateData(dbTableName, id.toLong(), mapOf("err_msg" to null))
     }

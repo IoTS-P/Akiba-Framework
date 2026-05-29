@@ -13,6 +13,7 @@ import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.utils.Configs
 import org.iotsplab.akiba.utils.General
+import org.iotsplab.akiba.utils.LLMSource
 import org.iotsplab.akiba.utils.ProcedureArguments
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer.loadAllModules
@@ -39,6 +40,9 @@ object ConfigManager {
         get() = config.general!!
     val projectConf: WithGhidraProject
         get() = config.withGhidraProject!!
+    /** Global LLM configuration. Returns null if not configured. */
+    val llmConf: LLMSource?
+        get() = config.llm
 
     lateinit var mainConfigFile: File
     var mainConfigJsonPath: String = "."    // . means all content of the JSON document

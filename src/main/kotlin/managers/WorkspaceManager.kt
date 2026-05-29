@@ -118,8 +118,8 @@ object WorkspaceManager: Closeable {
             // and then find the config according to the project name
             projectName = it
 
-            logRootDir = Path.of("logs/$it")
-            if (Path.of("logs/${it}/config.json").notExists()) {
+            logRootDir = Path.of(mainConf.logsRoot, it)
+            if (logRootDir.resolve("config.json").notExists()) {
                 globalLogger.error("Failed to find config file")
                 return false
             }
@@ -168,9 +168,9 @@ object WorkspaceManager: Closeable {
                     globalLogger.error("Continue log not specified while in mode `base`")
                     return false
                 }
-                logRootDir = Path.of("logs/${projectConf.continueLog}")
+                logRootDir = Path.of(mainConf.logsRoot, projectConf.continueLog)
             } else
-                logRootDir = Path.of("logs/$projectName")
+                logRootDir = Path.of(mainConf.logsRoot, projectName)
 
             taskConfigPath = logRootDir.toFile().resolve("config.json")
             globalLogger.info("Log directory: ${logRootDir.absolutePathString()}")

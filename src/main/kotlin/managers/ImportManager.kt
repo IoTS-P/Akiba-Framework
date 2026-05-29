@@ -136,7 +136,9 @@ object ImportManager {
             )
             originalPath.copyTo(WorkspaceManager.binaryPath.resolve("$id.bin"), overwrite = true)
 
+            val txId = it.startTransaction("rename")
             it.name = "$id-${originalPath.fileName}"
+            it.endTransaction(txId, true)
             project.saveAs(it, "/", it.name, false)
             project.close(it)
             return id
@@ -145,12 +147,12 @@ object ImportManager {
         // Preprocess binaries, now only contains removing unnecessary continuous \x00 segments
         val preprocessed: Pair<Path, List<FileSegment>>? = preprocessFile(originalPath)
         val program: Program? = arch?.let {
-            val prog = project.importProgram(
-                originalPath.toFile(),
-                languageProvider.getLanguage(it.languageID),
-                null
+            val prog = ProgramManager.loadProgram(
+                originalPath,
+                project,
+                languageProvider.getLanguage(it.languageID)
             )
-            autoAnalyzeInTimeout(prog, mainConf.autoAnalysisTimeout)
+            prog?.let { p -> autoAnalyzeInTimeout(p, mainConf.autoAnalysisTimeout) }
             prog
         } ?: ProgramManager.tryCreateProgramWithoutLang(
             project = project,
@@ -184,7 +186,9 @@ object ImportManager {
             WorkspaceManager.processedBinaryPath.resolve("$id.bin"), overwrite = true)
 
         program?.let {
+            val txId = it.startTransaction("rename")
             it.name = "$id-${originalPath.fileName}"
+            it.endTransaction(txId, true)
             project.saveAs(it, "/", it.name, false)
             project.close(program)
         }

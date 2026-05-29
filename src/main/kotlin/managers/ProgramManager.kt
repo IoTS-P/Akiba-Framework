@@ -1,14 +1,15 @@
 package org.iotsplab.akiba.managers
 
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager
+import ghidra.app.util.importer.ProgramLoader
 import ghidra.app.util.opinion.*
 import ghidra.base.project.GhidraProject
 import ghidra.framework.options.Options
+import ghidra.program.model.lang.Language
 import ghidra.program.model.lang.LanguageID
 import ghidra.program.model.listing.Program
 import ghidra.program.util.GhidraProgramUtilities
 import ghidra.util.exception.DuplicateFileException
-import ghidra.util.task.ConsoleTaskMonitor
 import ghidra.util.task.TaskMonitor
 import ghidra.util.task.TimeoutTaskMonitor
 import io.ktor.http.HttpStatusCode
@@ -42,7 +43,6 @@ import java.util.*
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
-import kotlin.coroutines.coroutineContext
 import kotlin.io.path.*
 
 object ProgramManager {
@@ -104,7 +104,7 @@ object ProgramManager {
             Files.createDirectories(runtimeErrorDir)
             if (projectConf.mode == "base")
                 Files.createDirectories(notFoundDir)
-        } catch (e: IOException) {
+        } catch (_: IOException) {
             globalLogger.error("Failed to create directories for success and failed cases")
             return false
         }
@@ -239,7 +239,7 @@ object ProgramManager {
             }
         }
 
-        jobs.forEach { it.join() }
+        jobs.joinAll()
 
         heartbeatJob.cancelAndJoin()
 
@@ -453,6 +453,10 @@ object ProgramManager {
         importDbData(metadata.id)
 
         var failed = false
+        // Open a transaction for module execution. Modules (and their
+        // auto-analysis calls) expect an active transaction on the program.
+        // The transaction is committed before saveAs (which requires no open tx).
+        val moduleTxId = if (program != null) program!!.startTransaction("modules") else -1
 
         try {
             for (procedure: ProcedureArguments in config.tasks) {
@@ -466,11 +470,16 @@ object ProgramManager {
                     "tableName" to procedure.tableName
                 )
                 if (ProcedureManager.invokeProcedure(
-                        path, procedure, arguments, coroutineContext[ModuleContext.Key]!!)) {
+                        path, procedure, arguments, currentCoroutineContext()[ModuleContext.Key]!!)) {
                     failed = true
                     break
                 }
                 globalLogger.info("Finished ${procedure.mainClass!!.name} on #${metadata.id}")
+            }
+
+            // End the module transaction before saving (saveAs requires no open tx)
+            if (program != null && moduleTxId >= 0) {
+                program!!.endTransaction(moduleTxId, true)
             }
 
             // Save the program
@@ -489,13 +498,23 @@ object ProgramManager {
                 logDir.moveTo(successDir.resolve(logDir.fileName))
             }
         } catch (e: NoSuchMethodError) {
+            // Ensure tx is closed on error paths
+            if (program != null && moduleTxId >= 0) {
+                try { program!!.endTransaction(moduleTxId, false) } catch (_: Exception) {}
+            }
             globalLogger.error("Fatal error, there exists a method not found. It may be caused by incorrect module" +
                     "dependencies or incorrect module definitions. Check your module code.")
             e.printStackTrace()
             Signal.raise(Signal("INT"))
         } catch (e: DuplicateFileException) {
+            if (program != null && moduleTxId >= 0) {
+                try { program!!.endTransaction(moduleTxId, false) } catch (_: Exception) {}
+            }
             globalLogger.error("duplicated file found: ${e.message}")
         } catch (e: Exception) {     // If we reach here, it means that something bad happens.
+            if (program != null && moduleTxId >= 0) {
+                try { program!!.endTransaction(moduleTxId, false) } catch (_: Exception) {}
+            }
             globalLogger.error(
                 "Exception occurred while running #${metadata.id}: ${e.message} (${e.javaClass.simpleName})")
             e.printStackTrace()
@@ -503,7 +522,7 @@ object ProgramManager {
     }
 
     private fun applyLoadProperties(program: Program, data: List<ImportManager.FileSegment>?) {
-        if (data == null || data.isEmpty())
+        if (data.isNullOrEmpty())
             return
 
         assert(program.memory.blocks.size == 1)
@@ -536,7 +555,7 @@ object ProgramManager {
             val data = DatabaseClient.getModuleData(id.toLong(), table, column)
 
             for (k in data.keys) {
-                coroutineContext[ModuleContext.Key]!!.data["$table.$k"] = data[k]
+                currentCoroutineContext()[ModuleContext.Key]!!.data["$table.$k"] = data[k]
             }
         }
     }
@@ -549,7 +568,7 @@ object ProgramManager {
      * @param arch: The architecture of MCU
      * @param format: File format (unused for now)
      * @return A nullable program, null if failed to create a program
-     * @throws Exception In some cases, a malformed file may cause IOException from `project.importProgram`
+     * @throws Exception In some cases, a malformed file may cause IOException during load
      */
     @Throws(Exception::class)
     private fun createProgramWithLang(
@@ -570,23 +589,23 @@ object ProgramManager {
             return null
         }
 
-        // If we specify loader, the program cannot be initialized, and `initializeProgram` is a private method
-        val program: Program = project.importProgram(
-            path.toFile(), lang, null)
+        val program: Program = loadProgram(path, project, lang)
             ?: run {
                 globalLogger.error("Failed to create program for $path")
                 failureTestCount++
                 return null
             }
 
+        val txId = program.startTransaction("rename")
         program.name = "${id}-${path.fileName}"
+        program.endTransaction(txId, true)
         programNames.add(program.name)
         return program
     }
 
     fun tryCreateProgramWithAutoDetect(project: GhidraProject, path: Path): Program? {
         return try {
-            project.importProgram(path.toFile()) ?. let {
+            loadProgram(path, project) ?. let {
                 // If not raw binary, it seems Ghidra has identified the format
                 if (it.executableFormat != "Raw Binary") it else null
             }
@@ -610,6 +629,7 @@ object ProgramManager {
                 "temp-${UUID.randomUUID()}", false
             )
         } else null
+        val useProject = project ?: tempProject!!
         val candidates: MutableSet<Pair<String, Int>> = sortedSetOf(comparator = compareByDescending { it.second })
         for(lang: String in GUESSED_PRIMARY_LEVEL_ARCHES) {
             globalLogger.debug("Trying $lang......")
@@ -617,18 +637,11 @@ object ProgramManager {
             var tempProgram: Program
 
             try {
-                tempProgram = project?.importProgram(path.toFile(), language, null)
-                    ?: tempProject?.importProgram(path.toFile(), language, null)
+                tempProgram = loadProgram(path, useProject, language)
                     ?: continue
             } catch (e: Exception) {
-                // TODO: In some very rare cases, Ghidra may throw an exception here because
-                //       Ghidra got a wrong binary format, how to handle it?
                 globalLogger.error("Failed to create program for $path with $lang: ${e.message}")
                 return null
-//                globalLogger.error("Failed to create program for $path with $lang: ${e.message}, trying raw binary...")
-//                tempProgram = project?.importProgram(path.toFile(), language, null)
-//                    ?: tempProject?.importProgram(path.toFile(), language, null)
-//                    ?: continue
             }
 
             if (tempProgram.executableFormat == "Raw Binary")
@@ -653,9 +666,50 @@ object ProgramManager {
         globalLogger.info("The ${selected.first} got the most functions (${selected.second}), set as architecture")
         tempProject?.close()
         val lang = languageProvider.getLanguage(LanguageID(selected.first))
-        val ret = project?.importProgram(path.toFile(), lang, null)
+        val ret = loadProgram(path, project ?: tempProject!!, lang)
         tempProject?.close()
         return ret
+    }
+
+    /**
+     * Load (import) a binary file into a [Program] using the new
+     * [ProgramLoader] builder API (Ghidra 12.0+).
+     *
+     * The returned [Program] has an open transaction (matching the behavior
+     * of the legacy `GhidraProject.importProgram`), so callers can immediately
+     * modify program state (e.g. rename, analyze). The transaction is committed
+     * when `GhidraProject.saveAs()` or `GhidraProject.close()` is called.
+     *
+     * @param path     Path to the binary file on disk.
+     * @param project  The [GhidraProject] that owns the imported program.
+     * @param language Optional [Language]; when null, Ghidra will auto-detect.
+     * @return The primary [Program] produced by the loader, or null if the
+     *         load yielded no results.
+     */
+    fun loadProgram(path: Path, project: GhidraProject, language: Language? = null): Program? {
+        val builder = ProgramLoader.builder()
+            .source(path.toFile())
+            .project(project.getProject())
+            .projectFolderPath("/")
+
+        if (language != null) {
+            builder.language(language.languageID)
+        }
+
+        val loadResults = try {
+            builder.load()
+        } catch (_: Exception) {
+            return null
+        }
+
+        val primary = loadResults.getPrimary() ?: run {
+            loadResults.close()
+            return null
+        }
+        val program = primary.getDomainObject(project)
+        loadResults.close()
+
+        return program
     }
 
     @OptIn(ExperimentalStdlibApi::class)
@@ -689,12 +743,20 @@ object ProgramManager {
 
         aam.initializeOptions(options)
 
-        aam.reAnalyzeAll(null)
+        // ProgramLoader does not leave a transaction open (unlike the legacy
+        // importProgram). AutoAnalysisManager and individual Analyzers require
+        // an active transaction to modify program state.
         val monitor = TimeoutTaskMonitor.timeoutIn(
             if (timeout > 0) timeout.toLong() else Int.MAX_VALUE.toLong(), TimeUnit.SECONDS)
-        aam.startAnalysis(monitor)
-        aam.cancelQueuedTasks()
-        GhidraProgramUtilities.markProgramAnalyzed(program)     // mark this program as auto-analyzed
+        val txId = program.startTransaction("auto-analysis")
+        try {
+            aam.reAnalyzeAll(null)
+            aam.startAnalysis(monitor)
+            aam.cancelQueuedTasks()
+            GhidraProgramUtilities.markProgramAnalyzed(program)
+        } finally {
+            program.endTransaction(txId, true)
+        }
 
         if (monitor.didTimeout()) {
             if (timeoutHandler != null)

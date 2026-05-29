@@ -28,6 +28,8 @@ data class Configs (
     var general: General? = null,
     var withGhidraProject: WithGhidraProject? = null,
     var sqlSource: SqlSource = SqlSource(),
+    /** Global LLM configuration shared by all AgentModules. */
+    var llm: LLMSource? = null,
     var globalPreTasks: List<ProcedureArguments> = listOf(),
     var packages: List<String>? = null,
     // Database data generated in previous tasks to import
@@ -46,7 +48,11 @@ data class General(
     var importRoot: String? = null,
     var processor: String = "n/a",
     var autoAnalysisTimeout: Int = 180,
-    var threads: Int = 1
+    var threads: Int = 1,
+    // Root directory for all log files. Default: ~/.akiba/logs
+    var logsRoot: String = System.getProperty("user.home") + "/.akiba/logs",
+    // Root directory for module workspace files. Default: ~/.akiba/workspace
+    var workspaceRoot: String = System.getProperty("user.home") + "/.akiba/workspace"
 )
 
 data class WithGhidraProject (
@@ -91,6 +97,91 @@ data class SqlSource(
     // If set, will use a local cache database saving data that failed to send to server
     var useLocalCache: String? = null
 )
+
+/**
+ * Global LLM configuration for AgentModules.
+ *
+ * Defined in the main config JSON under the `"llm"` key.  All fields are
+ * optional so that users only need to specify what the chosen provider requires;
+ * sensible defaults are applied by [toLLMConfig].
+ *
+ * Example JSON:
+ * ```json
+ * {
+ *   "llm": {
+ *     "provider": "DEEP_SEEK",
+ *     "modelName": "deepseek-v4-flash",
+ *     "apiKeyEnv": "DEEPSEEK_API_KEY",
+ *     "baseUrl": "https://api.deepseek.com"
+ *   }
+ * }
+ * ```
+ */
+data class LLMSource(
+    /** Provider identifier (matches [LLMProvider] enum name, case-insensitive). E.g. `"DEEP_SEEK"`, `"OLLAMA"`. */
+    var provider: String = "",
+    /** Model identifier recognised by the provider. E.g. `"deepseek-v4-flash"`, `"qwen3.6"`. */
+    var modelName: String = "",
+    /** Environment variable name that holds the API key. Takes precedence over [apiKey]. */
+    var apiKeyEnv: String = "",
+    /** Literal API key. Not recommended for production; prefer [apiKeyEnv]. */
+    var apiKey: String = "",
+    /** Base URL override. When blank the provider's default endpoint is used. */
+    var baseUrl: String = "",
+    /** Temperature: 0.0 → deterministic, 1.0 → creative. */
+    var temperature: Double? = null,
+    /** Top-P nucleus sampling. */
+    var topP: Double? = null,
+    /** Maximum tokens the model may generate in a single response. */
+    var maxTokens: Int? = null,
+    /** Request timeout in seconds. */
+    var timeoutSeconds: Int = 120,
+    /** Number of retries on transient failures. */
+    var maxRetries: Int = 3,
+    /** Whether to log full request/response bodies for debugging. */
+    var debugLogging: Boolean = false
+) {
+    /**
+     * Convert this config-source to an [LLMConfig].
+     *
+     * @throws IllegalArgumentException if [provider] is not a valid [LLMProvider] name.
+     * @throws IllegalStateException if no API key can be resolved (neither env var nor literal).
+     */
+    fun toLLMConfig(): org.iotsplab.akiba.llm.client.LLMConfig {
+        val resolvedProvider = org.iotsplab.akiba.llm.client.LLMProvider.fromString(provider)
+            ?: throw IllegalArgumentException(
+                "Unknown LLM provider '$provider'. Valid values: " +
+                org.iotsplab.akiba.llm.client.LLMProvider.entries.joinToString { it.name }
+            )
+
+        val resolvedApiKey = when {
+            apiKeyEnv.isNotBlank() -> System.getenv(apiKeyEnv)
+                ?: throw IllegalStateException(
+                    "Environment variable '$apiKeyEnv' not set (specified in llm.apiKeyEnv)"
+                )
+            apiKey.isNotBlank() -> apiKey
+            else -> throw IllegalStateException(
+                "No API key configured. Set llm.apiKeyEnv or llm.apiKey in the main config."
+            )
+        }
+
+        return org.iotsplab.akiba.llm.client.LLMConfig(
+            provider = resolvedProvider,
+            modelName = modelName,
+            apiKey = resolvedApiKey,
+            baseUrl = baseUrl.ifBlank { null },
+            temperature = temperature,
+            topP = topP,
+            maxTokens = maxTokens,
+            timeoutSeconds = timeoutSeconds,
+            maxRetries = maxRetries,
+            debugLogging = debugLogging
+        )
+    }
+
+    /** Whether this source has enough information to produce an [LLMConfig]. */
+    val isConfigured: Boolean get() = provider.isNotBlank() && modelName.isNotBlank()
+}
 
 data class ProcedureArguments(
     // Main class name (Full class path) of the task
