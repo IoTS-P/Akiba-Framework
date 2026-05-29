@@ -393,31 +393,84 @@ object GhidraDocsManager {
             it.className.lowercase().contains(lowerKeyword)
         }
 
-        if (typeMatches.isNotEmpty()) {
-            results.add("=== Classes matching '$keyword' ===")
-            typeMatches.take(maxResults).forEach { entry ->
+        // Partition into exact match, prefix match, and contains match
+        val exactClassMatches = typeMatches.filter { it.className.equals(keyword, ignoreCase = true) }
+        val prefixClassMatches = typeMatches.filter {
+            !it.className.equals(keyword, ignoreCase = true) &&
+                it.className.lowercase().startsWith(lowerKeyword)
+        }
+        val containsClassMatches = typeMatches.filter {
+            !it.className.equals(keyword, ignoreCase = true) &&
+                !it.className.lowercase().startsWith(lowerKeyword)
+        }
+
+        // 2. Search member index
+        val memberEntries = loadMemberIndex()
+
+        // For exact class matches: show the class and ALL its members immediately below
+        if (exactClassMatches.isNotEmpty()) {
+            results.add("=== Exact class match ===")
+            for (entry in exactClassMatches) {
                 val fqn = "${entry.pkg}.${entry.className}"
                 results.add("  $fqn")
-            }
-            if (typeMatches.size > maxResults) {
-                results.add("  ... and ${typeMatches.size - maxResults} more")
+
+                // Find all members belonging to this exact class
+                val classMembers = memberEntries.filter {
+                    it.className == entry.className && it.pkg == entry.pkg
+                }
+                if (classMembers.isNotEmpty()) {
+                    results.add("    Members (${classMembers.size}):")
+                    classMembers.take(50).forEach { m ->
+                        results.add("      .${m.memberName}")
+                    }
+                    if (classMembers.size > 50) {
+                        results.add("      ... and ${classMembers.size - 50} more members")
+                    }
+                }
             }
         }
 
-        // 2. Search member index for matching method/field names
-        val memberEntries = loadMemberIndex()
-        val memberMatches = memberEntries.filter {
-            it.memberName.lowercase().contains(lowerKeyword)
+        // 3. Similar class names (prefix match first, then contains)
+        val otherClasses = prefixClassMatches + containsClassMatches
+        if (otherClasses.isNotEmpty()) {
+            val remaining = maxResults - exactClassMatches.size
+            if (remaining > 0) {
+                results.add("=== Similar classes ===")
+                otherClasses.take(remaining).forEach { entry ->
+                    val fqn = "${entry.pkg}.${entry.className}"
+                    results.add("  $fqn")
+                }
+                if (otherClasses.size > remaining) {
+                    results.add("  ... and ${otherClasses.size - remaining} more")
+                }
+            }
         }
 
-        if (memberMatches.isNotEmpty()) {
-            results.add("=== Members matching '$keyword' ===")
-            memberMatches.take(maxResults).forEach { entry ->
-                val fqn = "${entry.pkg}.${entry.className}"
-                results.add("  $fqn.${entry.memberName}")
+        // 4. Members matching the keyword that do NOT belong to an exact-matched class
+        //    (e.g. methods in other classes that happen to have this name)
+        val exactClassFqns = exactClassMatches.map { "${it.pkg}.${it.className}" }.toSet()
+        val otherMemberMatches = memberEntries.filter {
+            it.memberName.lowercase().contains(lowerKeyword) &&
+                "${it.pkg}.${it.className}" !in exactClassFqns
+        }
+
+        if (otherMemberMatches.isNotEmpty()) {
+            // Prioritize: exact member name match first, then contains
+            val exactMembers = otherMemberMatches.filter {
+                it.memberName.equals(keyword, ignoreCase = true)
             }
-            if (memberMatches.size > maxResults) {
-                results.add("  ... and ${memberMatches.size - maxResults} more")
+            val otherMembers = otherMemberMatches.filter {
+                !it.memberName.equals(keyword, ignoreCase = true)
+            }
+            val sortedMembers = exactMembers + otherMembers
+
+            val memberLimit = maxResults.coerceAtMost(20)
+            results.add("=== Members in other classes matching '$keyword' ===")
+            sortedMembers.take(memberLimit).forEach { entry ->
+                results.add("  ${entry.pkg}.${entry.className}.${entry.memberName}")
+            }
+            if (sortedMembers.size > memberLimit) {
+                results.add("  ... and ${sortedMembers.size - memberLimit} more")
             }
         }
 
