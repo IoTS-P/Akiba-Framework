@@ -259,4 +259,131 @@ Akiba 还提供以下子命令用于管理数据库实例：
 ./bin/Akiba instance-delete -i my_instance -u admin -H 192.168.1.100 -p 31777
 ```
 
+#### 7. server - 启动 Akiba HTTP 服务器
+
+```shell
+./bin/Akiba server [选项]
+```
+
+**描述：** 启动一个 HTTP 服务器，提供 REST API 端点用于与 Akiba 交互。支持 JWT 认证和用户管理。
+
+**可选参数：**
+- `-p`/`--port <端口>`：服务器端口，默认为 `8080`
+- `--host <主机>`：服务器主机，默认为 `0.0.0.0`
+- `--bin-root <路径>`：二进制文件根目录，默认为 `~/.akiba`
+- `--jwt-secret <密钥>`：JWT 密钥，生产环境请修改！
+- `--db-host <主机>`：用户管理的 PostgreSQL 主机，默认为 `127.0.0.1`
+- `--db-port <端口>`：用户管理的 PostgreSQL 端口，默认为 `5432`
+- `--db-name <名称>`：用户管理的数据库名称，默认为 `akiba_users`
+- `--db-user <用户>`：PostgreSQL 用户，默认为 `akiba`
+- `--db-password <密码>`：PostgreSQL 密码，默认为 `akiba`
+- `--daemon-host <主机>`：Akiba DB daemon 主机，默认为 `127.0.0.1`
+- `--daemon-port <端口>`：Akiba DB daemon 端口，默认为 `31777`
+- `-h`/`--help`：显示帮助信息并退出
+
+**示例：**
+```shell
+# 使用默认设置启动服务器
+./bin/Akiba server
+
+# 使用自定义端口和 JWT 密钥启动服务器
+./bin/Akiba server -p 9000 --jwt-secret "my-secure-random-string"
+```
+
+#### 8. meltdown - 紧急终止开关
+
+```shell
+./bin/Akiba meltdown [-f|--force]
+```
+
+**描述：** 紧急终止开关，立即终止所有正在运行的 Akiba 框架进程。当 LLM agent 执行危险操作或需要立即停止所有 Akiba 活动时使用。
+
+**可选参数：**
+- `-f`/`--force`：跳过确认提示，直接终止进程
+
+**示例：**
+```shell
+# 终止前显示确认提示
+./bin/Akiba meltdown
+
+# 直接终止，不需确认
+./bin/Akiba meltdown --force
+```
+
+## LLM Agent 支持
+
+Akiba 提供了内置的 LLM agent 基础设施，用于智能二进制分析。Agent 系统支持：
+
+### Agent 策略
+
+- **ReAct 策略**（默认）：显式的 Thought → Action → Observation 循环，用于逐步推理
+- **Plan-Execute 策略**：先制定计划，再执行每个步骤，最后进行反思
+
+### 内置工具
+
+使用 `AgentModule` 时，以下内置工具自动可用：
+
+- `run_module` — 委托工作给另一个 AkibaModule
+- `run_sub_agent` — 生成子 LLM agent
+- `query_module_data` — 从数据库查询分析结果
+- `query_session_history` — 查看过去的 agent 会话
+- `query_memories` — 搜索长期记忆存储
+
+### LLM 提供者
+
+Akiba 支持以下 LLM 提供者：
+
+| 提供者 | 显示名称 | OpenAI 兼容 |
+|-------|---------|------------|
+| `OPEN_AI` | OpenAI | 否 |
+| `ANTHROPIC` | Anthropic | 否 |
+| `GOOGLE_GEMINI` | Google Gemini | 否 |
+| `MISTRAL` | Mistral AI | 否 |
+| `OLLAMA` | Ollama | 否 |
+| `AZURE_OPEN_AI` | Azure OpenAI | 否 |
+| `DEEP_SEEK` | DeepSeek | 是 |
+| `MOONSHOT` | Moonshot / Kimi | 是 |
+| `ZHIPU` | Zhipu AI / ChatGLM | 是 |
+| `QWEN` | Qwen / DashScope | 是 |
+| `OPEN_AI_COMPATIBLE` | OpenAI 兼容 | 是 |
+
+### 配置示例
+
+```json
+{
+  "llm": {
+    "provider": "DEEP_SEEK",
+    "modelName": "deepseek-v4-flash",
+    "apiKeyEnv": "DEEPSEEK_API_KEY"
+  }
+}
+```
+
+### 创建 Agent 模块
+
+继承 `AgentModule` 来创建 agent 驱动的分析模块：
+
+```kotlin
+@WithAgentSystemPrompt("You are a binary analysis assistant.")
+@WithAgentMaxIterations(15)
+@WithTableColumn("analysis", "TEXT")
+class BinaryAnalyst(configPath: String? = null, id: Int, program: Program?)
+    : AgentModule(configPath, id, program) {
+
+    override fun defineTools(): List<Tool> = listOf(
+        tool("list_functions") {
+            description = "List all functions in the binary"
+            execute { args ->
+                program?.functionManager?.getFunctions(true)
+                    ?.take(50)?.joinToString("\n") { "${it.name} @ ${it.entryPoint}" }
+                    ?: "No program loaded"
+            }
+        }
+    )
+
+    override fun taskPrompt(): String =
+        "Analyze this binary and identify its purpose, entry point, and key functions."
+}
+```
+
 其他配置文件需要保存到 `src/main/resources/configs`。具体内容请查看 [Usage_guide_zh.md](Usage_guide_zh.md)
