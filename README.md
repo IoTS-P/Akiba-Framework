@@ -256,4 +256,131 @@ Akiba also provides the following subcommands for managing database instances:
 ./bin/Akiba instance-delete -i my_instance -u admin -H 192.168.1.100 -p 31777
 ```
 
+#### 7. server - Start Akiba HTTP Server
+
+```shell
+./bin/Akiba server [options]
+```
+
+**Description:** Starts an HTTP server that provides REST API endpoints for interacting with Akiba. Supports JWT authentication and user management.
+
+**Optional Parameters:**
+- `-p`/`--port <port>`: Server port, default is `8080`
+- `--host <host>`: Server host, default is `0.0.0.0`
+- `--bin-root <path>`: Root directory for binary files, default is `~/.akiba`
+- `--jwt-secret <secret>`: JWT secret key, default is a placeholder string (change in production!)
+- `--db-host <host>`: PostgreSQL host for user management, default is `127.0.0.1`
+- `--db-port <port>`: PostgreSQL port for user management, default is `5432`
+- `--db-name <name>`: Database name for user management, default is `akiba_users`
+- `--db-user <user>`: PostgreSQL user, default is `akiba`
+- `--db-password <password>`: PostgreSQL password, default is `akiba`
+- `--daemon-host <host>`: Akiba DB daemon host, default is `127.0.0.1`
+- `--daemon-port <port>`: Akiba DB daemon port, default is `31777`
+- `-h`/`--help`: Show help message and exit
+
+**Examples:**
+```shell
+# Start server with default settings
+./bin/Akiba server
+
+# Start server on custom port with custom JWT secret
+./bin/Akiba server -p 9000 --jwt-secret "my-secure-random-string"
+```
+
+#### 8. meltdown - Emergency Kill Switch
+
+```shell
+./bin/Akiba meltdown [-f|--force]
+```
+
+**Description:** Emergency kill switch that immediately terminates ALL running Akiba framework processes. Use when an LLM agent is executing dangerous operations or when you need to halt all Akiba activity immediately.
+
+**Optional Parameters:**
+- `-f`/`--force`: Skip the confirmation prompt and kill processes immediately
+
+**Examples:**
+```shell
+# Show confirmation prompt before killing
+./bin/Akiba meltdown
+
+# Kill immediately without confirmation
+./bin/Akiba meltdown --force
+```
+
+## LLM Agent Support
+
+Akiba provides a built-in LLM agent infrastructure for intelligent binary analysis. The agent system supports:
+
+### Agent Strategies
+
+- **ReAct Strategy** (default): Explicit Thought → Action → Observation cycle for step-by-step reasoning
+- **Plan-Execute Strategy**: Plan first, then execute each step, with reflection phase
+
+### Built-in Tools
+
+When using `AgentModule`, the following built-in tools are automatically available:
+
+- `run_module` — Delegate work to another AkibaModule
+- `run_sub_agent` — Spawn a child LLM agent
+- `query_module_data` — Query analysis results from the database
+- `query_session_history` — Review past agent sessions
+- `query_memories` — Search the long-term memory store
+
+### LLM Providers
+
+Akiba supports the following LLM providers:
+
+| Provider | Display Name | OpenAI-Compatible |
+|----------|-------------|-------------------|
+| `OPEN_AI` | OpenAI | No |
+| `ANTHROPIC` | Anthropic | No |
+| `GOOGLE_GEMINI` | Google Gemini | No |
+| `MISTRAL` | Mistral AI | No |
+| `OLLAMA` | Ollama | No |
+| `AZURE_OPEN_AI` | Azure OpenAI | No |
+| `DEEP_SEEK` | DeepSeek | Yes |
+| `MOONSHOT` | Moonshot / Kimi | Yes |
+| `ZHIPU` | Zhipu AI / ChatGLM | Yes |
+| `QWEN` | Qwen / DashScope | Yes |
+| `OPEN_AI_COMPATIBLE` | OpenAI-Compatible | Yes |
+
+### Configuration Example
+
+```json
+{
+  "llm": {
+    "provider": "DEEP_SEEK",
+    "modelName": "deepseek-v4-flash",
+    "apiKeyEnv": "DEEPSEEK_API_KEY"
+  }
+}
+```
+
+### Creating an Agent Module
+
+Extend `AgentModule` to create an agent-driven analysis module:
+
+```kotlin
+@WithAgentSystemPrompt("You are a binary analysis assistant.")
+@WithAgentMaxIterations(15)
+@WithTableColumn("analysis", "TEXT")
+class BinaryAnalyst(configPath: String? = null, id: Int, program: Program?)
+    : AgentModule(configPath, id, program) {
+
+    override fun defineTools(): List<Tool> = listOf(
+        tool("list_functions") {
+            description = "List all functions in the binary"
+            execute { args ->
+                program?.functionManager?.getFunctions(true)
+                    ?.take(50)?.joinToString("\n") { "${it.name} @ ${it.entryPoint}" }
+                    ?: "No program loaded"
+            }
+        }
+    )
+
+    override fun taskPrompt(): String =
+        "Analyze this binary and identify its purpose, entry point, and key functions."
+}
+```
+
 Other configuration files need to be saved in `src/main/resources/configs`. For details, see [Usage_guide_en.md](Usage_guide_en.md)
