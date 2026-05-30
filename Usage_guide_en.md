@@ -11,10 +11,10 @@ Example configuration file:
 ```text
 {
   // metadata: Main information of this task, currently not required and has no practical significance
-  "metadata": {   
+  "metadata": {
     "description": "Akiba Test"
   },
-  // main: Main configuration. Actually, this configuration path can be modified freely. 
+  // main: Main configuration. Actually, this configuration path can be modified freely.
   // Just specify the correct file and JSON path within the file using the -c parameter of the framework.
   // For example, if the file name is config.json, then -c should be config.json@main. The default configuration is configs/config.json@/main
   // Note: JSON path uses Jackson format, i.e., separated by "/", similar to file names.
@@ -26,15 +26,28 @@ Example configuration file:
     // usingInstance: Name of using database instance, Akiba supports multiple instances
     "usingInstance": "akiba",
     // globalConsoleLogLevel: Global console log level. Alternative: OFF, TRACE, DEBUG, INFO, WARN, ERROR
-    "globalConsoleLogLevel": "INFO"
+    "globalConsoleLogLevel": "INFO",
     // globalFileLogLevel: Global file log level. Alternative: OFF, TRACE, DEBUG, INFO, WARN, ERROR
-    "globalFileLogLevel": "INFO"
+    "globalFileLogLevel": "INFO",
+    // llm: LLM configuration for agent support
+    "llm": {
+      // provider: LLM provider (DEEP_SEEK, OPEN_AI, ANTHROPIC, GEMINI, OLLAMA, etc.)
+      "provider": "DEEP_SEEK",
+      // modelName: Model name to use
+      "modelName": "deepseek-v4-flash",
+      // apiKeyEnv: Environment variable name containing the API key
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      // baseUrl: (Optional) Base URL for OpenAI-compatible APIs
+      "baseUrl": null
+    },
     // general: General configuration
     "general": {
-      // binariesRoot: Root directory for binary files. When importing files, Akiba will copy files to the specified directory 
+      // binariesRoot: Root directory for binary files. When importing files, Akiba will copy files to the specified directory
       // and name them uniformly as <id>.bin. This specifies the target directory for copying.
       "binariesRoot": "/data/binaries",
-      // processor: Default processor architecture. If analyzing files with unknown architecture in the database, 
+      // importRoot: (Optional) Root directory for importing files. If null, uses binariesRoot
+      "importRoot": null,
+      // processor: Default processor architecture. If analyzing files with unknown architecture in the database,
       // this architecture will be used by default. When set to n/a, multiple common architectures will be tried.
       "processor": "n/a",
       // autoAnalysisTimeout: Maximum automatic analysis time for Ghidra (in seconds).
@@ -55,10 +68,16 @@ Example configuration file:
       "mode": "new",
       // forkTo: When creating a project and set to fork, name is the original project name, and forkTo (target project name) must be specified.
       "forkTo": null,
+      // forkOnTask: Whether to fork a new Ghidra project for each task. Default is false.
+      "forkOnTask": false,
       // continueLog: When creating a project and set to base, name is the original project name, and continueLog (log name for this task) must be specified.
       "continueLog": null,
       // overwriteLog: Whether to overwrite existing log files. If a log file already exists and overwriteLog is set to false, Akiba will refuse to start the task.
       "overwriteLog": true,
+      // overwriteProject: Whether to overwrite if a Ghidra project with the same name exists. Default is false.
+      "overwriteProject": false,
+      // deletePreviousProgram: Whether to delete the previous Ghidra program before analysis. Default is false.
+      "deletePreviousProgram": false,
       // saveProject: Whether to save the Ghidra project. If set to false, the Ghidra project will be deleted after all tasks are completed.
       "saveProject": true,
       // noCreateProgram: Whether to automatically create Ghidra Program for binary files to be analyzed. Ghidra Program is the basis for binary analysis.
@@ -73,13 +92,19 @@ Example configuration file:
       "serverPort": "31777",
       // useSnapshot: Specify the database snapshot to use. This feature is not yet supported, reserved.
       "useSnapshot": "current",
-      // constraint: ID filtering constraint. Default is empty, meaning all files in the database will be analyzed. 
+      // constraint: ID filtering constraint. Default is empty, meaning all files in the database will be analyzed.
       //             SQL statement fragments can also be filled in, such as "WHERE u.ID < 100".
       //             This fragment is concatenated with "SELECT u.ID FROM using_binaries u".
       "constraint": "",
       // disableUpdate: Whether to disable database updates. If set to true, Akiba will not update the database during this task. (This feature has not been tested)
-      "disableUpdate": false
+      "disableUpdate": false,
+      // useLocalCache: (Optional) Use local cache database instead of remote daemon. null means disabled.
+      "useLocalCache": null
     },
+    // globalPreTasks: Global preprocessing tasks that run once before binary-specific tasks
+    "globalPreTasks": [],
+    // packages: (Optional) Maven packages to import for script execution
+    "packages": null,
     // dbImports: Database import configuration
     //            Sometimes a module needs output results from other modules, you can specify imported data tables in the import configuration file.
     //            In single-file pipeline analysis, the key of this part of data will be saved in the form of "data_name.column_name". For example, "test_results.function_number"
@@ -319,4 +344,223 @@ Log files are uniformly saved in the `log` directory of the Akiba root directory
 A script used to monitor the execution of the Kotlin process. When the log file has not been updated for more than 20 minutes (configurable), it will restart and resume the process (automatically perform breakpoint continuation).
 All parameters needed by Akiba can be specified in the script.
 Tip: In Linux, you can add a `&` to the command line to run the command in the background. For example: `python3 starter.py &`
+
+## 6. LLM Agent System
+
+### Overview
+
+Akiba provides a built-in LLM agent infrastructure for intelligent binary analysis. The agent system allows you to create modules that use Large Language Models to analyze binaries with step-by-step reasoning.
+
+### Agent Strategies
+
+#### ReAct Strategy (Default)
+
+The ReAct (Reasoning + Acting) strategy follows an explicit **Thought → Action → Observation** cycle:
+
+```
+THOUGHT: I need to find the entry point.
+ACTION:  list_functions()
+OBSERVATION: main @ 0x401234, foo @ 0x401256
+THOUGHT: The entry point is main...
+ACTION:  decompile(address="0x401234")
+OBSERVATION: int main() { return 0; }
+THOUGHT: I now have the answer.
+FINAL ANSWER: The binary's entry point...
+```
+
+#### Plan-Execute Strategy
+
+The Plan-Execute strategy works in three phases:
+
+1. **Planning**: Create a numbered plan of steps
+2. **Execution**: Execute each step and gather observations
+3. **Reflection**: Reflect on results and provide final answer
+
+### Creating an Agent Module
+
+Extend `AgentModule` to create an agent-driven analysis module:
+
+```kotlin
+@WithAgentSystemPrompt("You are a binary analysis assistant.")
+@WithAgentMaxIterations(15)
+@WithTableColumn("analysis", "TEXT")
+@WithTableColumn("iterations", "INTEGER")
+class BinaryAnalyst(
+    configPath: String? = null,
+    id: Int,
+    program: Program?,
+    consoleLogLevel: Level = Level.INFO,
+    fileLogLevel: Level = Level.INFO
+) : AgentModule(configPath, id, program, consoleLogLevel, fileLogLevel) {
+
+    override fun defineTools(): List<Tool> = listOf(
+        tool("list_functions") {
+            description = "List all functions in the binary"
+            execute { args ->
+                program?.let { p ->
+                    p.functionManager.getFunctions(true)
+                        .take(50).joinToString("\n") { "${it.name} @ ${it.entryPoint}" }
+                } ?: "No program loaded"
+            }
+        }
+    )
+
+    override fun taskPrompt(): String =
+        "Analyze this binary and identify its purpose, entry point, and key functions."
+}
+```
+
+### Built-in Tools
+
+When using `AgentModule`, the following built-in tools are automatically available:
+
+| Tool Name | Description | Parameters |
+|-----------|-------------|------------|
+| `run_module` | Run another AkibaModule on current or different binary | `className` (required), `targetId`, `configJson`, `timeout`, `skipDbWrite` |
+| `run_sub_agent` | Spawn a child LLM agent for sub-tasks | `systemPrompt` (required), `taskPrompt` (required), `toolNames`, `maxIterations` |
+| `query_module_data` | Query analysis results from the database | `tableName` (required), `columns` |
+| `query_session_history` | Review past agent sessions or get messages | `sessionId`, `binaryId`, `limit` |
+| `query_memories` | Search the long-term memory store | `sessionId`, `memoryType`, `key`, `minImportance`, `limit` |
+| `list_modules` | List all available AkibaModules | (none) |
+| `run_script` | Compile and run a Kotlin script dynamically | `source` (required), `className`, `targetId` |
+| `query_ghidra_api` | Search and read Ghidra API documentation | `action` (required, search/read_class), `keyword` (required), `maxResults` |
+| `run_shell` | Execute shell commands in workspace | `command` (required), `timeout`, `workDir` |
+
+#### run_module
+
+Run another AkibaModule and return its result. The module must be a fully-qualified class name.
+
+```json
+{
+  "className": "org.example.DecompileModule",
+  "targetId": 123,
+  "configJson": "{\"option\":\"value\"}",
+  "timeout": 300,
+  "skipDbWrite": false
+}
+```
+
+#### run_sub_agent
+
+Spawn a child agent with its own conversation history and tools.
+
+```json
+{
+  "systemPrompt": "You are a decompilation specialist.",
+  "taskPrompt": "Decompile the main function",
+  "toolNames": "run_script,query_ghidra_api",
+  "maxIterations": 10
+}
+```
+
+#### query_ghidra_api
+
+Search Ghidra API documentation before writing scripts.
+
+```
+action: "search"  → find classes/members matching keyword
+action: "read_class"  → read full class documentation
+```
+
+Example workflow:
+1. `query_ghidra_api {"action":"search", "keyword":"decompile"}`
+2. `query_ghidra_api {"action":"read_class", "keyword":"DecompInterface"}`
+3. Use discovered API in `run_script`
+
+### Agent Configuration
+
+LLM configuration can be specified in two ways:
+
+**1. Global Configuration (configs/config.json):**
+
+```json
+{
+  "llm": {
+    "provider": "DEEP_SEEK",
+    "modelName": "deepseek-v4-flash",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseUrl": null
+  }
+}
+```
+
+**2. Programmatic Override:**
+
+```kotlin
+class MyAgent(...) : AgentModule(...) {
+    override fun agentLLMConfig(): LLMConfig = LLMConfig(
+        provider = LLMProvider.OLLAMA,
+        modelName = "qwen3.6",
+        apiKey = "ollama",
+        baseUrl = "http://localhost:11434"
+    )
+}
+```
+
+### LLM Providers
+
+Akiba supports the following LLM providers:
+
+| Provider | Display Name | OpenAI-Compatible |
+|----------|-------------|-------------------|
+| `OPEN_AI` | OpenAI | No |
+| `ANTHROPIC` | Anthropic | No |
+| `GOOGLE_GEMINI` | Google Gemini | No |
+| `MISTRAL` | Mistral AI | No |
+| `OLLAMA` | Ollama | No |
+| `AZURE_OPEN_AI` | Azure OpenAI | No |
+| `DEEP_SEEK` | DeepSeek | Yes |
+| `MOONSHOT` | Moonshot / Kimi | Yes |
+| `ZHIPU` | Zhipu AI / ChatGLM | Yes |
+| `QWEN` | Qwen / DashScope | Yes |
+| `OPEN_AI_COMPATIBLE` | OpenAI-Compatible | Yes |
+
+### LLM Configuration Options
+
+The `llm` section in `configs/config.json` supports the following options:
+
+```json
+{
+  "llm": {
+    "provider": "DEEP_SEEK",
+    "modelName": "deepseek-v4-flash",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "apiKey": "your-api-key",
+    "baseUrl": null,
+    "temperature": null,
+    "topP": null,
+    "maxTokens": null,
+    "timeoutSeconds": 120,
+    "maxRetries": 3,
+    "debugLogging": false
+  }
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `provider` | string | (required) | LLM provider name (OPEN_AI, DEEP_SEEK, etc.) |
+| `modelName` | string | (required) | Model identifier |
+| `apiKeyEnv` | string | | Environment variable containing API key |
+| `apiKey` | string | | Direct API key (not recommended) |
+| `baseUrl` | string | null | Base URL for OpenAI-compatible APIs |
+| `temperature` | double | null | Sampling temperature (0.0-1.0) |
+| `topP` | double | null | Nucleus sampling parameter |
+| `maxTokens` | int | null | Maximum tokens in response |
+| `timeoutSeconds` | int | 120 | Request timeout in seconds |
+| `maxRetries` | int | 3 | Number of retries on failure |
+| `debugLogging` | boolean | false | Enable verbose request/response logging |
+
+### Memory System
+
+Akiba agents have two types of memory:
+
+1. **Chat Memory**: Conversation history with sliding window eviction
+   - Persistent (database-backed) or in-memory
+   - Configurable via `usePersistentMemory()` and `maxMemoryMessages()`
+
+2. **Cognitive Memory**: Long-term memory store for insights and findings
+   - Stored in database per session
+   - Automatically remembers significant tool results
+   - Searchable via `query_memories` tool
 
