@@ -11,7 +11,7 @@
 ```text
 {
   // metadata: 本次任务的主要信息，目前不要求填充，也没有实际意义
-  "metadata": {   
+  "metadata": {
     "description": "Akiba Test"
   },
   // main: 主要配置，实际上该配置可以随意修改路径，在框架的 -c 参数中指定正确的文件与文件内 JSON 路径即可。
@@ -25,13 +25,26 @@
     // usingInstance: 使用的数据库实例名称，Akiba 支持多数据库实例保存数据
     "usingInstance": "akiba",
     // globalConsoleLogLevel: 全局控制台日志等级。可选值：OFF，TRACE，DEBUG, INFO, WARN, ERROR。
-    "globalConsoleLogLevel": "INFO"
+    "globalConsoleLogLevel": "INFO",
     // globalFileLogLevel: 全局文件日志等级。可选值：OFF，TRACE，DEBUG, INFO, WARN, ERROR。
-    "globalFileLogLevel": "INFO"
+    "globalFileLogLevel": "INFO",
+    // llm: LLM 配置，用于 agent 支持
+    "llm": {
+      // provider: LLM 提供者 (DEEP_SEEK, OPEN_AI, ANTHROPIC, GEMINI, OLLAMA 等)
+      "provider": "DEEP_SEEK",
+      // modelName: 使用的模型名称
+      "modelName": "deepseek-v4-flash",
+      // apiKeyEnv: 包含 API 密钥的环境变量名
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      // baseUrl: (可选) OpenAI 兼容 API 的基础 URL
+      "baseUrl": null
+    },
     // general: 通用配置
     "general": {
       // binariesRoot: 二进制文件根目录。Akiba 在导入文件时，会将文件复制到指定目录，并统一命名为 <id>.bin。这里指定的是复制的目标目录。
       "binariesRoot": "/data/binaries",
+      // importRoot: (可选) 导入文件的根目录。如果为 null，则使用 binariesRoot
+      "importRoot": null,
       // processor: 缺省处理器架构，如果需要分析数据库中未知架构的文件，则默认使用该架构分析，默认为 n/a 时，会尝试使用多种常用架构分析。
       "processor": "n/a",
       // autoAnalysisTimeout: Ghidra 的单次最大自动分析时间（秒）。
@@ -52,10 +65,16 @@
       "mode": "new",
       // forkTo: 创建项目时，指定为 fork 时，name 为原项目名，必须指定 forkTo（复制的目标项目名）。
       "forkTo": null,
+      // forkOnTask: 是否为每个任务 fork 一个新的 Ghidra 项目。默认为 false。
+      "forkOnTask": false,
       // continueLog: 创建项目时，指定为 base 时，name 为原项目名，必须指定本次任务的日志名 continueLog。
       "continueLog": null,
       // overwriteLog: 是否覆盖已有日志文件。如果已有日志文件且 overwriteLog 被设置为 false，Akiba 则会拒绝开始任务。
       "overwriteLog": true,
+      // overwriteProject: 当同名 Ghidra 项目存在时是否覆盖。默认为 false。
+      "overwriteProject": false,
+      // deletePreviousProgram: 是否在分析前删除之前的 Ghidra 程序。默认为 false。
+      "deletePreviousProgram": false,
       // saveProject: 是否保存 Ghidra 项目。如果设置为 false，则 Ghidra 项目会在任务全部完成后删除。
       "saveProject": true,
       // noCreateProgram: 是否为待分析二进制文件自动创建 Ghidra Program。Ghidra Program 是二进制分析的基础，
@@ -74,8 +93,14 @@
       //             该片段与 "SELECT u.ID FROM using_binaries u" 拼接。
       "constraint": "",
       // disableUpdate: 是否禁用数据库更新。如果设置为 true，则 Akiba 在本次任务中将不会更新数据库。（该功能尚未测试）
-      "disableUpdate": false
+      "disableUpdate": false,
+      // useLocalCache: (可选) 使用本地缓存数据库替代远程 daemon。null 表示禁用。
+      "useLocalCache": null
     },
+    // globalPreTasks: 全局预处理任务，在二进制特定任务之前运行一次
+    "globalPreTasks": [],
+    // packages: (可选) 脚本执行需要导入的 Maven 包
+    "packages": null,
     // dbImports: 数据库导入配置
     //            有时一个模块需要其他模块的输出结果，可以在导入配置文件中指定导入的数据表。
     //            在单文件流水线分析中，该部分数据的 key 将会以 "数据名+.+列名" 的形式保存。如 "test_results.function_number"
@@ -315,4 +340,223 @@ Akiba 将不同二进制文件、不同模块产生的日志分开保存，便�
 一个脚本，用于监控 Kotlin 进程的执行，当日志文件没有更新超过 20 分钟（可配置）时，它将重新启动并恢复进程（自动进行断点续传）。
 所有 Akiba 需要的参数都可以在脚本中指定。
 温馨提示：在 Linux 中，你可以在命令行中添加一个 `&` 来在后台运行该命令。例如：`python3 starter.py &`
+
+## 6. LLM Agent 系统
+
+### 概述
+
+Akiba 提供了内置的 LLM agent 基础设施，用于智能二进制分析。Agent 系统允许你创建使用大型语言模型进行逐步推理分析二进制的模块。
+
+### Agent 策略
+
+#### ReAct 策略（默认）
+
+ReAct（推理 + 行动）策略遵循显式的 **Thought → Action → Observation** 循环：
+
+```
+THOUGHT: 我需要找到入口点。
+ACTION:  list_functions()
+OBSERVATION: main @ 0x401234, foo @ 0x401256
+THOUGHT: 入口点是 main...
+ACTION:  decompile(address="0x401234")
+OBSERVATION: int main() { return 0; }
+THOUGHT: 我现在有答案了。
+FINAL ANSWER: 二进制的入口点...
+```
+
+#### Plan-Execute 策略
+
+Plan-Execute 策略分三个阶段工作：
+
+1. **规划**：创建编号的步骤计划
+2. **执行**：执行每个步骤并收集观察结果
+3. **反思**：反思结果并给出最终答案
+
+### 创建 Agent 模块
+
+继承 `AgentModule` 来创建 agent 驱动的分析模块：
+
+```kotlin
+@WithAgentSystemPrompt("You are a binary analysis assistant.")
+@WithAgentMaxIterations(15)
+@WithTableColumn("analysis", "TEXT")
+@WithTableColumn("iterations", "INTEGER")
+class BinaryAnalyst(
+    configPath: String? = null,
+    id: Int,
+    program: Program?,
+    consoleLogLevel: Level = Level.INFO,
+    fileLogLevel: Level = Level.INFO
+) : AgentModule(configPath, id, program, consoleLogLevel, fileLogLevel) {
+
+    override fun defineTools(): List<Tool> = listOf(
+        tool("list_functions") {
+            description = "List all functions in the binary"
+            execute { args ->
+                program?.let { p ->
+                    p.functionManager.getFunctions(true)
+                        .take(50).joinToString("\n") { "${it.name} @ ${it.entryPoint}" }
+                } ?: "No program loaded"
+            }
+        }
+    )
+
+    override fun taskPrompt(): String =
+        "Analyze this binary and identify its purpose, entry point, and key functions."
+}
+```
+
+### 内置工具
+
+使用 `AgentModule` 时，以下内置工具自动可用：
+
+| 工具名称 | 描述 | 参数 |
+|---------|------|------|
+| `run_module` | 在当前或不同二进制文件上运行另一个 AkibaModule | `className` (必需), `targetId`, `configJson`, `timeout`, `skipDbWrite` |
+| `run_sub_agent` | 生成子 LLM agent 处理子任务 | `systemPrompt` (必需), `taskPrompt` (必需), `toolNames`, `maxIterations` |
+| `query_module_data` | 从数据库查询分析结果 | `tableName` (必需), `columns` |
+| `query_session_history` | 查看过去的 agent 会话或获取消息 | `sessionId`, `binaryId`, `limit` |
+| `query_memories` | 搜索长期记忆存储 | `sessionId`, `memoryType`, `key`, `minImportance`, `limit` |
+| `list_modules` | 列出所有可用的 AkibaModules | (无) |
+| `run_script` | 动态编译并运行 Kotlin 脚本 | `source` (必需), `className`, `targetId` |
+| `query_ghidra_api` | 搜索和阅读 Ghidra API 文档 | `action` (必需, search/read_class), `keyword` (必需), `maxResults` |
+| `run_shell` | 在工作空间执行 shell 命令 | `command` (必需), `timeout`, `workDir` |
+
+#### run_module
+
+运行另一个 AkibaModule 并返回其结果。模块必须是完全限定的类名。
+
+```json
+{
+  "className": "org.example.DecompileModule",
+  "targetId": 123,
+  "configJson": "{\"option\":\"value\"}",
+  "timeout": 300,
+  "skipDbWrite": false
+}
+```
+
+#### run_sub_agent
+
+生成具有独立对话历史和工具的子 agent。
+
+```json
+{
+  "systemPrompt": "You are a decompilation specialist.",
+  "taskPrompt": "Decompile the main function",
+  "toolNames": "run_script,query_ghidra_api",
+  "maxIterations": 10
+}
+```
+
+#### query_ghidra_api
+
+在编写脚本之前搜索 Ghidra API 文档。
+
+```
+action: "search"  → 查找匹配关键字的类/成员
+action: "read_class"  → 阅读完整的类文档
+```
+
+示例工作流：
+1. `query_ghidra_api {"action":"search", "keyword":"decompile"}`
+2. `query_ghidra_api {"action":"read_class", "keyword":"DecompInterface"}`
+3. 在 `run_script` 中使用发现的 API
+
+### Agent 配置
+
+LLM 配置可以通过两种方式指定：
+
+**1. 全局配置（configs/config.json）：**
+
+```json
+{
+  "llm": {
+    "provider": "DEEP_SEEK",
+    "modelName": "deepseek-v4-flash",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseUrl": null
+  }
+}
+```
+
+**2. 程序化覆盖：**
+
+```kotlin
+class MyAgent(...) : AgentModule(...) {
+    override fun agentLLMConfig(): LLMConfig = LLMConfig(
+        provider = LLMProvider.OLLAMA,
+        modelName = "qwen3.6",
+        apiKey = "ollama",
+        baseUrl = "http://localhost:11434"
+    )
+}
+```
+
+### LLM 提供者
+
+Akiba 支持以下 LLM 提供者：
+
+| 提供者 | 显示名称 | OpenAI 兼容 |
+|-------|---------|------------|
+| `OPEN_AI` | OpenAI | 否 |
+| `ANTHROPIC` | Anthropic | 否 |
+| `GOOGLE_GEMINI` | Google Gemini | 否 |
+| `MISTRAL` | Mistral AI | 否 |
+| `OLLAMA` | Ollama | 否 |
+| `AZURE_OPEN_AI` | Azure OpenAI | 否 |
+| `DEEP_SEEK` | DeepSeek | 是 |
+| `MOONSHOT` | Moonshot / Kimi | 是 |
+| `ZHIPU` | Zhipu AI / ChatGLM | 是 |
+| `QWEN` | Qwen / DashScope | 是 |
+| `OPEN_AI_COMPATIBLE` | OpenAI 兼容 | 是 |
+
+### LLM 配置选项
+
+`configs/config.json` 中的 `llm` 部分支持以下选项：
+
+```json
+{
+  "llm": {
+    "provider": "DEEP_SEEK",
+    "modelName": "deepseek-v4-flash",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "apiKey": "your-api-key",
+    "baseUrl": null,
+    "temperature": null,
+    "topP": null,
+    "maxTokens": null,
+    "timeoutSeconds": 120,
+    "maxRetries": 3,
+    "debugLogging": false
+  }
+}
+```
+
+| 参数 | 类型 | 默认值 | 描述 |
+|------|------|-------|------|
+| `provider` | string | (必需) | LLM 提供者名称 (OPEN_AI, DEEP_SEEK 等) |
+| `modelName` | string | (必需) | 模型标识符 |
+| `apiKeyEnv` | string | | 包含 API 密钥的环境变量名 |
+| `apiKey` | string | | 直接 API 密钥（不推荐） |
+| `baseUrl` | string | null | OpenAI 兼容 API 的基础 URL |
+| `temperature` | double | null | 采样温度 (0.0-1.0) |
+| `topP` | double | null | 核采样参数 |
+| `maxTokens` | int | null | 响应最大 token 数 |
+| `timeoutSeconds` | int | 120 | 请求超时时间（秒） |
+| `maxRetries` | int | 3 | 失败重试次数 |
+| `debugLogging` | boolean | false | 启用详细的请求/响应日志 |
+
+### 记忆系统
+
+Akiba agent 有两种类型的记忆：
+
+1. **聊天记忆**：对话历史，支持滑动窗口退出
+   - 持久化（数据库支持）或内存中
+   - 通过 `usePersistentMemory()` 和 `maxMemoryMessages()` 配置
+
+2. **认知记忆**：用于洞察和发现的长期记忆存储
+   - 按会话存储在数据库中
+   - 自动记住重要的工具结果
+   - 可通过 `query_memories` 工具搜索
 
