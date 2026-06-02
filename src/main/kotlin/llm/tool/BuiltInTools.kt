@@ -23,6 +23,7 @@ import org.iotsplab.akiba.module.AkibaModule
  * - [QueryMemoriesTool] — search the long-term memory store
  * - [ListModulesTool] — list all available modules
  * - [RunScriptTool] — compile and run a Kotlin script dynamically
+ * - [ScriptLibraryTool] — search and run pre-built scripts from the library
  * - [QueryGhidraAPITool] — search and read Ghidra API documentation
  * - [RunShellTool] — execute shell commands in the module workspace
  *
@@ -57,6 +58,7 @@ object BuiltInTools {
         QuerySessionHistoryTool(),
         QueryMemoriesTool(),
         ListModulesTool(),
+        ScriptLibraryTool(parent),
         RunScriptTool(parent),
         QueryGhidraAPITool(),
         RunShellTool(parent)

@@ -469,6 +469,7 @@ object ProgramManager {
                     "fileLogLevel" to procedure.fileLogLevel,
                     "tableName" to procedure.tableName
                 )
+                program ?. let { initialAnalysis(it) }
                 if (ProcedureManager.invokeProcedure(
                         path, procedure, arguments, currentCoroutineContext()[ModuleContext.Key]!!)) {
                     failed = true
@@ -519,6 +520,13 @@ object ProgramManager {
                 "Exception occurred while running #${metadata.id}: ${e.message} (${e.javaClass.simpleName})")
             e.printStackTrace()
         }
+    }
+
+    private fun initialAnalysis(program: Program) {
+        val mgr = AutoAnalysisManager.getAnalysisManager(program)
+        mgr.reAnalyzeAll(null)
+        mgr.startAnalysis(TimeoutTaskMonitor.timeoutIn(120, TimeUnit.SECONDS))
+        mgr.cancelQueuedTasks()
     }
 
     private fun applyLoadProperties(program: Program, data: List<ImportManager.FileSegment>?) {

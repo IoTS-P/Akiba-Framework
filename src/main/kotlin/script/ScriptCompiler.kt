@@ -1,5 +1,6 @@
 package org.iotsplab.akiba.script
 
+import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.PrintStream
@@ -203,6 +204,13 @@ object ScriptCompiler {
         val urls = mutableListOf<String>()
         additionalDependencies.forEach { urls.add(it.path) }
         urls.add(System.getProperty("java.class.path"))
+        // Include all dynamically loaded module JARs so scripts can `import`
+        // and reference module classes during compilation. Without this the
+        // Kotlin compiler would emit `unresolved reference` errors for any
+        // symbol coming from a `modules/*.jar`.
+        ProcedureArgumentsDeserializer.jarLoaded.forEach { url ->
+            urls.add(url.path)
+        }
         return urls
     }
 

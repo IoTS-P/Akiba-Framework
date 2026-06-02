@@ -146,6 +146,19 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
             "targetId", "integer",
             "Binary ID to run the script on. Defaults to the current binary.",
             required = false
+        ),
+        ToolParameter(
+            "saveToLibrary", "boolean",
+            "If true, save this script to the script library for future reuse (author='LLM Agent'). " +
+                "Only set this to true when the script runs successfully and performs a useful, reusable task. " +
+                "Note: a script can only be overwritten by the same author. You cannot overwrite scripts authored by 'Akiba'. " +
+                "Defaults to false.",
+            required = false
+        ),
+        ToolParameter(
+            "description", "string",
+            "Description of what the script does. Required when saveToLibrary is true.",
+            required = false
         )
     )
 ) { args ->
@@ -158,6 +171,8 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
 
     val className = args["className"] as? String ?: "AkibaDynamicScript"
     val targetId = (args["targetId"] as? Number)?.toInt() ?: parent.id
+    val saveToLibrary = args["saveToLibrary"] as? Boolean ?: false
+    val scriptDescription = args["description"] as? String ?: ""
 
     val mapper = jacksonObjectMapper()
 
@@ -258,6 +273,25 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
                 )
             }
         } catch (_: Exception) { }
+
+        // Save to script library if requested and execution was successful
+        if (saveToLibrary) {
+            try {
+                val resultNode = mapper.readTree(finalResult)
+                val success = resultNode["success"]?.asBoolean() ?: false
+                if (success) {
+                    AgentDatabaseClient.createScript(
+                        name = className,
+                        description = scriptDescription,
+                        author = "LLM Agent",
+                        code = source,
+                        language = "kotlin",
+                        saveResult = true,
+                        maxOutputSize = 10 * 1024 * 1024
+                    )
+                }
+            } catch (_: Exception) { }
+        }
 
         finalResult
     } catch (e: org.iotsplab.akiba.script.CompilationException) {

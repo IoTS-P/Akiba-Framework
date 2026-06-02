@@ -3,6 +3,7 @@ package org.iotsplab.akiba.script
 import ghidra.program.model.listing.Program
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.module.RuntimeReport
+import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import java.io.File
 import java.net.URL
 import java.net.URLClassLoader
@@ -16,21 +17,26 @@ import java.security.ProtectionDomain
  * This enables hot-reload — simply create a new [ScriptClassLoader] and
  * compile/load the updated script.
  *
- * The parent ClassLoader is set to the one that loaded [AkibaScript], so
- * framework classes (and the Ghidra API) are shared across all script
- * instances, while each script's own classes remain isolated.
+ * The parent ClassLoader is set to the dynamic-module loader
+ * ([ProcedureArgumentsDeserializer.loader]) when it has been initialized,
+ * so framework classes, the Ghidra API **and any dynamically loaded
+ * module classes** are shared across all script instances. When the
+ * module loader is not yet available (e.g. during early startup), the
+ * loader of [AkibaScript] (the App CL) is used as a fallback. Each
+ * script's own classes always remain isolated within its own loader.
  *
  * ### ClassLoader isolation model
  *
  * ```
  * Bootstrap CL
  *   └── App CL (Ghidra, framework jars, …)
- *         ├── ScriptClassLoader-1  →  ScriptA, ScriptA$1, ScriptA$inner
- *         ├── ScriptClassLoader-2  →  ScriptB, ScriptB$1
- *         └── ...
+ *         └── ProcedureArgumentsDeserializer.loader (modules/ *.jar)
+ *               ├── ScriptClassLoader-1  →  ScriptA, ScriptA$1, ScriptA$inner
+ *               ├── ScriptClassLoader-2  →  ScriptB, ScriptB$1
+ *               └── ...
  * ```
  *
- * Framework classes are resolved by the parent CL (shared).
+ * Framework / module classes are resolved by the parent CL (shared).
  * Script classes are resolved **only** within this CL (isolated).
  */
 class ScriptClassLoader private constructor(
@@ -187,12 +193,33 @@ class ScriptClassLoader private constructor(
 
     companion object {
         /**
+         * Resolve the parent ClassLoader for script loaders.
+         *
+         * If the dynamic-module loader (`ProcedureArgumentsDeserializer.loader`)
+         * has already been initialized, use it as the parent so that scripts
+         * can resolve classes from dynamically loaded modules. Otherwise fall
+         * back to the framework's own ClassLoader (the App CL).
+         *
+         * Using the module loader as the parent is critical for two reasons:
+         * 1. Scripts can `import` and use classes from any loaded module.
+         * 2. Module classes loaded by the framework and seen by the script
+         *    are the **same** `Class` instance, avoiding `ClassCastException`
+         *    caused by parallel loading.
+         */
+        private fun resolveParentLoader(): ClassLoader {
+            return if (ProcedureArgumentsDeserializer.isLoaderInitialized()) {
+                ProcedureArgumentsDeserializer.loader
+            } else {
+                AkibaScript::class.java.classLoader
+            }
+        }
+
+        /**
          * Create a new isolated [ScriptClassLoader] with access to the
-         * Akiba framework classes.
+         * Akiba framework classes and any dynamically loaded modules.
          */
         fun create(): ScriptClassLoader {
-            val frameworkLoader = AkibaScript::class.java.classLoader
-            return ScriptClassLoader(frameworkLoader, emptyList(), null)
+            return ScriptClassLoader(resolveParentLoader(), emptyList(), null)
         }
 
         /**
@@ -200,11 +227,15 @@ class ScriptClassLoader private constructor(
          * dependencies available on the classpath.
          */
         fun createWithDependencies(jars: List<File>): ScriptClassLoader {
-            val frameworkLoader = AkibaScript::class.java.classLoader
+            val parent = resolveParentLoader()
+            // Use `parent` (not null) as the URLClassLoader's parent so that
+            // any class also reachable through the module/framework loader is
+            // returned as the same Class instance, preventing duplicate
+            // class definitions and ClassCastException.
             val urlCl = if (jars.isNotEmpty()) {
-                URLClassLoader(jars.map { it.toURI().toURL() }.toTypedArray(), null as ClassLoader?)
+                URLClassLoader(jars.map { it.toURI().toURL() }.toTypedArray(), parent)
             } else null
-            return ScriptClassLoader(frameworkLoader, jars, urlCl)
+            return ScriptClassLoader(parent, jars, urlCl)
         }
     }
 }

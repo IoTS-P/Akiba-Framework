@@ -422,9 +422,9 @@ abstract class AgentModule(
     private fun resolveSystemPrompt(): String {
         val base = agentSystemPrompt()
             ?: this::class.annotations.filterIsInstance<WithAgentSystemPrompt>().firstOrNull()?.prompt
-            ?: "You are an AI assistant specialized in binary analysis and reverse engineering."
+            ?: AgentPrompts.DEFAULT_SYSTEM_PROMPT
 
-        return "$base\n\n$DEFAULT_AGENT_RULES"
+        return "$base\n\n${AgentPrompts.DEFAULT_AGENT_RULES}"
     }
 
     private fun resolveMaxIterations(): Int {
@@ -433,18 +433,6 @@ abstract class AgentModule(
 
         val annotation = this::class.annotations.filterIsInstance<WithAgentMaxIterations>().firstOrNull()
         return annotation?.iterations ?: 10
-    }
-
-    companion object {
-        /**
-         * Common rules appended to every agent's system prompt.
-         * These provide essential guidance about the runtime environment.
-         */
-        private const val DEFAULT_AGENT_RULES = """IMPORTANT RULES:
-1. The workspace directory is empty by default — there are NO binary files in it. The binary under analysis is already loaded into Ghidra as the current program; you do NOT need to locate or open any file manually.
-2. NEVER use the shell tool (run_shell) for tasks that can be accomplished with other available tools. Shell commands are a last resort only.
-3. For binary analysis tasks, prefer using query_ghidra_api to look up Ghidra API usage and run_script to execute Ghidra scripts against the loaded program. These tools give you direct access to decompiled code, function listings, cross-references, and data flow — use them proactively.
-4. Scripts are written in Kotlin (not Java/Jython). They differ from standard Ghidra scripts but all Ghidra APIs are fully available."""
     }
 
     private fun resolveModelName(): String {

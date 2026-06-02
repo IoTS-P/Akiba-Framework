@@ -610,6 +610,7 @@ object AgentDatabaseClient {
         val id: Int,
         val name: String,
         val description: String?,
+        val author: String?,
         val code: String?,
         val codeSize: Int?,
         val language: String?,
@@ -641,6 +642,7 @@ object AgentDatabaseClient {
     fun createScript(
         name: String,
         description: String = "",
+        author: String = "",
         code: String,
         language: String = "kotlin",
         saveResult: Boolean = true,
@@ -649,6 +651,7 @@ object AgentDatabaseClient {
         val body = mapOf(
             "name" to name,
             "description" to description,
+            "author" to author,
             "code" to code,
             "language" to language,
             "saveResult" to saveResult,

@@ -207,6 +207,15 @@ object ProcedureArgumentsDeserializer: JsonDeserializer<ProcedureArguments>() {
     val jarLoaded: MutableSet<URL> = mutableSetOf()
     lateinit var loader: URLClassLoader
 
+    /**
+     * Whether the module [loader] has been initialized via [loadAllModules].
+     *
+     * `lateinit var` backing fields are only accessible inside the declaring
+     * class, so external callers (e.g. the script subsystem) must use this
+     * helper instead of `::loader.isInitialized`.
+     */
+    fun isLoaderInitialized(): Boolean = ::loader.isInitialized
+
     init {
         peekAllModules()
     }

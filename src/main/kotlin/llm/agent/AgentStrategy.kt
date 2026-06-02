@@ -99,6 +99,12 @@ class StrategyContext(
 
     /**
      * Execute a tool call and return the result string.
+     *
+     * Tool calls are NOT cached or deduplicated: many tools are not
+     * idempotent (e.g. anything that mutates program state, queries
+     * timestamps, or depends on prior side-effects of other tools), so
+     * repeating the "same" call at a later point may legitimately yield
+     * a different result. We always re-execute.
      */
     fun executeTool(toolCall: ParsedToolCall): String {
         val tool = toolRegistry.get(toolCall.name)
@@ -204,31 +210,83 @@ object ToolCallParser {
     /** Pattern to detect the start of a json code block containing tool_call. */
     private val codeBlockStart = Regex("""```(?:json|tool_call)\s*""")
 
+    /** Complete reasoning-channel block: <think>...</think> (case-insensitive, spans newlines). */
+    private val thinkBlock = Regex("""(?is)<\s*think\s*>.*?<\s*/\s*think\s*>""")
+
+    /** Any stray opening/closing think tag left over after block removal. */
+    private val strayThinkTag = Regex("""(?is)<\s*/?\s*think\s*>""")
+
+    /**
+     * Strip reasoning-channel markup that some models (e.g. R1-style) leak into
+     * the visible content. Handles three cases:
+     *  1. Well-formed <think>...</think> blocks → removed entirely.
+     *  2. A leaked closing </think> with no opening tag (the model's reasoning
+     *     prefix bled into content) → everything up to and including it is dropped.
+     *  3. Any remaining stray <think> / </think> tags → removed.
+     *
+     * The result is trimmed. This is intentionally conservative: it only touches
+     * think tags and never alters tool_call JSON or normal prose.
+     */
+    fun stripThinking(content: String): String {
+        if (content.isEmpty()) return content
+
+        var text = thinkBlock.replace(content, "")
+
+        // Case 2: a closing tag survived without a matching opener. Treat all
+        // text before the LAST such closing tag as reasoning and discard it.
+        val lastClose = strayThinkTag.findAll(text)
+            .lastOrNull { it.value.contains("/") }
+        if (lastClose != null) {
+            text = text.substring(lastClose.range.last + 1)
+        }
+
+        // Case 3: drop any leftover stray tags.
+        text = strayThinkTag.replace(text, "")
+
+        return text.trim()
+    }
+
     /**
      * Try to parse a tool call from the assistant's text response.
      *
      * Returns null if no tool call is found.
      */
     fun parse(response: String): ParsedToolCall? {
-        // 1. Try code block extraction: find ```json or ```tool_call blocks,
-        //    then use brace-balancing to extract the JSON inside.
+        return parseAll(response).firstOrNull()
+    }
+
+    /**
+     * Parse ALL tool calls from the assistant's response, in textual order.
+     * Useful for letting the LLM batch multiple actions in one response.
+     *
+     * Returns an empty list if none are found.
+     */
+    fun parseAll(response: String): List<ParsedToolCall> {
+        val results = mutableListOf<ParsedToolCall>()
+        val seenJsonRanges = mutableSetOf<IntRange>()
+
+        // 1. Code block extraction
         var cbMatch = codeBlockStart.find(response)
         while (cbMatch != null) {
             val jsonStart = cbMatch.range.last + 1
-            // Find the first '{' after the code block marker
             val braceStart = response.indexOf('{', jsonStart)
             if (braceStart >= 0) {
-                val jsonStr = extractBalancedJson(response, braceStart)
+                val (jsonStr, endIdx) = extractBalancedJsonWithEnd(response, braceStart)
                 if (jsonStr != null) {
-                    val result = tryParseToolCallJson(jsonStr)
-                    if (result != null) return result
+                    val range = braceStart..endIdx
+                    if (seenJsonRanges.none { it.first <= range.first && it.last >= range.last }) {
+                        val result = tryParseToolCallJson(jsonStr)
+                        if (result != null) {
+                            results.add(result)
+                            seenJsonRanges.add(range)
+                        }
+                    }
                 }
             }
             cbMatch = codeBlockStart.find(response, cbMatch.range.last + 1)
         }
 
-        // 2. Find bare JSON containing "tool_call" using brace-balancing.
-        //    Look for the keyword and walk backwards to the enclosing '{'.
+        // 2. Bare JSON containing "tool_call"
         val toolCallKeyword = "\"tool_call\""
         var searchFrom = 0
         while (searchFrom < response.length) {
@@ -237,16 +295,24 @@ object ToolCallParser {
 
             val braceStart = findOpeningBrace(response, keyIdx)
             if (braceStart >= 0) {
-                val jsonStr = extractBalancedJson(response, braceStart)
+                val (jsonStr, endIdx) = extractBalancedJsonWithEnd(response, braceStart)
                 if (jsonStr != null) {
-                    val result = tryParseToolCallJson(jsonStr)
-                    if (result != null) return result
+                    val range = braceStart..endIdx
+                    // Skip if this range is already inside a previously-found JSON block
+                    if (seenJsonRanges.none { it.first <= range.first && it.last >= range.last }) {
+                        val result = tryParseToolCallJson(jsonStr)
+                        if (result != null) {
+                            results.add(result)
+                            seenJsonRanges.add(range)
+                        }
+                    }
                 }
             }
             searchFrom = keyIdx + toolCallKeyword.length
         }
 
-        return null
+        // Sort by position in source so the call order matches the LLM's intent
+        return results.zip(seenJsonRanges).sortedBy { it.second.first }.map { it.first }
     }
 
     /**
@@ -295,7 +361,15 @@ object ToolCallParser {
      * Returns the JSON substring, or null if braces are unbalanced.
      */
     private fun extractBalancedJson(text: String, startIndex: Int): String? {
-        if (startIndex >= text.length || text[startIndex] != '{') return null
+        return extractBalancedJsonWithEnd(text, startIndex).first
+    }
+
+    /**
+     * Variant of [extractBalancedJson] that also returns the end index of
+     * the balanced JSON (inclusive of the closing brace), or -1 if not found.
+     */
+    private fun extractBalancedJsonWithEnd(text: String, startIndex: Int): Pair<String?, Int> {
+        if (startIndex >= text.length || text[startIndex] != '{') return null to -1
 
         var depth = 0
         var inString = false
@@ -316,13 +390,13 @@ object ToolCallParser {
                 c == '}' -> {
                     depth--
                     if (depth == 0) {
-                        return text.substring(startIndex, i + 1)
+                        return text.substring(startIndex, i + 1) to i
                     }
                 }
             }
             i++
         }
-        return null // unbalanced
+        return null to -1 // unbalanced
     }
 
     /**
@@ -370,10 +444,12 @@ object ToolCallParser {
     }
 
     /**
-     * Parse ALL tool calls from a completion (for providers that support
-     * parallel/multi tool calling in a single response).
+     * Like [parseFromCompletion] but returns ALL tool calls in the completion,
+     * supporting batch invocations. Native provider tool calls take precedence;
+     * if none, falls back to parsing all JSON tool_call blocks from the text.
      */
     fun parseAllFromCompletion(completion: ChatCompletion): List<ParsedToolCall> {
+        // 1. Native provider tool calls
         if (completion.toolCalls.isNotEmpty()) {
             return completion.toolCalls.map { tc ->
                 val args: Map<String, Any?> = try {
@@ -389,13 +465,10 @@ object ToolCallParser {
                 )
             }
         }
-        // Fall back to single text-based parse
+
+        // 2. Fall back to text-based parsing of all JSON tool_call blocks
         val content = completion.content
-        if (content.isNotBlank()) {
-            val single = parse(content)
-            if (single != null) return listOf(single)
-        }
-        return emptyList()
+        return if (content.isNotBlank()) parseAll(content) else emptyList()
     }
 }
 
@@ -437,34 +510,15 @@ class ReActStrategy : AgentStrategy {
     override val name: String = "ReAct"
 
     companion object {
+        /**
+         * Maximum number of tool calls executed sequentially in a single
+         * iteration before requesting another LLM round-trip. Defined in
+         * [AgentPrompts] (it is also referenced inside the ReAct instruction).
+         */
+        const val MAX_BATCH_TOOL_CALLS: Int = AgentPrompts.MAX_BATCH_TOOL_CALLS
+
         /** The system prompt supplement that instructs the LLM to follow ReAct. */
-        val REACT_INSTRUCTION: String = """
-            You are a ReAct-style agent. You MUST follow this exact format in EVERY response:
-            
-            **Thought:** <your reasoning about the current state and what to do next>
-            
-            Then choose EXACTLY ONE of:
-            - **Action:** followed by a JSON tool call (see format below)
-            - **Final Answer:** <your final conclusion when you have enough information>
-            
-            For Action, you MUST include a JSON tool call in this EXACT format:
-            ```json
-            {"tool_call": {"name": "<tool_name>", "arguments": {<key>: <value>, ...}}}
-            ```
-            
-            IMPORTANT RULES:
-            1. ALWAYS start with **Thought:** — never skip reasoning.
-            2. **Action:** MUST be followed by a JSON code block containing "tool_call". 
-               Do NOT just describe what you want to do in natural language — the system 
-               can only understand the JSON format above.
-            3. After receiving an observation, reason again with **Thought:** before your next step.
-            4. When you have enough information to answer, respond with **Final Answer:**.
-            5. Do NOT make up information — use tools to verify.
-            6. If a tool call fails, reason about the failure and try a different approach 
-               using the correct JSON format.
-            7. Never write "Action: <natural language description>". Always write 
-               "Action:" followed by ```json {"tool_call": ...} ```.
-        """.trimIndent()
+        val REACT_INSTRUCTION: String get() = AgentPrompts.REACT_INSTRUCTION
     }
 
     override fun execute(ctx: StrategyContext): AgentResult {
@@ -489,31 +543,58 @@ class ReActStrategy : AgentStrategy {
                 ctx.stats.totalOutputTokens += usage.outputTokenCount
             }
 
-            val assistantText = completion.content
+            // Strip any leaked reasoning-channel (<think>...</think>) markup before
+            // storing/displaying/parsing the assistant text.
+            val assistantText = ToolCallParser.stripThinking(completion.content)
             ctx.memory.addAssistantMessage(assistantText)
 
             logger.info("[ReAct] Assistant (${assistantText.length} chars): ${assistantText.take(300)}...")
             ctx.transcript?.writeAssistantMessage(assistantText, ctx.stats.iterations)
 
-            // Parse tool call (native first, then text-based fallback)
-            val toolCall = ToolCallParser.parseFromCompletion(completion)
-                ?: ToolCallParser.parse(assistantText)
+            // Parse ALL tool calls (native first, then text-based fallback).
+            // Up to MAX_BATCH_TOOL_CALLS will be executed sequentially in the
+            // same iteration before another LLM round-trip.
+            val allToolCalls = ToolCallParser.parseAllFromCompletion(completion).ifEmpty {
+                ToolCallParser.parseAll(assistantText)
+            }
 
-            if (toolCall != null) {
-                // Action phase — execute tool
-                logger.info("[ReAct] Action: ${toolCall.name}(${toolCall.argumentsJson.take(200)})")
-                val observation = ctx.executeTool(toolCall)
+            if (allToolCalls.isNotEmpty()) {
+                // Cap the batch size so a single response can't blow through the
+                // iteration budget or overwhelm downstream tools.
+                val batch = allToolCalls.take(MAX_BATCH_TOOL_CALLS)
+                if (allToolCalls.size > MAX_BATCH_TOOL_CALLS) {
+                    logger.warn("[ReAct] LLM emitted ${allToolCalls.size} tool calls in one response, " +
+                        "capping at $MAX_BATCH_TOOL_CALLS")
+                }
 
-                // Inject as structured observation
-                val obsMessage = "**Observation:** $observation"
-                ctx.memory.addToolMessage(
-                    toolCallId = toolCall.callId,
-                    toolName = toolCall.name,
-                    args = toolCall.argumentsJson,
-                    result = obsMessage
-                )
+                logger.info("[ReAct] Executing ${batch.size} tool call(s) in this iteration")
 
-                logger.debug("[ReAct] Observation: ${observation.take(200)}...")
+                for ((idx, toolCall) in batch.withIndex()) {
+                    logger.info("[ReAct] Action ${idx + 1}/${batch.size}: " +
+                        "${toolCall.name}(${toolCall.argumentsJson.take(200)})")
+                    val observation = ctx.executeTool(toolCall)
+
+                    val obsMessage = if (batch.size == 1) {
+                        "**Observation:** $observation"
+                    } else {
+                        "**Observation (call ${idx + 1}/${batch.size}, ${toolCall.name}):** $observation"
+                    }
+                    ctx.memory.addToolMessage(
+                        toolCallId = toolCall.callId,
+                        toolName = toolCall.name,
+                        args = toolCall.argumentsJson,
+                        result = obsMessage
+                    )
+
+                    logger.debug("[ReAct] Observation: ${observation.take(200)}...")
+                }
+
+                // If we capped the batch, hint to the LLM that some calls were dropped
+                if (allToolCalls.size > MAX_BATCH_TOOL_CALLS) {
+                    ctx.memory.addUserMessage(
+                        AgentPrompts.batchTruncatedNote(allToolCalls.size, MAX_BATCH_TOOL_CALLS)
+                    )
+                }
             } else {
                 // No tool call detected — check if LLM explicitly gave a Final Answer
                 val finalAnswer = extractFinalAnswer(assistantText)
@@ -534,14 +615,7 @@ class ReActStrategy : AgentStrategy {
                     "Text preview: ${assistantText.take(500)}")
 
                 val toolNames = ctx.toolRegistry.names().joinToString(", ")
-                val reminder = "Your previous response did not contain a valid tool call or a **Final Answer:**.\n\n" +
-                    "You MUST use this exact JSON format for tool calls:\n" +
-                    "```json\n{\"tool_call\": {\"name\": \"<tool_name>\", \"arguments\": {<args>}}}\n```\n\n" +
-                    "Available tools: $toolNames\n\n" +
-                    "Example:\n" +
-                    "```json\n{\"tool_call\": {\"name\": \"list_modules\", \"arguments\": {}}}\n```\n\n" +
-                    "Please respond with **Thought:** followed by either a valid **Action:** with the JSON above, " +
-                    "or a **Final Answer:** if you have enough information."
+                val reminder = AgentPrompts.formatReminder(toolNames)
                 ctx.memory.addUserMessage(reminder)
                 ctx.transcript?.writeFormatReminder(reminder)
             }
@@ -631,57 +705,9 @@ class PlanExecuteStrategy(
     override val name: String = "Plan-Execute"
 
     companion object {
-        val PLANNING_INSTRUCTION: String = """
-            You are a Plan-Execute agent. Your first task is to create a structured plan.
-            
-            Create a numbered plan with clear steps. For each step, specify:
-            - What you want to accomplish
-            - Which tool you will use (if any)
-            - What information you expect to gain
-            
-            Format your plan as:
-            ```
-            ## Plan
-            1. [Step description] — Tool: <tool_name> — Expected: <what you'll learn>
-            2. [Step description] — Tool: <tool_name> — Expected: <what you'll learn>
-            ...
-            ```
-            
-            Rules:
-            1. Be specific about which tool each step uses.
-            2. Steps should be ordered by dependency — don't plan to use results you haven't gathered yet.
-            3. Keep the plan concise (3-8 steps typically).
-            4. If the task is simple, a 1-2 step plan is fine.
-            5. Do NOT execute any tools yet — just create the plan.
-        """.trimIndent()
-
-        val EXECUTION_INSTRUCTION: String = """
-            You are now in the EXECUTION phase. Follow the plan step by step.
-            
-            Current step: {step}
-            
-            For each step:
-            1. Call the appropriate tool using this format:
-            ```json
-            {"tool_call": {"name": "<tool_name>", "arguments": {<key>: <value>, ...}}}
-            ```
-            2. After receiving the observation, briefly note what you learned.
-            3. If you cannot complete a step, explain why and move to the next.
-            4. If all steps are complete or you have enough information, respond with **Final Answer:** followed by your conclusion.
-            
-            If the current step's tool fails or the observation suggests the plan needs adjustment, say **Replan Needed:** and explain what changed.
-        """.trimIndent()
-
-        val REFLECTION_INSTRUCTION: String = """
-            You have completed the execution phase. Now reflect on the results.
-            
-            Based on all observations gathered:
-            1. Summarize the key findings.
-            2. Determine if the original goal has been achieved.
-            3. If not, suggest what additional steps would be needed.
-            
-            Provide your final answer starting with **Final Answer:**.
-        """.trimIndent()
+        val PLANNING_INSTRUCTION: String get() = AgentPrompts.PLANNING_INSTRUCTION
+        val EXECUTION_INSTRUCTION: String get() = AgentPrompts.EXECUTION_INSTRUCTION
+        val REFLECTION_INSTRUCTION: String get() = AgentPrompts.REFLECTION_INSTRUCTION
     }
 
     /** Represents a parsed plan step. */
@@ -796,13 +822,7 @@ class PlanExecuteStrategy(
     }
 
     private fun replan(ctx: StrategyContext): List<PlanStep> {
-        val replanPrompt = """
-            The previous plan needs to be adjusted based on new observations.
-            Create an updated plan that accounts for what we've learned so far.
-            
-            $PLANNING_INSTRUCTION
-        """.trimIndent()
-        return requestPlan(ctx, replanPrompt)
+        return requestPlan(ctx, AgentPrompts.replanPrompt())
     }
 
     private fun requestPlan(ctx: StrategyContext, instruction: String): List<PlanStep> {
@@ -815,7 +835,7 @@ class PlanExecuteStrategy(
             ctx.stats.totalOutputTokens += usage.outputTokenCount
         }
 
-        val planText = completion.content
+        val planText = ToolCallParser.stripThinking(completion.content)
         ctx.memory.addAssistantMessage(planText)
 
         return parsePlan(planText)
@@ -879,8 +899,7 @@ class PlanExecuteStrategy(
                 append("\n")
             }
 
-            val execInstruction = EXECUTION_INSTRUCTION.replace(
-                "{step}",
+            val execInstruction = AgentPrompts.executionStepInstruction(
                 "Step ${step.index}: ${step.description}" +
                     (step.tool?.let { " (suggested tool: $it)" } ?: "")
             )
@@ -905,7 +924,7 @@ class PlanExecuteStrategy(
                     ctx.stats.totalOutputTokens += usage.outputTokenCount
                 }
 
-                val assistantText = completion.content
+                val assistantText = ToolCallParser.stripThinking(completion.content)
                 ctx.memory.addAssistantMessage(assistantText)
                 ctx.transcript?.writeAssistantMessage(assistantText, ctx.stats.iterations)
 
@@ -959,7 +978,7 @@ class PlanExecuteStrategy(
             ctx.stats.totalOutputTokens += usage.outputTokenCount
         }
 
-        val reflection = completion.content
+        val reflection = ToolCallParser.stripThinking(completion.content)
         ctx.memory.addAssistantMessage(reflection)
 
         // Store reflection as insight
