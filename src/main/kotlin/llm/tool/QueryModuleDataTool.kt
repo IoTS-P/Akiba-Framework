@@ -2,8 +2,6 @@ package org.iotsplab.akiba.llm.tool
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.data.database.DatabaseClient
-import org.iotsplab.akiba.llm.agent.Tool
-import org.iotsplab.akiba.llm.agent.ToolParameter
 import org.iotsplab.akiba.module.AkibaModule
 
 /**
@@ -14,7 +12,7 @@ import org.iotsplab.akiba.module.AkibaModule
  * result table) and optionally a list of columns. The tool returns
  * the matching rows as a JSON array.
  */
-fun QueryModuleDataTool(parent: AkibaModule): Tool = Tool(
+fun QueryModuleDataTool(parent: AkibaModule, dbClient: DatabaseClient = parent.dbClient): Tool = Tool(
     name = "query_module_data",
     description = buildString {
         appendLine("Query analysis results from the database for the current binary.")
@@ -45,7 +43,7 @@ fun QueryModuleDataTool(parent: AkibaModule): Tool = Tool(
     val mapper = jacksonObjectMapper()
 
     try {
-        val data = DatabaseClient.getModuleData(
+        val data = dbClient.getModuleData(
             id = parent.id.toLong(),
             tableName = tableName,
             columns = columns

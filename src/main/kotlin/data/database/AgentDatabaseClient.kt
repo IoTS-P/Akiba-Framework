@@ -9,13 +9,20 @@ import org.iotsplab.akiba.module.Log
 /**
  * Client for Agent-related database operations.
  *
- * This object extends the existing [DatabaseClient] pattern, sending HTTP POST
- * requests to the `akiba_db_daemon`'s `/agent/*` routes.  It is the framework-side
+ * This class extends the existing [DatabaseClient] pattern, sending HTTP POST
+ * requests to the `akiba_db_daemon`'s `/agent/ *` routes.  It is the framework-side
  * counterpart of [org.iotsplab.akiba.dbDaemon.operations.AgentOps].
  *
+ * Each instance is bound to a single [DatabaseClient] and therefore to a single
+ * daemon session (host/port + auth token). This makes it safe for concurrent
+ * multi-tenant use when the surrounding code creates one
+ * [AgentDatabaseClient] per request/session.
+ *
  * All methods are synchronous (runBlocking) to match the existing [DatabaseClient] API.
- */*/
-object AgentDatabaseClient {
+ *
+ * @param dbClient The underlying [DatabaseClient] used to issue HTTP requests.
+ */
+class AgentDatabaseClient(private val dbClient: DatabaseClient) {
 
     private val mapper get() = jacksonObjectMapper()
 
@@ -54,7 +61,7 @@ object AgentDatabaseClient {
             "moduleName" to moduleName,
             "modelName" to modelName
         )
-        val response = DatabaseClient.post("/agent/session/create", body)
+        val response = dbClient.post("/agent/session/create", body)
         if (response.first == HttpStatusCode.OK)
             response.second.removeSurrounding("\"")  // UUID string
         else
@@ -66,7 +73,7 @@ object AgentDatabaseClient {
      */
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     fun getSession(sessionId: String): SessionInfo = runBlocking {
-        val response = DatabaseClient.post("/agent/session/get", mapOf("sessionId" to sessionId))
+        val response = dbClient.post("/agent/session/get", mapOf("sessionId" to sessionId))
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<SessionInfo>(response.second)
         else
@@ -91,7 +98,7 @@ object AgentDatabaseClient {
             "limit" to limit,
             "offset" to offset
         )
-        val response = DatabaseClient.post("/agent/session/list", body)
+        val response = dbClient.post("/agent/session/list", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<List<SessionInfo>>(response.second)
         else
@@ -116,7 +123,7 @@ object AgentDatabaseClient {
             "graphId" to graphId,
             "modelName" to modelName
         )
-        val response = DatabaseClient.post("/agent/session/update", body)
+        val response = dbClient.post("/agent/session/update", body)
         if (response.first != HttpStatusCode.OK)
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }
@@ -158,7 +165,7 @@ object AgentDatabaseClient {
             "sessionId" to sessionId,
             "messages" to messages
         )
-        val response = DatabaseClient.post("/agent/message/append", body)
+        val response = dbClient.post("/agent/message/append", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<List<Long>>(response.second)
         else
@@ -175,7 +182,7 @@ object AgentDatabaseClient {
             "fromIndex" to fromIndex,
             "limit" to limit
         )
-        val response = DatabaseClient.post("/agent/message/get", body)
+        val response = dbClient.post("/agent/message/get", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<List<MessageInfo>>(response.second)
         else
@@ -192,7 +199,7 @@ object AgentDatabaseClient {
             "sessionId" to sessionId,
             "fromIndex" to fromIndex
         )
-        val response = DatabaseClient.post("/agent/message/delete_from", body)
+        val response = dbClient.post("/agent/message/delete_from", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<Int>(response.second)
         else
@@ -241,7 +248,7 @@ object AgentDatabaseClient {
             "importance" to importance,
             "metadata" to metadata
         )
-        val response = DatabaseClient.post("/agent/memory/store", body)
+        val response = dbClient.post("/agent/memory/store", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<Long>(response.second)
         else
@@ -270,7 +277,7 @@ object AgentDatabaseClient {
             "minImportance" to minImportance,
             "limit" to limit
         )
-        val response = DatabaseClient.post("/agent/memory/query", body)
+        val response = dbClient.post("/agent/memory/query", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<List<MemoryInfo>>(response.second)
         else
@@ -305,7 +312,7 @@ object AgentDatabaseClient {
             "contextConfig" to contextConfig,
             "moduleData" to moduleData
         )
-        val response = DatabaseClient.post("/agent/context/save", body)
+        val response = dbClient.post("/agent/context/save", body)
         if (response.first != HttpStatusCode.OK)
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }
@@ -315,7 +322,7 @@ object AgentDatabaseClient {
      */
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     fun loadContext(sessionId: String): ContextInfo = runBlocking {
-        val response = DatabaseClient.post("/agent/context/load", mapOf("sessionId" to sessionId))
+        val response = dbClient.post("/agent/context/load", mapOf("sessionId" to sessionId))
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<ContextInfo>(response.second)
         else
@@ -386,7 +393,7 @@ object AgentDatabaseClient {
             "convergenceThreshold" to convergenceThreshold,
             "cycleStrategy" to cycleStrategy
         )
-        val response = DatabaseClient.post("/agent/graph/create", body)
+        val response = dbClient.post("/agent/graph/create", body)
         if (response.first == HttpStatusCode.OK)
             response.second.removeSurrounding("\"")
         else
@@ -417,7 +424,7 @@ object AgentDatabaseClient {
             "tools" to tools,
             "config" to config
         )
-        val response = DatabaseClient.post("/agent/graph/add_node", body)
+        val response = dbClient.post("/agent/graph/add_node", body)
         if (response.first != HttpStatusCode.OK)
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }
@@ -445,7 +452,7 @@ object AgentDatabaseClient {
             "priority" to priority,
             "config" to config
         )
-        val response = DatabaseClient.post("/agent/graph/add_edge", body)
+        val response = dbClient.post("/agent/graph/add_edge", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<Long>(response.second)
         else
@@ -457,7 +464,7 @@ object AgentDatabaseClient {
      */
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     fun loadGraph(graphId: String): FullGraph = runBlocking {
-        val response = DatabaseClient.post("/agent/graph/load", mapOf("graphId" to graphId))
+        val response = dbClient.post("/agent/graph/load", mapOf("graphId" to graphId))
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<FullGraph>(response.second)
         else
@@ -506,7 +513,7 @@ object AgentDatabaseClient {
             "status" to status,
             "durationMs" to durationMs
         )
-        val response = DatabaseClient.post("/agent/execution/record", body)
+        val response = dbClient.post("/agent/execution/record", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<Long>(response.second)
         else
@@ -527,7 +534,7 @@ object AgentDatabaseClient {
             "graphId" to graphId,
             "limit" to limit
         )
-        val response = DatabaseClient.post("/agent/execution/get", body)
+        val response = dbClient.post("/agent/execution/get", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<List<ExecutionInfo>>(response.second)
         else
@@ -564,7 +571,7 @@ object AgentDatabaseClient {
             "requestText" to requestText,
             "expiresAt" to expiresAt
         )
-        val response = DatabaseClient.post("/agent/human/request", body)
+        val response = dbClient.post("/agent/human/request", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<Long>(response.second)
         else
@@ -581,7 +588,7 @@ object AgentDatabaseClient {
             "responseText" to responseText,
             "status" to status
         )
-        val response = DatabaseClient.post("/agent/human/respond", body)
+        val response = dbClient.post("/agent/human/respond", body)
         if (response.first != HttpStatusCode.OK)
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }
@@ -595,7 +602,7 @@ object AgentDatabaseClient {
             "sessionId" to sessionId,
             "includeAnswered" to includeAnswered
         )
-        val response = DatabaseClient.post("/agent/human/poll", body)
+        val response = dbClient.post("/agent/human/poll", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<List<HumanInputInfo>>(response.second)
         else
@@ -657,7 +664,7 @@ object AgentDatabaseClient {
             "saveResult" to saveResult,
             "maxOutputSize" to maxOutputSize
         )
-        val response = DatabaseClient.post("/script/create", body)
+        val response = dbClient.post("/script/create", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<Int>(response.second)
         else
@@ -669,7 +676,7 @@ object AgentDatabaseClient {
      */
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     fun getScript(scriptId: Int): ScriptInfo = runBlocking {
-        val response = DatabaseClient.post("/script/get", mapOf("scriptId" to scriptId))
+        val response = dbClient.post("/script/get", mapOf("scriptId" to scriptId))
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<ScriptInfo>(response.second)
         else
@@ -682,7 +689,7 @@ object AgentDatabaseClient {
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     fun listScripts(limit: Int = 100, offset: Int = 0): List<ScriptInfo> = runBlocking {
         val body = mapOf("limit" to limit, "offset" to offset)
-        val response = DatabaseClient.post("/script/list", body)
+        val response = dbClient.post("/script/list", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<List<ScriptInfo>>(response.second)
         else
@@ -711,7 +718,7 @@ object AgentDatabaseClient {
             "saveResult" to saveResult,
             "maxOutputSize" to maxOutputSize
         )
-        val response = DatabaseClient.post("/script/update", body)
+        val response = dbClient.post("/script/update", body)
         if (response.first != HttpStatusCode.OK)
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }
@@ -732,7 +739,7 @@ object AgentDatabaseClient {
             "status" to status,
             "maxOutputSize" to maxOutputSize
         )
-        val response = DatabaseClient.post("/script/update_output", body)
+        val response = dbClient.post("/script/update_output", body)
         if (response.first != HttpStatusCode.OK)
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }
@@ -742,7 +749,7 @@ object AgentDatabaseClient {
      */
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     fun deleteScript(scriptId: Int) = runBlocking {
-        val response = DatabaseClient.post("/script/delete", mapOf("scriptId" to scriptId))
+        val response = dbClient.post("/script/delete", mapOf("scriptId" to scriptId))
         if (response.first != HttpStatusCode.OK)
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }
@@ -757,7 +764,7 @@ object AgentDatabaseClient {
         binaryId: Int? = null
     ): Int = runBlocking {
         val body = mapOf("scriptId" to scriptId, "binaryId" to binaryId)
-        val response = DatabaseClient.post("/script/execution/create", body)
+        val response = dbClient.post("/script/execution/create", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<Int>(response.second)
         else
@@ -769,7 +776,7 @@ object AgentDatabaseClient {
      */
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     fun getScriptExecution(executionId: Int): ScriptExecutionInfo = runBlocking {
-        val response = DatabaseClient.post("/script/execution/get", mapOf("executionId" to executionId))
+        val response = dbClient.post("/script/execution/get", mapOf("executionId" to executionId))
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<ScriptExecutionInfo>(response.second)
         else
@@ -781,7 +788,7 @@ object AgentDatabaseClient {
      */
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     fun listScriptExecutions(scriptId: Int): List<ScriptExecutionInfo> = runBlocking {
-        val response = DatabaseClient.post("/script/execution/list", mapOf("scriptId" to scriptId))
+        val response = dbClient.post("/script/execution/list", mapOf("scriptId" to scriptId))
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<List<ScriptExecutionInfo>>(response.second)
         else
@@ -804,7 +811,7 @@ object AgentDatabaseClient {
             "status" to status,
             "errorMessage" to errorMessage
         )
-        val response = DatabaseClient.post("/script/execution/update", body)
+        val response = dbClient.post("/script/execution/update", body)
         if (response.first != HttpStatusCode.OK)
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }
@@ -838,7 +845,7 @@ object AgentDatabaseClient {
             "success" to success,
             "durationMs" to durationMs
         )
-        val response = DatabaseClient.post("/agent/tool_call/record", body)
+        val response = dbClient.post("/agent/tool_call/record", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<Long>(response.second)
         else

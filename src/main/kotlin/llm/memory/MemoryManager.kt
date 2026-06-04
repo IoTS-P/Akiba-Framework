@@ -79,6 +79,7 @@ data class MemoryEntry(
  * ```
  */
 class MemoryManager(
+    private val agentDbClient: AgentDatabaseClient,
     private val sessionId: String? = null,
     private val binaryId: Int? = null
 ) {
@@ -101,7 +102,7 @@ class MemoryManager(
         metadata: String? = null
     ): Long {
         return try {
-            AgentDatabaseClient.storeMemory(
+            agentDbClient.storeMemory(
                 sessionId = sessionId,
                 binaryId = binaryId,
                 memoryType = type.value,
@@ -146,7 +147,7 @@ class MemoryManager(
         limit: Int = 50
     ): List<MemoryEntry> {
         return try {
-            AgentDatabaseClient.queryMemories(
+            agentDbClient.queryMemories(
                 sessionId = sessionId,
                 binaryId = binaryId,
                 memoryType = type?.value,

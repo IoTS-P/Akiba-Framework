@@ -4,9 +4,6 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import org.iotsplab.akiba.data.database.DatabaseClient
-import org.iotsplab.akiba.managers.ConfigManager
-import org.iotsplab.akiba.utils.Configs
-import org.iotsplab.akiba.utils.SqlSource
 
 data class InstanceRequest(val name: String)
 data class InstanceActionRequest(val instanceName: String)
@@ -14,94 +11,131 @@ data class InstanceResponse(val message: String, val instanceName: String? = nul
 
 fun Route.instanceRoutes(daemonHost: String, daemonPort: Int) {
 
-    suspend fun withDaemonConnection(block: suspend () -> Any): Any {
-        ConfigManager.config = Configs(sqlSource = SqlSource(serverIP = daemonHost, serverPort = daemonPort))
-        DatabaseClient.urlHeader = "http://$daemonHost:$daemonPort"
-        return block()
-    }
-
+    /**
+     * List instances visible to the daemon.
+     *
+     * The akiba_db_daemon does not currently expose a "list all instances"
+     * endpoint, so this route can only confirm whether a *specific* named
+     * instance is reachable. Behavior:
+     *
+     *   - With `?probe=<name>`: try to connect+disconnect to `<name>`. If
+     *     it succeeds the response includes the name, otherwise an empty
+     *     list. Used by the frontend to verify that a remembered
+     *     selection is still valid.
+     *   - Without `?probe=`: respond with an empty list and a hint asking
+     *     the caller to either probe a known name or create a new
+     *     instance via `POST /instances/create`.
+     *
+     * No instance name is ever hard-coded here.
+     */
     get("/instances") {
+        val probe = call.parameters["probe"]?.takeIf { it.isNotBlank() }
+        val visible = mutableListOf<String>()
         try {
-            call.respond(mapOf("instances" to listOf<String>()))
+            if (probe != null) {
+                withDaemonSession(daemonHost, daemonPort, instanceName = null) { dbClient ->
+                    runCatching {
+                        dbClient.connectToInstance(probe)
+                        dbClient.disconnectToInstance(probe)
+                        visible.add(probe)
+                    }
+                }
+                call.respond(mapOf("instances" to visible))
+            } else {
+                call.respond(mapOf(
+                    "instances" to visible,
+                    "hint" to "Pass ?probe=<name> to verify a specific instance, " +
+                        "or POST /api/instances/create to create one."
+                ))
+            }
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                mapOf("error" to e.message))
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
         }
     }
 
+    /**
+     * Create / delete operate on an instance that may not exist yet (or is
+     * about to disappear), so we cannot connect to it. Login-only session.
+     */
     post("/instances/create") {
         val req = call.receive<InstanceRequest>()
         try {
-            withDaemonConnection {
-                DatabaseClient.login("akiba", "akiba")
-                DatabaseClient.createInstance(req.name)
-                DatabaseClient.logout()
+            withDaemonSession(daemonHost, daemonPort, instanceName = null) { dbClient ->
+                dbClient.createInstance(req.name)
             }
             call.respond(InstanceResponse("Instance created", req.name))
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                InstanceResponse("Failed to create instance: ${e.message}"))
+            val (status, body) = errorPayload(e)
+            call.respond(status, InstanceResponse(
+                body["error"] ?: "Failed to create instance", req.name
+            ))
         }
     }
 
     post("/instances/delete") {
         val req = call.receive<InstanceActionRequest>()
         try {
-            withDaemonConnection {
-                DatabaseClient.login("akiba", "akiba")
-                DatabaseClient.deleteInstance(req.instanceName)
-                DatabaseClient.logout()
+            withDaemonSession(daemonHost, daemonPort, instanceName = null) { dbClient ->
+                dbClient.deleteInstance(req.instanceName)
             }
             call.respond(InstanceResponse("Instance deleted", req.instanceName))
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                InstanceResponse("Failed to delete instance: ${e.message}"))
+            val (status, body) = errorPayload(e)
+            call.respond(status, InstanceResponse(
+                body["error"] ?: "Failed to delete instance", req.instanceName
+            ))
         }
     }
 
+    /**
+     * Start / shutdown / backup all act on the request's `instanceName`.
+     * Connecting + disconnecting is what we use to ensure the instance is
+     * reachable; we let `withDaemonSession` do the connect via its
+     * `instanceName` parameter so any error during connect surfaces here.
+     */
     post("/instances/start") {
         val req = call.receive<InstanceActionRequest>()
         try {
-            withDaemonConnection {
-                DatabaseClient.login("akiba", "akiba")
-                DatabaseClient.connectToInstance(req.instanceName)
-                DatabaseClient.disconnectToInstance(req.instanceName)
-                DatabaseClient.logout()
+            withDaemonSession(daemonHost, daemonPort, instanceName = req.instanceName) { _ ->
+                // Just connecting + (auto) disconnecting is the start-probe.
             }
             call.respond(InstanceResponse("Instance started", req.instanceName))
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                InstanceResponse("Failed to start instance: ${e.message}"))
+            val (status, body) = errorPayload(e)
+            call.respond(status, InstanceResponse(
+                body["error"] ?: "Failed to start instance", req.instanceName
+            ))
         }
     }
 
     post("/instances/shutdown") {
         val req = call.receive<InstanceActionRequest>()
         try {
-            withDaemonConnection {
-                DatabaseClient.login("akiba", "akiba")
-                DatabaseClient.shutdownInstance(req.instanceName)
-                DatabaseClient.logout()
+            // shutdownInstance does not require an active session — it is
+            // an admin-level call.
+            withDaemonSession(daemonHost, daemonPort, instanceName = null) { dbClient ->
+                dbClient.shutdownInstance(req.instanceName)
             }
             call.respond(InstanceResponse("Instance shut down", req.instanceName))
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                InstanceResponse("Failed to shut down instance: ${e.message}"))
+            val (status, body) = errorPayload(e)
+            call.respond(status, InstanceResponse(
+                body["error"] ?: "Failed to shut down instance", req.instanceName
+            ))
         }
     }
 
     post("/instances/backup") {
         val req = call.receive<InstanceActionRequest>()
         try {
-            withDaemonConnection {
-                DatabaseClient.login("akiba", "akiba")
-                DatabaseClient.createBackup(true, req.instanceName, null, null)
-                DatabaseClient.logout()
+            withDaemonSession(daemonHost, daemonPort, instanceName = req.instanceName) { dbClient ->
+                dbClient.createBackup(true, req.instanceName, null, null)
             }
             call.respond(mapOf("message" to "Backup created"))
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                mapOf("error" to "Failed to create backup: ${e.message}"))
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
         }
     }
 }

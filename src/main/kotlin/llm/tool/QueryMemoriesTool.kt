@@ -2,8 +2,6 @@ package org.iotsplab.akiba.llm.tool
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.llm.agent.Tool
-import org.iotsplab.akiba.llm.agent.ToolParameter
 
 /**
  * Create a tool that queries the cognitive memory store.
@@ -11,7 +9,7 @@ import org.iotsplab.akiba.llm.agent.ToolParameter
  * Agents can search for past findings, insights, plans, and other
  * memories associated with the current session or binary.
  */
-fun QueryMemoriesTool(): Tool = Tool(
+fun QueryMemoriesTool(agentDbClient: AgentDatabaseClient): Tool = Tool(
     name = "query_memories",
     description = buildString {
         appendLine("Query the agent's long-term memory store for past findings, insights, ")
@@ -57,7 +55,7 @@ fun QueryMemoriesTool(): Tool = Tool(
     val mapper = jacksonObjectMapper()
 
     try {
-        val memories = AgentDatabaseClient.queryMemories(
+        val memories = agentDbClient.queryMemories(
             sessionId = sessionId,
             memoryType = memoryType,
             key = key,

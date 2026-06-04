@@ -9,7 +9,6 @@ import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.data.database.AgentDatabaseClient.ScriptExecutionInfo
 import org.iotsplab.akiba.data.database.AgentDatabaseClient.ScriptInfo
 import org.iotsplab.akiba.data.database.DatabaseClient
-import org.iotsplab.akiba.server.security.JwtService
 
 data class CreateScriptRequest(
     val name: String,
@@ -76,21 +75,26 @@ object ScriptConfig {
     const val DEFAULT_MAX_OUTPUT_SIZE = 10 * 1024 * 1024L // 10MB
 }
 
-fun Route.scriptRoutes() {
+fun Route.scriptRoutes(daemonHost: String, daemonPort: Int) {
     get("/scripts") {
+        val instance = call.requireInstanceHeader() ?: return@get
         val limit = call.parameters["limit"]?.toIntOrNull() ?: 100
         val offset = call.parameters["offset"]?.toIntOrNull() ?: 0
 
         try {
-            val scripts = AgentDatabaseClient.listScripts(limit, offset)
+            val scripts = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                agentDbClient.listScripts(limit, offset)
+            }
             call.respond(mapOf("scripts" to scripts.map { it.toResponse() }))
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                mapOf("error" to e.message))
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
         }
     }
 
     get("/scripts/{id}") {
+        val instance = call.requireInstanceHeader() ?: return@get
         val id = call.parameters["id"]?.toIntOrNull()
         if (id == null) {
             call.respond(io.ktor.http.HttpStatusCode.BadRequest, mapOf("error" to "Invalid ID"))
@@ -98,22 +102,26 @@ fun Route.scriptRoutes() {
         }
 
         try {
-            val script = AgentDatabaseClient.getScript(id)
+            val script = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                agentDbClient.getScript(id)
+            }
             call.respond(script.toResponse())
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             if (e.statusCode == io.ktor.http.HttpStatusCode.NotFound) {
                 call.respond(io.ktor.http.HttpStatusCode.NotFound, mapOf("error" to "Script not found"))
             } else {
-                call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                    mapOf("error" to e.message))
+                val (status, body) = errorPayload(e)
+                call.respond(status, body)
             }
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                mapOf("error" to e.message))
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
         }
     }
 
     post("/scripts") {
+        val instance = call.requireInstanceHeader() ?: return@post
         val req = call.receive<CreateScriptRequest>()
         try {
             if (req.code.toByteArray().size > ScriptConfig.MAX_CODE_SIZE) {
@@ -135,24 +143,27 @@ fun Route.scriptRoutes() {
                 req.maxOutputSize
             }
 
-            val scriptId = AgentDatabaseClient.createScript(
-                name = req.name,
-                description = req.description,
-                code = req.code,
-                language = req.language,
-                saveResult = req.saveResult,
-                maxOutputSize = maxOutputSize
-            )
-
-            val script = AgentDatabaseClient.getScript(scriptId)
+            val script = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                val scriptId = agentDbClient.createScript(
+                    name = req.name,
+                    description = req.description,
+                    code = req.code,
+                    language = req.language,
+                    saveResult = req.saveResult,
+                    maxOutputSize = maxOutputSize
+                )
+                agentDbClient.getScript(scriptId)
+            }
             call.respond(io.ktor.http.HttpStatusCode.Created, script.toResponse())
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                mapOf("error" to "Failed to create script: ${e.message}"))
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
         }
     }
 
     put("/scripts/{id}") {
+        val instance = call.requireInstanceHeader() ?: return@put
         val id = call.parameters["id"]?.toIntOrNull()
         if (id == null) {
             call.respond(io.ktor.http.HttpStatusCode.BadRequest, mapOf("error" to "Invalid ID"))
@@ -160,9 +171,6 @@ fun Route.scriptRoutes() {
         }
 
         try {
-            // Verify script exists
-            AgentDatabaseClient.getScript(id)
-
             val req = call.receive<UpdateScriptRequest>()
             if (req.code != null && req.code.toByteArray().size > ScriptConfig.MAX_CODE_SIZE) {
                 call.respond(io.ktor.http.HttpStatusCode.BadRequest,
@@ -170,23 +178,32 @@ fun Route.scriptRoutes() {
                 return@put
             }
 
-            AgentDatabaseClient.updateScript(id, req.name, req.description, req.code, req.language, req.saveResult, req.maxOutputSize)
-            val updated = AgentDatabaseClient.getScript(id)
+            val updated = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                // Verify script exists
+                agentDbClient.getScript(id)
+                agentDbClient.updateScript(
+                    id, req.name, req.description, req.code, req.language,
+                    req.saveResult, req.maxOutputSize
+                )
+                agentDbClient.getScript(id)
+            }
             call.respond(updated.toResponse())
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             if (e.statusCode == io.ktor.http.HttpStatusCode.NotFound) {
                 call.respond(io.ktor.http.HttpStatusCode.NotFound, mapOf("error" to "Script not found"))
             } else {
-                call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                    mapOf("error" to "Failed to update script: ${e.message}"))
+                val (status, body) = errorPayload(e)
+                call.respond(status, body)
             }
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                mapOf("error" to "Failed to update script: ${e.message}"))
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
         }
     }
 
     delete("/scripts/{id}") {
+        val instance = call.requireInstanceHeader() ?: return@delete
         val id = call.parameters["id"]?.toIntOrNull()
         if (id == null) {
             call.respond(io.ktor.http.HttpStatusCode.BadRequest, mapOf("error" to "Invalid ID"))
@@ -194,15 +211,19 @@ fun Route.scriptRoutes() {
         }
 
         try {
-            AgentDatabaseClient.deleteScript(id)
+            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                agentDbClient.deleteScript(id)
+            }
             call.respond(mapOf("message" to "Script deleted"))
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                mapOf("error" to "Failed to delete script: ${e.message}"))
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
         }
     }
 
     post("/scripts/{id}/run") {
+        val instance = call.requireInstanceHeader() ?: return@post
         val id = call.parameters["id"]?.toIntOrNull()
         if (id == null) {
             call.respond(io.ktor.http.HttpStatusCode.BadRequest, mapOf("error" to "Invalid ID"))
@@ -210,58 +231,85 @@ fun Route.scriptRoutes() {
         }
 
         try {
-            val script = AgentDatabaseClient.getScript(id)
-
             val req = call.receive<RunScriptRequest>()
             val binaryIds = req.binaryIds
 
+            // Resolve script + create execution row(s) under one daemon session.
+            data class Prepared(val script: AgentDatabaseClient.ScriptInfo, val executionIds: List<Int>)
+            val prepared = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                val script = agentDbClient.getScript(id)
+                val execs = if (binaryIds.isEmpty()) {
+                    listOf(agentDbClient.createScriptExecution(script.id, null))
+                } else if (binaryIds.size == 1 || !req.parallel) {
+                    listOf(agentDbClient.createScriptExecution(script.id, binaryIds.first()))
+                } else {
+                    binaryIds.map { agentDbClient.createScriptExecution(script.id, it) }
+                }
+                Prepared(script, execs)
+            }
+
+            // Spawn the executors. Each one opens its own daemon session
+            // because the parent route session has already been released.
             if (binaryIds.isEmpty()) {
-                val executionId = AgentDatabaseClient.createScriptExecution(script.id, null)
                 CoroutineScope(Dispatchers.Default).launch {
-                    executeScript(executionId, script)
+                    runCatching {
+                        withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                            val agentDbClient = AgentDatabaseClient(dbClient)
+                            executeScript(agentDbClient, prepared.executionIds.first(), prepared.script)
+                        }
+                    }
                 }
                 call.respond(ScriptRunResponse(
-                    executionId = executionId,
-                    scriptId = script.id,
+                    executionId = prepared.executionIds.first(),
+                    scriptId = prepared.script.id,
                     binaryIds = emptyList(),
                     status = "pending",
                     message = "Script execution started"
                 ))
             } else if (binaryIds.size == 1 || !req.parallel) {
-                val executionId = AgentDatabaseClient.createScriptExecution(script.id, binaryIds.first())
                 CoroutineScope(Dispatchers.Default).launch {
-                    executeScriptForBinary(executionId, script, binaryIds.first())
+                    runCatching {
+                        withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                            val agentDbClient = AgentDatabaseClient(dbClient)
+                            executeScriptForBinary(agentDbClient, prepared.executionIds.first(), prepared.script, binaryIds.first())
+                        }
+                    }
                 }
                 call.respond(ScriptRunResponse(
-                    executionId = executionId,
-                    scriptId = script.id,
+                    executionId = prepared.executionIds.first(),
+                    scriptId = prepared.script.id,
                     binaryIds = binaryIds,
                     status = "pending",
                     message = "Script execution started for single binary (serial)"
                 ))
             } else {
-                val executionIds = binaryIds.map { binaryId ->
-                    val execId = AgentDatabaseClient.createScriptExecution(script.id, binaryId)
+                prepared.executionIds.zip(binaryIds).forEach { (execId, binaryId) ->
                     CoroutineScope(Dispatchers.Default).launch {
-                        executeScriptForBinary(execId, script, binaryId)
+                        runCatching {
+                            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                                val agentDbClient = AgentDatabaseClient(dbClient)
+                                executeScriptForBinary(agentDbClient, execId, prepared.script, binaryId)
+                            }
+                        }
                     }
-                    execId
                 }
                 call.respond(ScriptRunResponse(
-                    executionId = executionIds.first(),
-                    scriptId = script.id,
+                    executionId = prepared.executionIds.first(),
+                    scriptId = prepared.script.id,
                     binaryIds = binaryIds,
                     status = "pending",
                     message = "Script execution started for ${binaryIds.size} binaries (parallel)"
                 ))
             }
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                mapOf("error" to "Failed to run script: ${e.message}"))
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
         }
     }
 
     get("/scripts/{id}/executions") {
+        val instance = call.requireInstanceHeader() ?: return@get
         val id = call.parameters["id"]?.toIntOrNull()
         if (id == null) {
             call.respond(io.ktor.http.HttpStatusCode.BadRequest, mapOf("error" to "Invalid ID"))
@@ -269,18 +317,21 @@ fun Route.scriptRoutes() {
         }
 
         try {
-            // Verify script exists
-            AgentDatabaseClient.getScript(id)
-
-            val executions = AgentDatabaseClient.listScriptExecutions(id)
+            val executions = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                // Verify script exists
+                agentDbClient.getScript(id)
+                agentDbClient.listScriptExecutions(id)
+            }
             call.respond(mapOf("executions" to executions.map { it.toResponse() }))
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                mapOf("error" to e.message))
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
         }
     }
 
     get("/executions/{id}") {
+        val instance = call.requireInstanceHeader() ?: return@get
         val id = call.parameters["id"]?.toIntOrNull()
         if (id == null) {
             call.respond(io.ktor.http.HttpStatusCode.BadRequest, mapOf("error" to "Invalid ID"))
@@ -288,18 +339,21 @@ fun Route.scriptRoutes() {
         }
 
         try {
-            val execution = AgentDatabaseClient.getScriptExecution(id)
+            val execution = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                agentDbClient.getScriptExecution(id)
+            }
             call.respond(execution.toResponse())
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             if (e.statusCode == io.ktor.http.HttpStatusCode.NotFound) {
                 call.respond(io.ktor.http.HttpStatusCode.NotFound, mapOf("error" to "Execution not found"))
             } else {
-                call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                    mapOf("error" to e.message))
+                val (status, body) = errorPayload(e)
+                call.respond(status, body)
             }
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                mapOf("error" to e.message))
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
         }
     }
 }
@@ -321,50 +375,50 @@ private fun validateCode(code: String, language: String): List<String> {
     return issues
 }
 
-private suspend fun executeScript(executionId: Int, script: ScriptInfo) {
+private fun executeScript(agentDbClient: AgentDatabaseClient, executionId: Int, script: ScriptInfo) {
     try {
-        AgentDatabaseClient.updateScriptExecution(executionId, null, "running", null)
+        agentDbClient.updateScriptExecution(executionId, null, "running", null)
 
         val output = "Script execution placeholder - requires full framework integration"
-        AgentDatabaseClient.updateScriptOutput(
+        agentDbClient.updateScriptOutput(
             script.id, output, "completed", script.maxOutputSize
         )
-        AgentDatabaseClient.updateScriptExecution(executionId, output, "completed", null)
+        agentDbClient.updateScriptExecution(executionId, output, "completed", null)
 
         if (script.saveResult == true) {
-            AgentDatabaseClient.updateScriptOutput(
+            agentDbClient.updateScriptOutput(
                 script.id, output, "completed", script.maxOutputSize
             )
         }
     } catch (e: Exception) {
         val errorMsg = e.message ?: "Unknown error"
         try {
-            AgentDatabaseClient.updateScriptOutput(script.id, "Error: $errorMsg", "failed", script.maxOutputSize)
-            AgentDatabaseClient.updateScriptExecution(executionId, null, "failed", errorMsg)
+            agentDbClient.updateScriptOutput(script.id, "Error: $errorMsg", "failed", script.maxOutputSize)
+            agentDbClient.updateScriptExecution(executionId, null, "failed", errorMsg)
         } catch (_: Exception) { }
     }
 }
 
-private suspend fun executeScriptForBinary(executionId: Int, script: ScriptInfo, binaryId: Int) {
+private fun executeScriptForBinary(agentDbClient: AgentDatabaseClient, executionId: Int, script: ScriptInfo, binaryId: Int) {
     try {
-        AgentDatabaseClient.updateScriptExecution(executionId, null, "running", null)
+        agentDbClient.updateScriptExecution(executionId, null, "running", null)
 
         val output = "Script execution for binary $binaryId - placeholder"
-        AgentDatabaseClient.updateScriptOutput(
+        agentDbClient.updateScriptOutput(
             script.id, output, "completed", script.maxOutputSize
         )
-        AgentDatabaseClient.updateScriptExecution(executionId, output, "completed", null)
+        agentDbClient.updateScriptExecution(executionId, output, "completed", null)
 
         if (script.saveResult == true) {
-            AgentDatabaseClient.updateScriptOutput(
+            agentDbClient.updateScriptOutput(
                 script.id, output, "completed", script.maxOutputSize
             )
         }
     } catch (e: Exception) {
         val errorMsg = e.message ?: "Unknown error"
         try {
-            AgentDatabaseClient.updateScriptOutput(script.id, "Error: $errorMsg", "failed", script.maxOutputSize)
-            AgentDatabaseClient.updateScriptExecution(executionId, null, "failed", errorMsg)
+            agentDbClient.updateScriptOutput(script.id, "Error: $errorMsg", "failed", script.maxOutputSize)
+            agentDbClient.updateScriptExecution(executionId, null, "failed", errorMsg)
         } catch (_: Exception) { }
     }
 }

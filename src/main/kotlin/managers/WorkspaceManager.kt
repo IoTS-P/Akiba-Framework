@@ -277,7 +277,11 @@ object WorkspaceManager: Closeable {
     }
 
     fun initDatabase(): Boolean {
-        if (!DatabaseClient.testConnection()) {
+        val sqlSource = config.sqlSource
+        val dbClient = DatabaseClient(sqlSource.serverIP, sqlSource.serverPort)
+        DatabaseClient.global = dbClient   // CLI mode: store global reference
+
+        if (!dbClient.testConnection()) {
             globalLogger.error("Database error, failed to initialize")
             return false
         }
@@ -295,9 +299,9 @@ object WorkspaceManager: Closeable {
                 globalLogger.error("Instance name not specified")
             }
             try {
-                DatabaseClient.login(config.username!!, config.password!!)
+                dbClient.login(config.username!!, config.password!!)
 
-                DatabaseClient.connectToInstance(config.usingInstance!!)
+                dbClient.connectToInstance(config.usingInstance!!)
             } catch (e: Exception) {
                 globalLogger.error("Failed to login to database: ${e.message}")
                 return@runBlocking false

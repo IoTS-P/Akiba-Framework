@@ -72,9 +72,9 @@ object BackupInstance: Runnable {
             exitProcess(1)
         }
 
-        DatabaseClient.urlHeader = "http://$host:$port"
+        val dbClient = DatabaseClient(host, port)
 
-        if (!DatabaseClient.testConnection())
+        if (!dbClient.testConnection())
             globalLogger.error("Cannot connect to database daemon")
 
         if (password == null) {
@@ -83,19 +83,19 @@ object BackupInstance: Runnable {
         }
 
         try {
-            DatabaseClient.login(user, password!!)
+            dbClient.login(user, password!!)
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             globalLogger.error("Cannot login to database daemon, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
             return
         }
         
         try {
-            DatabaseClient.createBackup(backupType == "full", instanceName, alias, description)
+            dbClient.createBackup(backupType == "full", instanceName, alias, description)
             globalLogger.info("Backup created successfully")
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             globalLogger.error("Cannot create backup, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
         }
 
-        DatabaseClient.logout()
+        dbClient.logout()
     }
 }

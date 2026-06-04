@@ -9,6 +9,9 @@ import org.iotsplab.akiba.llm.memory.ChatMemory
 import org.iotsplab.akiba.llm.memory.InMemoryChatMemory
 import org.iotsplab.akiba.llm.memory.MemoryManager
 import org.iotsplab.akiba.llm.memory.persistentChatMemory
+import org.iotsplab.akiba.llm.tool.Tool
+import org.iotsplab.akiba.llm.tool.ToolParameter
+import org.iotsplab.akiba.llm.tool.ToolRegistry
 import org.iotsplab.akiba.managers.ConfigManager
 
 // ============================================================
@@ -137,6 +140,18 @@ class AgentBuilder {
         llmConfig = source.toLLMConfig()
     }
 
+    /**
+     * Resolve LLM configuration from the global config (`configs.json` → `llm` section).
+     *
+     * This is an alias for [fromGlobalConfig] kept for backward compatibility.
+     *
+     * @throws IllegalStateException if the global config has no `llm` section
+     *                              or the section is not fully configured.
+     */
+    fun fromRuntimeOrGlobalConfig() {
+        fromGlobalConfig()
+    }
+
     private var pendingProvider: LLMProvider? = null
     private var pendingModel: String? = null
     private var pendingApiKey: String? = null
@@ -169,10 +184,16 @@ class AgentBuilder {
     private var memoryManager: MemoryManager? = null
     private var sessionId: String? = null
     private var binaryId: Int? = null
+    private var agentDbClient: AgentDatabaseClient? = null
+
+    /** Set the [AgentDatabaseClient] for session persistence and audit. */
+    fun agentDbClient(client: AgentDatabaseClient) {
+        agentDbClient = client
+    }
 
     /** Configure chat memory. */
     fun memory(block: MemoryBuilder.() -> Unit) {
-        chatMemory = MemoryBuilder().apply(block).build()
+        chatMemory = MemoryBuilder(agentDbClient).apply(block).build()
     }
 
     /** Set a pre-built [ChatMemory]. */
@@ -290,7 +311,12 @@ class AgentBuilder {
         val resolvedMemory = chatMemory ?: InMemoryChatMemory()
 
         val resolvedMemoryManager = memoryManager
-            ?: sessionId?.let { MemoryManager(it, binaryId) }
+            ?: sessionId?.let { agentDbClient?.let { adc -> MemoryManager(adc, it, binaryId) } }
+
+        val contextLength = ModelContextLengthService.getContextLength(
+            resolvedClient.config.provider,
+            resolvedClient.config.modelName
+        )
 
         return AkibaAgent(
             client = resolvedClient,
@@ -302,7 +328,9 @@ class AgentBuilder {
             sessionId = sessionId,
             enrichSystemPromptWithMemory = enrich,
             auditToolCalls = audit,
-            strategy = agentStrategy
+            strategy = agentStrategy,
+            contextLength = contextLength,
+            agentDbClient = agentDbClient
         )
     }
 }
@@ -325,7 +353,7 @@ class AgentBuilder {
  * }
  * ```
  */
-class MemoryBuilder {
+class MemoryBuilder(private val agentDbClient: AgentDatabaseClient? = null) {
     private var factory: (() -> ChatMemory)? = null
 
     /** Use a persistent database-backed memory. */
@@ -334,7 +362,12 @@ class MemoryBuilder {
         maxMessages: Int = 0,
         maxTokens: Int = 0
     ) {
-        factory = { persistentChatMemory(sessionId, maxMessages, maxTokens) }
+        val adc = agentDbClient
+            ?: throw IllegalStateException(
+                "persistentChatMemory requires an AgentDatabaseClient. " +
+                "Use agentDbClient() in the builder to provide one."
+            )
+        factory = { persistentChatMemory(adc, sessionId, maxMessages, maxTokens) }
     }
 
     /** Use a pure in-memory memory. */

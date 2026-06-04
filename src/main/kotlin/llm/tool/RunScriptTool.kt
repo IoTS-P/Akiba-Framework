@@ -1,12 +1,12 @@
 package org.iotsplab.akiba.llm.tool
 
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.llm.agent.Tool
-import org.iotsplab.akiba.llm.agent.ToolParameter
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.module.RuntimeReport
+import org.iotsplab.akiba.script.CompilationException
 import org.iotsplab.akiba.script.ScriptCompiler
 import org.iotsplab.akiba.script.ScriptInstance
 import kotlin.system.measureTimeMillis
@@ -50,7 +50,7 @@ import kotlin.system.measureTimeMillis
  * }
  * ```
  */
-fun RunScriptTool(parent: AkibaModule): Tool = Tool(
+fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool = Tool(
     name = "run_script",
     description = buildString {
         appendLine("Compile and run a Kotlin script that analyzes the current binary loaded in Ghidra.")
@@ -61,9 +61,12 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
         appendLine()
         appendLine("IMPORTANT: Scripts are written in Kotlin, NOT Java or Jython.")
         appendLine("- `currentProgram` is the loaded Ghidra Program (same as `program` in standard Ghidra scripts)")
-        appendLine("- All Ghidra API packages (ghidra.program.model.*, ghidra.app.decompiler.*, etc.) are available")
+        appendLine("- All Ghidra API packages (ghidra.program.model.*, ghidra.util.*, etc.) are available")
         appendLine("- Use `appendLine(text)` instead of `println()` — println output is not captured")
         appendLine("- The execute() method is `suspend` but you can call blocking Ghidra APIs directly")
+        appendLine("- IMPORTANT: You MUST NOT write scripts that invoke the decompiler (DecompInterface,")
+        appendLine("  FlatDecompilerAPI, ghidra.app.decompiler.*) before the target function has been")
+        appendLine("  disassembled via `disassemble_function`. Decompilation is ONLY allowed AFTER disassembly.")
         appendLine()
         appendLine("=== EXAMPLE 1: List all functions ===")
         appendLine("```kotlin")
@@ -84,21 +87,22 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
         appendLine("}")
         appendLine("```")
         appendLine()
-        appendLine("=== EXAMPLE 2: Decompile a function ===")
+        appendLine("=== EXAMPLE 2: Disassemble a function ===")
         appendLine("```kotlin")
         appendLine("import org.iotsplab.akiba.script.AkibaScript")
-        appendLine("import ghidra.app.decompiler.DecompInterface")
+        appendLine("import ghidra.program.model.lang.Instruction")
         appendLine("")
-        appendLine("class DecompileMain : AkibaScript() {")
+        appendLine("class DisassembleMain : AkibaScript() {")
         appendLine("    override suspend fun execute() {")
-        appendLine("        val decomp = DecompInterface()")
-        appendLine("        decomp.openProgram(currentProgram)")
+        appendLine("        val listing = currentProgram!!.listing")
         appendLine("        val func = currentProgram!!.functionManager.getFunctionAt(")
         appendLine("            currentProgram!!.minAddress")
         appendLine("        ) ?: run { appendLine(\"No function at min address\"); return }")
-        appendLine("        val result = decomp.decompileFunction(func, 30, null)")
-        appendLine("        appendLine(result.decompiledFunction?.c ?: \"Decompile failed\")")
-        appendLine("        decomp.dispose()")
+        appendLine("        val iter = listing.getInstructions(func.body, true)")
+        appendLine("        while (iter.hasNext()) {")
+        appendLine("            val inst = iter.next()")
+        appendLine($$"            appendLine(\"${inst.address}  ${inst.mnemonicString}  ${inst.defaultOperandRepresentation}\")")
+        appendLine("        }")
         appendLine("    }")
         appendLine("}")
         appendLine("```")
@@ -179,14 +183,14 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
     // 1. Record the script in the per-instance DB (best-effort, before any processing)
     var executionId: Int? = null
     try {
-        val scriptId = AgentDatabaseClient.createScript(
+        val scriptId = agentDbClient.createScript(
             name = className,
             code = source,
             saveResult = false,
             maxOutputSize = 10 * 1024 * 1024
         )
-        executionId = AgentDatabaseClient.createScriptExecution(scriptId, targetId)
-        AgentDatabaseClient.updateScriptExecution(executionId, null, "running", null)
+        executionId = agentDbClient.createScriptExecution(scriptId, targetId)
+        agentDbClient.updateScriptExecution(executionId, null, "running", null)
     } catch (_: Exception) {
         // Recording is best-effort; don't block execution if it fails
     }
@@ -197,7 +201,7 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
         val errorMsg = "Validation failed: ${validationIssues.joinToString("; ")}"
         try {
             if (executionId != null) {
-                AgentDatabaseClient.updateScriptExecution(executionId, null, "failed", errorMsg)
+                agentDbClient.updateScriptExecution(executionId, null, "failed", errorMsg)
             }
         } catch (_: Exception) { }
         return@Tool "Error: script validation failed: ${validationIssues.joinToString("; ")}"
@@ -211,7 +215,7 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
             ?: run {
                 try {
                     if (executionId != null) {
-                        AgentDatabaseClient.updateScriptExecution(
+                        agentDbClient.updateScriptExecution(
                             executionId, null, "failed", "Program not found for binary id=$targetId"
                         )
                     }
@@ -258,7 +262,7 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
         // Patch the totalTimeMs into the result
         val finalResult = try {
             val node = mapper.readTree(resultJson)
-            (node as? com.fasterxml.jackson.databind.node.ObjectNode)?.put("totalTimeMs", totalElapsed)
+            (node as? ObjectNode)?.put("totalTimeMs", totalElapsed)
             node?.toString() ?: resultJson
         } catch (_: Exception) {
             resultJson
@@ -268,7 +272,7 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
         try {
             if (executionId != null) {
                 val output = (mapper.readTree(finalResult)["output"]?.asText() ?: "").take(10000)
-                AgentDatabaseClient.updateScriptExecution(
+                agentDbClient.updateScriptExecution(
                     executionId, output, "completed", null
                 )
             }
@@ -280,7 +284,7 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
                 val resultNode = mapper.readTree(finalResult)
                 val success = resultNode["success"]?.asBoolean() ?: false
                 if (success) {
-                    AgentDatabaseClient.createScript(
+                    agentDbClient.createScript(
                         name = className,
                         description = scriptDescription,
                         author = "LLM Agent",
@@ -294,11 +298,11 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
         }
 
         finalResult
-    } catch (e: org.iotsplab.akiba.script.CompilationException) {
+    } catch (e: CompilationException) {
         // Update execution record with compilation error
         try {
             if (executionId != null) {
-                AgentDatabaseClient.updateScriptExecution(
+                agentDbClient.updateScriptExecution(
                     executionId, null, "failed", "Compilation error: ${e.message}"
                 )
             }
@@ -308,7 +312,7 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
         // Update execution record with instantiation error
         try {
             if (executionId != null) {
-                AgentDatabaseClient.updateScriptExecution(
+                agentDbClient.updateScriptExecution(
                     executionId, null, "failed", "Instantiation error: ${e.message}"
                 )
             }
@@ -319,7 +323,7 @@ fun RunScriptTool(parent: AkibaModule): Tool = Tool(
         try {
             if (executionId != null) {
                 val errorMsg = "${e.javaClass.simpleName}: ${e.message}"
-                AgentDatabaseClient.updateScriptExecution(
+                agentDbClient.updateScriptExecution(
                     executionId, null, "failed", errorMsg
                 )
             }

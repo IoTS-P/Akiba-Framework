@@ -1,9 +1,6 @@
 package org.iotsplab.akiba.llm.tool
 
-import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
-import org.iotsplab.akiba.llm.agent.Tool
-import org.iotsplab.akiba.llm.agent.ToolParameter
 import java.io.BufferedInputStream
 import java.io.IOException
 import java.net.URI
@@ -13,8 +10,6 @@ import java.nio.file.StandardCopyOption
 import java.util.zip.ZipInputStream
 import kotlin.io.path.exists
 import kotlin.io.path.isDirectory
-import kotlin.io.path.listDirectoryEntries
-import kotlin.io.path.name
 
 /**
  * Manages the Ghidra API documentation on the local filesystem.

@@ -2,8 +2,6 @@ package org.iotsplab.akiba.llm.tool
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import kotlinx.coroutines.*
-import org.iotsplab.akiba.llm.agent.Tool
-import org.iotsplab.akiba.llm.agent.ToolParameter
 import org.iotsplab.akiba.module.AkibaModule
 import java.io.InputStream
 

@@ -33,7 +33,6 @@ import io.ktor.websocket.CloseReason
 import io.ktor.websocket.Frame
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.runBlocking
-import org.iotsplab.akiba.managers.ConfigManager.sqlSource
 import org.iotsplab.akiba.managers.BinaryMetadata
 import org.iotsplab.akiba.managers.ProgramManager
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
@@ -44,45 +43,95 @@ import java.time.OffsetDateTime
 import java.time.ZoneOffset
 import kotlin.time.Duration.Companion.seconds
 
-object DatabaseClient {
-    val client: HttpClient = HttpClient {
-        install(ContentNegotiation) {
-            jackson {
-                enable(SerializationFeature.INDENT_OUTPUT)
-                // Maximum JSON string input length: 200 MB
-                factory.setStreamReadConstraints(
-                    StreamReadConstraints.builder().maxStringLength(200 * 1024 * 1024).build()
-                )
-            }
-        }
-        install(WebSockets) {
-            pingInterval = 15.seconds
-            contentConverter = JacksonWebsocketContentConverter(
-                jacksonObjectMapper()
-                    .registerKotlinModule()
-                    .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
-            )
-        }
-        install(HttpRequestRetry) {
-            maxRetries = 3          // 3 retries maximum
-            retryOnExceptionIf { _, cause ->
-                cause is java.io.IOException
-            }
-            exponentialDelay()
-        }
-    }
-
-    var urlHeader: String = "http://${sqlSource.serverIP}:${sqlSource.serverPort}"
-
+/**
+ * Database daemon client. Each instance holds its own connection URL, auth token,
+ * and locked-tables set, making it safe for concurrent multi-tenant use (e.g. in
+ * the Akiba HTTP server where every request can carry a different instance/token).
+ *
+ * For CLI (single-task) usage a global instance is typically placed in
+ * [DatabaseClient.Companion.global] and reused by all managers.
+ *
+ * @param host  Daemon hostname or IP (e.g. "127.0.0.1")
+ * @param port  Daemon port (e.g. 31777)
+ * @param token Optional initial bearer token; usually set via [login] instead.
+ */
+class DatabaseClient(
+    val host: String,
+    val port: Int,
     var token: String? = null
+) {
+    /** Convenience computed property — avoids string-concat mistakes. */
+    val urlHeader: String get() = "http://$host:$port"
 
+    /** Tables currently locked by **this** client (per-instance, not global). */
     val lockedTables: MutableSet<String> = mutableSetOf()
 
-    class DatabaseDaemonException(val statusCode: HttpStatusCode?, val statusMsg: String? = null): Exception()
+    // ============================================================
+    //  Shared (static) HTTP client — one connection pool per JVM
+    // ============================================================
+
+    companion object {
+        val httpClient: HttpClient = HttpClient {
+            install(ContentNegotiation) {
+                jackson {
+                    enable(SerializationFeature.INDENT_OUTPUT)
+                    // Maximum JSON string input length: 200 MB
+                    factory.setStreamReadConstraints(
+                        StreamReadConstraints.builder().maxStringLength(200 * 1024 * 1024).build()
+                    )
+                }
+            }
+            install(WebSockets) {
+                pingInterval = 15.seconds
+                contentConverter = JacksonWebsocketContentConverter(
+                    jacksonObjectMapper()
+                        .registerKotlinModule()
+                        .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+                )
+            }
+            install(HttpRequestRetry) {
+                maxRetries = 3          // 3 retries maximum
+                retryOnExceptionIf { _, cause ->
+                    cause is java.io.IOException
+                }
+                exponentialDelay()
+            }
+        }
+
+        /**
+         * Convenience global instance for CLI / single-task usage.
+         *
+         * Server code should **not** use this — it should create per-request
+         * [DatabaseClient] instances inside [withDaemonSession] (see [org.iotsplab.akiba.server.routes.RouteHelpers]).
+         */
+        var global: DatabaseClient? = null
+    }
+
+    // ============================================================
+    //  Exception
+    // ============================================================
+
+    class DatabaseDaemonException(
+        val statusCode: HttpStatusCode?,
+        val statusMsg: String? = null
+    ) : Exception(
+        // Surface a meaningful message to callers. Without this the default
+        // Exception() ctor leaves `message` null, which has been bubbling up
+        // to the HTTP layer as `{"error": null}` for every server route that
+        // catches the exception generically.
+        listOfNotNull(
+            statusMsg?.takeIf { it.isNotBlank() },
+            statusCode?.let { "${it.value} ${it.description}" }
+        ).joinToString(": ").ifBlank { "Database daemon error" }
+    )
+
+    // ============================================================
+    //  Connection helpers
+    // ============================================================
 
     fun testConnection(): Boolean = runBlocking {
         try {
-            val response = client.get("$urlHeader/test")
+            val response = httpClient.get("$urlHeader/test")
             if (response.status == HttpStatusCode.OK) {
                 Log.current.info("Database daemon connection successful. Reply: ${response.bodyAsText()}")
                 return@runBlocking true
@@ -101,7 +150,7 @@ object DatabaseClient {
     @Throws(DatabaseDaemonException::class)
     suspend fun post(path: String, body: Any?, putToken: Boolean = true): Pair<HttpStatusCode, String> {
         try {
-            val response = client.post("$urlHeader/$path") {
+            val response = httpClient.post("$urlHeader/$path") {
                 contentType(ContentType.Application.Json)
                 if (body != null)
                     setBody(body)
@@ -210,7 +259,7 @@ object DatabaseClient {
     )
 
     @Throws(DatabaseDaemonException::class)
-    fun insertBinary(data: DatabaseClient.InsertData): Long = runBlocking {
+    fun insertBinary(data: InsertData): Long = runBlocking {
         val response = post("/insert/insert_bin", data).let {
             if (it.first == HttpStatusCode.OK)
                 it.second
@@ -355,7 +404,7 @@ object DatabaseClient {
             else
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
-        token = jacksonObjectMapper().readValue<Map<String, String>>(response)["token"]
+        this@DatabaseClient.token = jacksonObjectMapper().readValue<Map<String, String>>(response)["token"]
             ?: throw DatabaseDaemonException(HttpStatusCode.InternalServerError, "Failed to get token")
     }
 
@@ -369,14 +418,14 @@ object DatabaseClient {
 
     fun createInstance(instanceName: String) = runBlocking {
         globalLogger.info("[CreateInstance] Starting WebSocket connection")
-        client.webSocket(
+        httpClient.webSocket(
             method = HttpMethod.Get,
-            host = sqlSource.serverIP,
-            port = sqlSource.serverPort,
+            host = host,
+            port = port,
             path = "/ws/instance/create"
         ) {
             send(Frame.Text(jacksonObjectMapper().writeValueAsString(mapOf(
-                "token" to token,
+                "token" to this@DatabaseClient.token,
                 "instanceName" to instanceName
             ))))
 
@@ -449,15 +498,15 @@ object DatabaseClient {
     ): String = runBlocking {
         var label: String? = null
 
-        client.webSocket(
+        httpClient.webSocket(
             method = HttpMethod.Get,
-            host = sqlSource.serverIP,
-            port = sqlSource.serverPort,
+            host = host,
+            port = port,
             path = "/ws/backup/create"
         ) {
             send(Frame.Text(jacksonObjectMapper().writeValueAsString(mapOf(
                 "isFull" to isFull,
-                "token" to token,
+                "token" to this@DatabaseClient.token,
                 "instance" to instanceName,
                 "alias" to alias,
                 "description" to description
@@ -521,7 +570,7 @@ object DatabaseClient {
     }
 
     @Throws(DatabaseDaemonException::class)
-    fun peekBackups(instanceName: String): List<DatabaseClient.BackupNode> = runBlocking {
+    fun peekBackups(instanceName: String): List<BackupNode> = runBlocking {
         post("/backup/peek", instanceName).let {
             if (it.first != HttpStatusCode.OK)
                 throw DatabaseDaemonException(it.first, it.first.description)
@@ -537,14 +586,14 @@ object DatabaseClient {
 
     @Throws(DatabaseDaemonException::class)
     fun restoreBackup(instanceName: String, aliasOrLabel: String) = runBlocking {
-        client.webSocket(
+        httpClient.webSocket(
             method = HttpMethod.Get,
-            host = sqlSource.serverIP,
-            port = sqlSource.serverPort,
+            host = host,
+            port = port,
             path = "/ws/backup/restore"
         ) {
             send(Frame.Text(jacksonObjectMapper().writeValueAsString(mapOf(
-                "token" to token,
+                "token" to this@DatabaseClient.token,
                 "instance" to instanceName,
                 "aliasOrLabel" to aliasOrLabel
             ))))

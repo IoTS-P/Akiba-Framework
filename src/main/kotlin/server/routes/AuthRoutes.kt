@@ -12,7 +12,7 @@ data class AuthResponse(val token: String, val userId: Int, val username: String
 data class MessageResponse(val message: String)
 
 fun Route.authRoutes() {
-    post("/api/auth/register") {
+    post("/auth/register") {
         val req = call.receive<RegisterRequest>()
         if (req.username.isBlank() || req.password.isBlank()) {
             call.respond(io.ktor.http.HttpStatusCode.BadRequest,
@@ -44,8 +44,8 @@ fun Route.authRoutes() {
         }
     }
 
-    post("/api/auth/login") {
-        val req = call.receive<org.iotsplab.akiba.server.routes.LoginRequest>()
+    post("/auth/login") {
+        val req = call.receive<LoginRequest>()
         if (req.username.isBlank() || req.password.isBlank()) {
             call.respond(io.ktor.http.HttpStatusCode.BadRequest,
                 MessageResponse("Username and password are required")
@@ -75,7 +75,7 @@ fun Route.authRoutes() {
         }
     }
 
-    post("/api/auth/logout") {
+    post("/auth/logout") {
         val authHeader = call.request.header("Authorization")
         if (authHeader != null && authHeader.startsWith("Bearer ")) {
             val token = authHeader.substring(7)
@@ -84,7 +84,7 @@ fun Route.authRoutes() {
         call.respond(MessageResponse("Logged out successfully"))
     }
 
-    get("/api/auth/me") {
+    get("/auth/me") {
         val authHeader = call.request.header("Authorization")
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
             call.respond(io.ktor.http.HttpStatusCode.Unauthorized,

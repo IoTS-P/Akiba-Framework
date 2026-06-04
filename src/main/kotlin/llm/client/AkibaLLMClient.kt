@@ -34,14 +34,14 @@ interface AkibaLLMClient : AutoCloseable {
      * is available.
      *
      * @param systemPrompt  Optional system-level instructions.
-     * @param messages      Ordered conversation history as (role, content) pairs.
+     * @param messages      Ordered conversation history as [AgentChatMessage] list.
      *                      Role is one of "user", "assistant", "tool".
      * @param tools         Optional tool definitions in the provider's native JSON schema format.
      * @return the completed response.
      */
     fun chat(
         systemPrompt: String? = null,
-        messages: List<Pair<String, String>>,
+        messages: List<org.iotsplab.akiba.llm.memory.AgentChatMessage>,
         tools: List<String>? = null
     ): ChatCompletion
 
@@ -56,13 +56,13 @@ interface AkibaLLMClient : AutoCloseable {
      * The flow completes after the final chunk ([ChatChunk.isComplete] == true).
      *
      * @param systemPrompt  Optional system-level instructions.
-     * @param messages      Ordered conversation history as (role, content) pairs.
+     * @param messages      Ordered conversation history as [AgentChatMessage] list.
      * @param tools         Optional tool definitions in the provider's native JSON schema format.
      * @return a flow of response chunks.
      */
     fun chatStream(
         systemPrompt: String? = null,
-        messages: List<Pair<String, String>>,
+        messages: List<org.iotsplab.akiba.llm.memory.AgentChatMessage>,
         tools: List<String>? = null
     ): Flow<ChatChunk>
 

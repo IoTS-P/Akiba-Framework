@@ -62,7 +62,7 @@ abstract class AbstractLangChainAdapter(
 
     override fun chat(
         systemPrompt: String?,
-        messages: List<Pair<String, String>>,
+        messages: List<org.iotsplab.akiba.llm.memory.AgentChatMessage>,
         tools: List<String>?
     ): ChatCompletion {
         val lcMessages = toLangChainMessages(systemPrompt, messages)
@@ -91,7 +91,7 @@ abstract class AbstractLangChainAdapter(
 
     override fun chatStream(
         systemPrompt: String?,
-        messages: List<Pair<String, String>>,
+        messages: List<org.iotsplab.akiba.llm.memory.AgentChatMessage>,
         tools: List<String>?
     ): Flow<ChatChunk> = flow {
         val lcMessages = toLangChainMessages(systemPrompt, messages)
@@ -171,18 +171,24 @@ abstract class AbstractLangChainAdapter(
 
     protected fun toLangChainMessages(
         systemPrompt: String?,
-        messages: List<Pair<String, String>>
+        messages: List<org.iotsplab.akiba.llm.memory.AgentChatMessage>
     ): MutableList<ChatMessage> {
         val result = mutableListOf<ChatMessage>()
         if (systemPrompt != null) {
             result.add(SystemMessage.from(systemPrompt))
         }
-        for ((role, content) in messages) {
-            when (role.lowercase()) {
-                "user" -> result.add(UserMessage.from(content))
-                "assistant" -> result.add(AiMessage.from(content))
-                "tool" -> result.add(ToolExecutionResultMessage.from("", "", content))
-                else -> result.add(UserMessage.from(content))
+        for (msg in messages) {
+            when (msg.role.lowercase()) {
+                "user" -> result.add(UserMessage.from(msg.content))
+                "assistant" -> result.add(AiMessage.from(msg.content))
+                "tool" -> result.add(
+                    ToolExecutionResultMessage.from(
+                        msg.toolCallId ?: "",
+                        msg.toolName ?: "",
+                        msg.content
+                    )
+                )
+                else -> result.add(UserMessage.from(msg.content))
             }
         }
         return result
@@ -223,7 +229,7 @@ abstract class AbstractLangChainAdapter(
     // ============================================================
 
     /**
-     * Parse a tool JSON schema string (as produced by [org.iotsplab.akiba.llm.agent.Tool.toJsonSchema])
+     * Parse a tool JSON schema string (as produced by [org.iotsplab.akiba.llm.tool.Tool.toJsonSchema])
      * into a langchain4j [ToolSpecification].
      *
      * Expected input format:

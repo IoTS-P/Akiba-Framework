@@ -3,8 +3,6 @@ package org.iotsplab.akiba.llm.tool
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.llm.agent.Tool
-import org.iotsplab.akiba.llm.agent.ToolParameter
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.module.RuntimeReport
 import org.iotsplab.akiba.script.ScriptInstance
@@ -35,7 +33,7 @@ import kotlin.system.measureTimeMillis
  * - **Faster**: no API lookup or trial-and-error needed.
  * - **Learning**: read script source to understand Ghidra API patterns.
  */
-fun ScriptLibraryTool(parent: AkibaModule): Tool = Tool(
+fun ScriptLibraryTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool = Tool(
     name = "script_library",
     description = buildString {
         appendLine("Access a library of pre-built Kotlin scripts for common binary analysis tasks.")
@@ -49,14 +47,14 @@ fun ScriptLibraryTool(parent: AkibaModule): Tool = Tool(
         appendLine("IMPORTANT: Prefer using scripts from this library over writing custom scripts")
         appendLine("with run_script. Only write custom scripts when the library doesn't cover your need.")
         appendLine()
-        appendLine("Available scripts include: binary_info, list_functions, decompile_function,")
-        appendLine("find_dangerous_calls, list_strings, get_xrefs, and more.")
+        appendLine("Available scripts include: binary_info, list_functions, disassemble_function,")
+        appendLine("find_dangerous_calls, list_strings, get_xrefs, decompile_function, and more.")
         appendLine()
         appendLine("Example usage:")
         appendLine("  search: {\"action\":\"search\", \"keyword\":\"\"} → list all scripts")
-        appendLine("  search: {\"action\":\"search\", \"keyword\":\"decompile\"} → find decompile-related scripts")
-        appendLine("  read:   {\"action\":\"read\", \"scriptName\":\"decompile_function\"} → return its full source")
-        appendLine("  run:    {\"action\":\"run\", \"scriptName\":\"decompile_function\", \"parameters\":{\"target\":\"main\"}}")
+        appendLine("  search: {\"action\":\"search\", \"keyword\":\"disassemble\"} → find disassembly-related scripts")
+        appendLine("  read:   {\"action\":\"read\", \"scriptName\":\"disassemble_function\"} → return its full source")
+        appendLine("  run:    {\"action\":\"run\", \"scriptName\":\"disassemble_function\", \"parameters\":{\"target\":\"main\"}}")
         appendLine("  run:    {\"action\":\"run\", \"scriptName\":\"list_functions\"}")
         appendLine()
         appendLine("CRITICAL: 'parameters' MUST be a nested JSON object, NOT a string!")
@@ -94,12 +92,12 @@ fun ScriptLibraryTool(parent: AkibaModule): Tool = Tool(
     when (action) {
         "search" -> {
             val keyword = (args["keyword"] as? String)?.trim() ?: ""
-            searchScripts(keyword)
+            searchScripts(agentDbClient, keyword)
         }
         "read" -> {
             val scriptName = args["scriptName"] as? String
                 ?: return@Tool "Error: 'scriptName' parameter is required for 'read' action"
-            readScript(scriptName)
+            readScript(agentDbClient, scriptName)
         }
         "run" -> {
             val scriptName = args["scriptName"] as? String
@@ -128,7 +126,7 @@ fun ScriptLibraryTool(parent: AkibaModule): Tool = Tool(
                 else -> return@Tool "Error: 'parameters' must be a JSON object or a JSON string, " +
                     "got ${rawParams.javaClass.simpleName}"
             }
-            runLibraryScript(parent, scriptName, parameters, mapper)
+            runLibraryScript(agentDbClient, parent, scriptName, parameters, mapper)
         }
         else -> "Error: unknown action '$action'. Use 'search', 'read', or 'run'."
     }
@@ -157,11 +155,11 @@ private var scriptLibrary: List<ScriptMeta>? = null
 /**
  * Load user-saved library scripts from the `scripts` table.
  */
-private fun loadDbLibraryScripts(): List<ScriptMeta> {
+private fun loadDbLibraryScripts(agentDbClient: AgentDatabaseClient): List<ScriptMeta> {
     return try {
-        val allScripts = AgentDatabaseClient.listScripts(limit = 500)
+        val allScripts = agentDbClient.listScripts(limit = 500)
         allScripts.mapNotNull { info ->
-            val source = AgentDatabaseClient.getScript(info.id).code ?: return@mapNotNull null
+            val source = agentDbClient.getScript(info.id).code ?: return@mapNotNull null
             val displayName = info.name
             val classNameRegex = Regex("""class\s+(\w+)\s*""")
             val className = classNameRegex.find(source)?.groupValues?.get(1) ?: return@mapNotNull null
@@ -229,8 +227,8 @@ private fun parseScriptMeta(source: String, fileName: String): ScriptMeta? {
  * site goes wrong, and decide whether to fix it (own-authored scripts) or
  * rewrite a replacement via `run_script` (system/other-authored scripts).
  */
-private fun readScript(scriptName: String): String {
-    val script = loadDbLibraryScripts().firstOrNull { it.name == scriptName }
+private fun readScript(agentDbClient: AgentDatabaseClient, scriptName: String): String {
+    val script = loadDbLibraryScripts(agentDbClient).firstOrNull { it.name == scriptName }
         ?: return "Error: Script '$scriptName' not found in library. Use 'search' action to see available scripts."
 
     val sb = StringBuilder()
@@ -248,9 +246,9 @@ private fun readScript(scriptName: String): String {
     return sb.toString()
 }
 
-private fun searchScripts(keyword: String): String {
+private fun searchScripts(agentDbClient: AgentDatabaseClient, keyword: String): String {
     // Also load user-saved scripts from the database
-    val allScripts = loadDbLibraryScripts()
+    val allScripts = loadDbLibraryScripts(agentDbClient)
 
     val matches = if (keyword.isEmpty()) {
         allScripts
@@ -282,12 +280,13 @@ private fun searchScripts(keyword: String): String {
 }
 
 private fun runLibraryScript(
+    agentDbClient: AgentDatabaseClient,
     parent: AkibaModule,
     scriptName: String,
     parameters: Map<String, Any?>,
     mapper: com.fasterxml.jackson.databind.ObjectMapper
 ): String {
-    val script = loadDbLibraryScripts().firstOrNull { it.name == scriptName }
+    val script = loadDbLibraryScripts(agentDbClient).firstOrNull { it.name == scriptName }
         ?: return "Error: Script '$scriptName' not found in library. Use 'search' action to see available scripts."
 
     // Inject parameters as scriptArgs by prepending a property to the source
@@ -329,14 +328,14 @@ private fun runLibraryScript(
     // Record execution in DB (best-effort)
     var executionId: Int? = null
     try {
-        val scriptId = AgentDatabaseClient.createScript(
+        val scriptId = agentDbClient.createScript(
             name = script.name,
             code = sourceWithArgs,
             saveResult = false,
             maxOutputSize = 10 * 1024 * 1024
         )
-        executionId = AgentDatabaseClient.createScriptExecution(scriptId, parent.id)
-        AgentDatabaseClient.updateScriptExecution(executionId, null, "running", null)
+        executionId = agentDbClient.createScriptExecution(scriptId, parent.id)
+        agentDbClient.updateScriptExecution(executionId, null, "running", null)
     } catch (_: Exception) { }
 
     return try {
@@ -374,7 +373,7 @@ private fun runLibraryScript(
         try {
             if (executionId != null) {
                 val output = (mapper.readTree(finalResult)["output"]?.asText() ?: "").take(10000)
-                AgentDatabaseClient.updateScriptExecution(executionId, output, "completed", null)
+                agentDbClient.updateScriptExecution(executionId, output, "completed", null)
             }
         } catch (_: Exception) { }
 
@@ -382,13 +381,13 @@ private fun runLibraryScript(
     } catch (e: org.iotsplab.akiba.script.CompilationException) {
         try {
             if (executionId != null)
-                AgentDatabaseClient.updateScriptExecution(executionId, null, "failed", "Compilation: ${e.message}")
+                agentDbClient.updateScriptExecution(executionId, null, "failed", "Compilation: ${e.message}")
         } catch (_: Exception) { }
         "Error: library script '${script.name}' compilation failed: ${e.message}"
     } catch (e: Exception) {
         try {
             if (executionId != null)
-                AgentDatabaseClient.updateScriptExecution(executionId, null, "failed", "${e.javaClass.simpleName}: ${e.message}")
+                agentDbClient.updateScriptExecution(executionId, null, "failed", "${e.javaClass.simpleName}: ${e.message}")
         } catch (_: Exception) { }
         "Error running library script '${script.name}': ${e.message}"
     }

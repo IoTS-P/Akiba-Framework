@@ -1,4 +1,4 @@
-package org.iotsplab.akiba.llm.agent
+package org.iotsplab.akiba.llm.tool
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 

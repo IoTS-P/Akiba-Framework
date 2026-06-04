@@ -8,13 +8,28 @@ import org.iotsplab.akiba.data.database.AgentDatabaseClient
 // ============================================================
 
 /**
+ * A single message in an agent conversation.
+ *
+ * @param role One of "user", "assistant", "tool", "system".
+ * @param content The textual content of the message.
+ * @param toolCallId For tool-result messages, the ID of the corresponding tool call.
+ * @param toolName For tool-result messages, the name of the tool that was invoked.
+ */
+data class AgentChatMessage(
+    val role: String,
+    val content: String,
+    val toolCallId: String? = null,
+    val toolName: String? = null
+)
+
+/**
  * Manages conversation history for an LLM agent session.
  *
  * Implementations may store messages in memory, in a database, or use
  * a sliding-window / token-bounded strategy to keep the context within
  * the model's context window.
  *
- * Messages are stored as `(role, content)` pairs compatible with
+ * Messages are stored as [AgentChatMessage] objects compatible with
  * [org.iotsplab.akiba.llm.client.AkibaLLMClient.chat].
  */
 interface ChatMemory : AutoCloseable {
@@ -42,19 +57,22 @@ interface ChatMemory : AutoCloseable {
         toolName: String,
         args: String? = null,
         result: String? = null
-    ) = add("tool", result ?: "")
+    ) = add(AgentChatMessage(role = "tool", content = result ?: "", toolCallId = toolCallId, toolName = toolName))
+
+    /** Add a pre-built [AgentChatMessage]. */
+    fun add(message: AgentChatMessage)
 
     // ---- Query -----------------------------------------------------------
 
-    /** Retrieve all messages in order as `(role, content)` pairs. */
-    fun messages(): List<Pair<String, String>>
+    /** Retrieve all messages in order. */
+    fun messages(): List<AgentChatMessage>
 
     /** Current message count. */
     fun size(): Int = messages().size
 
     /** Estimate total token count for all messages. */
     fun estimatedTokenCount(estimator: (String) -> Int): Int =
-        messages().sumOf { estimator(it.second) }
+        messages().sumOf { estimator(it.content) }
 
     /** Clear all messages. */
     fun clear()
@@ -78,16 +96,23 @@ class InMemoryChatMemory(
 
     override val sessionId: String? = null
 
-    private val buffer: ArrayDeque<Pair<String, String>> = ArrayDeque()
+    private val buffer: ArrayDeque<AgentChatMessage> = ArrayDeque()
 
     override fun add(role: String, content: String) {
-        buffer.addLast(role to content)
+        buffer.addLast(AgentChatMessage(role, content))
         if (maxMessages > 0 && buffer.size > maxMessages) {
             buffer.removeFirst()
         }
     }
 
-    override fun messages(): List<Pair<String, String>> = buffer.toList()
+    override fun add(message: AgentChatMessage) {
+        buffer.addLast(message)
+        if (maxMessages > 0 && buffer.size > maxMessages) {
+            buffer.removeFirst()
+        }
+    }
+
+    override fun messages(): List<AgentChatMessage> = buffer.toList()
 
     override fun clear() {
         buffer.clear()
@@ -114,6 +139,7 @@ class InMemoryChatMemory(
  * Both strategies can be combined; the stricter limit wins.
  */
 class PersistentChatMemory(
+    private val agentDbClient: AgentDatabaseClient,
     override val sessionId: String,
     private val maxMessages: Int = 0,
     private val maxTokens: Int = 0,
@@ -127,7 +153,7 @@ class PersistentChatMemory(
 
     private val logger = LogManager.getLogger(PersistentChatMemory::class.java)
 
-    private val buffer: MutableList<Pair<String, String>> = mutableListOf()
+    private val buffer: MutableList<AgentChatMessage> = mutableListOf()
 
     init {
         // Load existing messages from DB
@@ -139,14 +165,21 @@ class PersistentChatMemory(
             var offset = 0
             val batchSize = 200
             while (true) {
-                val batch = AgentDatabaseClient.getMessages(sessionId, offset, batchSize)
+                val batch = agentDbClient.getMessages(sessionId, offset, batchSize)
                 if (batch.isEmpty()) break
                 for (msg in batch) {
                     val content = when (msg.role) {
-                        "tool" -> msg.toolResult ?: ""
+                        "tool" -> msg.toolResult ?: msg.content ?: ""
                         else -> msg.content ?: ""
                     }
-                    buffer.add(msg.role to content)
+                    buffer.add(
+                        AgentChatMessage(
+                            role = msg.role,
+                            content = content,
+                            toolCallId = msg.toolCallId,
+                            toolName = msg.toolName
+                        )
+                    )
                 }
                 offset += batch.size
                 if (batch.size < batchSize) break
@@ -160,30 +193,57 @@ class PersistentChatMemory(
     override fun add(role: String, content: String) {
         // Persist to database
         try {
-            when (role) {
-                "tool" -> {
-                    // Tool messages should be added via addToolMessage; here we
-                    // store a bare tool-result row for the simple case.
-                    AgentDatabaseClient.appendMessages(
-                        sessionId,
-                        listOf(AgentDatabaseClient.MessageData(role = role, content = content))
-                    )
-                }
-                else -> {
-                    AgentDatabaseClient.appendMessages(
-                        sessionId,
-                        listOf(AgentDatabaseClient.MessageData(role = role, content = content))
-                    )
-                }
+            val data = if (role == "tool") {
+                AgentDatabaseClient.MessageData(role = role, content = content, toolResult = content)
+            } else {
+                AgentDatabaseClient.MessageData(role = role, content = content)
             }
+            agentDbClient.appendMessages(sessionId, listOf(data))
         } catch (e: Exception) {
-            logger.warn("Failed to persist message to DB: ${e.message}")
+            logger.error("Failed to persist message to DB for session $sessionId", e)
+            throw e
         }
 
         // Update local buffer
-        buffer.add(role to content)
+        buffer.add(AgentChatMessage(role, content))
 
         // Apply eviction
+        evictIfNeeded()
+    }
+
+    override fun add(message: AgentChatMessage) {
+        // For tool messages, persist full metadata
+        if (message.role == "tool") {
+            try {
+                agentDbClient.appendMessages(
+                    sessionId,
+                    listOf(
+                        AgentDatabaseClient.MessageData(
+                            role = "tool",
+                            content = message.content,
+                            toolCallId = message.toolCallId,
+                            toolName = message.toolName,
+                            toolResult = message.content
+                        )
+                    )
+                )
+            } catch (e: Exception) {
+                logger.error("Failed to persist tool message to DB for session $sessionId", e)
+                throw e
+            }
+        } else {
+            try {
+                agentDbClient.appendMessages(
+                    sessionId,
+                    listOf(AgentDatabaseClient.MessageData(role = message.role, content = message.content))
+                )
+            } catch (e: Exception) {
+                logger.error("Failed to persist message to DB for session $sessionId", e)
+                throw e
+            }
+        }
+
+        buffer.add(message)
         evictIfNeeded()
     }
 
@@ -194,7 +254,7 @@ class PersistentChatMemory(
         result: String?
     ) {
         try {
-            AgentDatabaseClient.appendMessages(
+            agentDbClient.appendMessages(
                 sessionId,
                 listOf(
                     AgentDatabaseClient.MessageData(
@@ -208,10 +268,11 @@ class PersistentChatMemory(
                 )
             )
         } catch (e: Exception) {
-            logger.warn("Failed to persist tool message to DB: ${e.message}")
+            logger.error("Failed to persist tool message to DB for session $sessionId", e)
+            throw e
         }
 
-        buffer.add("tool" to (result ?: ""))
+        buffer.add(AgentChatMessage(role = "tool", content = result ?: "", toolCallId = toolCallId, toolName = toolName))
         evictIfNeeded()
     }
 
@@ -230,7 +291,7 @@ class PersistentChatMemory(
             var totalTokens = estimatedTokenCount(tokenEstimator)
             var tokenEvict = 0
             while (totalTokens > maxTokens && tokenEvict < buffer.size - 1) {
-                totalTokens -= tokenEstimator(buffer[tokenEvict].second)
+                totalTokens -= tokenEstimator(buffer[tokenEvict].content)
                 tokenEvict++
             }
             evictCount = maxOf(evictCount, tokenEvict)
@@ -242,21 +303,7 @@ class PersistentChatMemory(
 
             // Remove from database
             try {
-                AgentDatabaseClient.deleteMessagesFrom(sessionId, 0)
-                // Re-add remaining messages? No — deleteMessagesFrom(fromIndex=0)
-                // removes everything from index 0 onward. We need to delete only
-                // the first `evictCount` messages.
-                // Since DB message_index starts at 0, we delete from 0 up to
-                // evictCount, then the DB indices shift. This is a simplification:
-                // we delete from index 0, which deletes the first evictCount messages.
-                // Actually, deleteMessagesFrom deletes from the given index onward.
-                // For a proper sliding window, we'd need a different approach.
-                // For now, just delete from 0 to evictCount.
-                // NOTE: This is a simplified eviction — proper implementation would
-                // need a more granular DB API. The current deleteMessagesFrom(fromIndex)
-                // deletes from that index to the end, which is too aggressive.
-                // Instead, we rely on the local buffer for the sliding window
-                // and periodically sync.
+                agentDbClient.deleteMessagesFrom(sessionId, 0)
                 logger.debug("Evicted $evictCount messages from local buffer")
             } catch (e: Exception) {
                 logger.warn("Failed to evict messages from DB: ${e.message}")
@@ -264,12 +311,12 @@ class PersistentChatMemory(
         }
     }
 
-    override fun messages(): List<Pair<String, String>> = buffer.toList()
+    override fun messages(): List<AgentChatMessage> = buffer.toList()
 
     override fun clear() {
         buffer.clear()
         try {
-            AgentDatabaseClient.deleteMessagesFrom(sessionId, 0)
+            agentDbClient.deleteMessagesFrom(sessionId, 0)
         } catch (e: Exception) {
             logger.warn("Failed to clear messages from DB: ${e.message}")
         }
@@ -286,6 +333,7 @@ fun inMemoryChatMemory(maxMessages: Int = 0): InMemoryChatMemory =
 
 /** Create a database-backed chat memory with optional eviction parameters. */
 fun persistentChatMemory(
+    agentDbClient: AgentDatabaseClient,
     sessionId: String,
     maxMessages: Int = 0,
     maxTokens: Int = 0,
@@ -294,4 +342,4 @@ fun persistentChatMemory(
         val ascii = text.length - cjk
         (ascii / 4 + cjk / 2).coerceAtLeast(1)
     }
-): PersistentChatMemory = PersistentChatMemory(sessionId, maxMessages, maxTokens, tokenEstimator)
+): PersistentChatMemory = PersistentChatMemory(agentDbClient, sessionId, maxMessages, maxTokens, tokenEstimator)

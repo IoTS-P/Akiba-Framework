@@ -2,8 +2,6 @@ package org.iotsplab.akiba.llm.tool
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.llm.agent.Tool
-import org.iotsplab.akiba.llm.agent.ToolParameter
 
 /**
  * Create a tool that retrieves the conversation history of an
@@ -12,7 +10,7 @@ import org.iotsplab.akiba.llm.agent.ToolParameter
  * Useful for agents that need to review what happened in previous
  * analysis sessions for the same binary.
  */
-fun QuerySessionHistoryTool(): Tool = Tool(
+fun QuerySessionHistoryTool(agentDbClient: AgentDatabaseClient): Tool = Tool(
     name = "query_session_history",
     description = buildString {
         appendLine("Retrieve the conversation history of an agent session from the database.")
@@ -45,7 +43,7 @@ fun QuerySessionHistoryTool(): Tool = Tool(
 
     try {
         if (sessionId != null) {
-            val messages = AgentDatabaseClient.getMessages(
+            val messages = agentDbClient.getMessages(
                 sessionId = sessionId,
                 fromIndex = 0,
                 limit = limit
@@ -61,7 +59,7 @@ fun QuerySessionHistoryTool(): Tool = Tool(
             }
             mapper.writeValueAsString(summaries)
         } else {
-            val sessions = AgentDatabaseClient.listSessions(
+            val sessions = agentDbClient.listSessions(
                 binaryId = binaryId,
                 limit = limit
             )

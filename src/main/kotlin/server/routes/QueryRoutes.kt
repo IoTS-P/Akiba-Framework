@@ -8,11 +8,12 @@ import org.iotsplab.akiba.data.database.DatabaseClient
 data class QueryRequest(val sql: String, val instanceName: String? = null)
 data class QueryResponse(val columns: List<String>, val rows: List<List<Any?>>)
 
-fun Route.queryRoutes() {
+fun Route.queryRoutes(daemonHost: String, daemonPort: Int) {
     post("/query") {
         val req = call.receive<QueryRequest>()
         if (req.sql.isBlank()) {
-            call.respond(io.ktor.http.HttpStatusCode.BadRequest, mapOf("error" to "SQL query is empty"))
+            call.respond(io.ktor.http.HttpStatusCode.BadRequest,
+                mapOf("error" to "SQL query is empty"))
             return@post
         }
 
@@ -26,23 +27,31 @@ fun Route.queryRoutes() {
         }
 
         try {
-            val result = DatabaseClient.getIdInSQL(req.sql)
+            // Allow the client to override the instance via the request body
+            // (legacy field), otherwise use the global selection from the
+            // X-Akiba-Instance header.
+            val instance = req.instanceName ?: call.instanceHeader() ?: run {
+                call.respond(io.ktor.http.HttpStatusCode.BadRequest, mapOf(
+                    "error" to "Missing instance selection. Please select an instance first."
+                ))
+                return@post
+            }
+            val result = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                dbClient.getIdInSQL(req.sql)
+            }
             call.respond(QueryResponse(
                 columns = listOf("id"),
                 rows = result.map { listOf(it as Any?) }
             ))
         } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                mapOf("error" to "Query failed: ${e.message}"))
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
         }
     }
 
     get("/query/history") {
-        try {
-            call.respond(mapOf("message" to "Query history not yet implemented"))
-        } catch (e: Exception) {
-            call.respond(io.ktor.http.HttpStatusCode.InternalServerError,
-                mapOf("error" to e.message))
-        }
+        // History tracking is not yet implemented on the daemon side. Return
+        // an empty list so the frontend can render without crashing.
+        call.respond(mapOf("history" to emptyList<Any>()))
     }
 }

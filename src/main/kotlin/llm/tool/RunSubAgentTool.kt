@@ -21,7 +21,7 @@ import org.iotsplab.akiba.llm.memory.persistentChatMemory
  * The child agent's tools default to the parent's tool registry.
  * Override via the `toolNames` parameter to select a subset.
  */
-fun RunSubAgentTool(parent: AgentModule): Tool = Tool(
+fun RunSubAgentTool(parent: AgentModule, agentDbClient: AgentDatabaseClient): Tool = Tool(
     name = "run_sub_agent",
     description = buildString {
         appendLine("Spawn a child LLM agent to handle a sub-task independently.")
@@ -82,7 +82,7 @@ fun RunSubAgentTool(parent: AgentModule): Tool = Tool(
             }
 
             val childSessionId = try {
-                AgentDatabaseClient.createSession(
+                agentDbClient.createSession(
                     sessionName = "sub-agent-${System.nanoTime()}",
                     binaryId = parent.id,
                     moduleName = "${parent.javaClass.simpleName}::SubAgent",
@@ -91,13 +91,18 @@ fun RunSubAgentTool(parent: AgentModule): Tool = Tool(
             } catch (_: Exception) { null }
 
             val childMemory = if (childSessionId != null)
-                persistentChatMemory(childSessionId, maxMessages = 0)
+                persistentChatMemory(agentDbClient, childSessionId, maxMessages = 0)
             else
                 inMemoryChatMemory()
 
             val childMemoryManager = childSessionId?.let {
-                MemoryManager(it, parent.id)
+                MemoryManager(agentDbClient, it, parent.id)
             }
+
+            val childContextLength = ModelContextLengthService.getContextLength(
+                client.config.provider,
+                client.config.modelName
+            )
 
             val childAgent = AkibaAgent(
                 client = client,
@@ -109,7 +114,8 @@ fun RunSubAgentTool(parent: AgentModule): Tool = Tool(
                 sessionId = childSessionId,
                 enrichSystemPromptWithMemory = true,
                 auditToolCalls = true,
-                strategy = ReActStrategy()
+                strategy = ReActStrategy(),
+                contextLength = childContextLength
             )
 
             val result = childAgent.run(taskPrompt)
@@ -121,7 +127,7 @@ fun RunSubAgentTool(parent: AgentModule): Tool = Tool(
                         StopReason.MAX_ITERATIONS -> "max_iterations"
                         StopReason.ERROR -> "error"
                     }
-                    AgentDatabaseClient.updateSession(childSessionId, status = status)
+                    agentDbClient.updateSession(childSessionId, status = status)
                 } catch (_: Exception) {}
             }
 

@@ -54,9 +54,9 @@ object RestoreInstance: Runnable {
 
     override fun run() {
         ConfigManager.config = Configs(sqlSource = SqlSource(serverIP = host, serverPort = port))
-        DatabaseClient.urlHeader = "http://$host:$port"
+        val dbClient = DatabaseClient(host, port)
 
-        if (!DatabaseClient.testConnection())
+        if (!dbClient.testConnection())
             globalLogger.error("Cannot connect to database daemon")
 
         if (password == null) {
@@ -65,19 +65,19 @@ object RestoreInstance: Runnable {
         }
 
         try {
-            DatabaseClient.login(user, password!!)
+            dbClient.login(user, password!!)
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             globalLogger.error("Cannot login to database daemon, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
             return
         }
         
         try {
-            DatabaseClient.restoreBackup(name, label)
+            dbClient.restoreBackup(name, label)
             globalLogger.info("Restore completed")
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             globalLogger.error("Cannot restore backup, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
         }
 
-        DatabaseClient.logout()
+        dbClient.logout()
     }
 }

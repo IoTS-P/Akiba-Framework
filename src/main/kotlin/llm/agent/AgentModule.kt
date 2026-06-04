@@ -2,6 +2,7 @@ package org.iotsplab.akiba.llm.agent
 
 import ghidra.program.model.listing.Program
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
+import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.llm.client.LLMClientFactory
 import org.iotsplab.akiba.llm.client.LLMConfig
 import org.iotsplab.akiba.llm.memory.MemoryManager
@@ -10,7 +11,9 @@ import org.iotsplab.akiba.llm.memory.persistentChatMemory
 import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.llm.tool.BuiltInTools
-import org.iotsplab.akiba.utils.*
+import org.iotsplab.akiba.llm.tool.Tool
+import org.iotsplab.akiba.llm.tool.ToolParameter
+import org.iotsplab.akiba.llm.tool.ToolRegistry
 
 // ============================================================
 //  Annotations for Agent Module DSL
@@ -130,10 +133,13 @@ abstract class AgentModule(
     properties: Map<String, String?> = mapOf(),
     consoleLogLevel: org.apache.logging.log4j.Level = org.apache.logging.log4j.Level.INFO,
     fileLogLevel: org.apache.logging.log4j.Level = org.apache.logging.log4j.Level.INFO,
-    tableName: String? = null
+    tableName: String? = null,
+    dbClient: DatabaseClient = DatabaseClient.global
+        ?: error("DatabaseClient.global not initialized. In CLI mode this is set by WorkspaceManager.initDatabase(); in server mode pass a per-request instance explicitly.")
 ) : AkibaModule(
     configPath, defaultConfig, id, program, properties,
-    consoleLogLevel, fileLogLevel, tableName
+    consoleLogLevel, fileLogLevel, tableName,
+    dbClient = dbClient
 ) {
 
     /** The agent session ID (created during [startProcess]). */
@@ -147,6 +153,9 @@ abstract class AgentModule(
     /** The result of the agent run. */
     var agentResult: AgentResult? = null
         private set
+
+    /** The agent database client. */
+    val agentDbClient = AgentDatabaseClient(dbClient)
 
     // ---- Overridable configuration (programmatic) -------------------------
 
@@ -279,7 +288,7 @@ abstract class AgentModule(
 
         // 1. Create agent session
         val sessionId = try {
-            AgentDatabaseClient.createSession(
+            agentDbClient.createSession(
                 sessionName = "${this.javaClass.simpleName}-$id",
                 binaryId = id,
                 moduleName = this.javaClass.simpleName,
@@ -298,14 +307,14 @@ abstract class AgentModule(
 
         // 3. Build memory
         val chatMemory = if (usePersistentMemory() && sessionId != null) {
-            persistentChatMemory(sessionId, maxMemoryMessages())
+            persistentChatMemory(agentDbClient, sessionId, maxMemoryMessages())
         } else {
             inMemoryChatMemory(maxMemoryMessages())
         }
 
         // 4. Build memory manager
         val memoryManager = if (sessionId != null) {
-            MemoryManager(sessionId, id)
+            MemoryManager(agentDbClient, sessionId, id)
         } else null
 
         // 5. Register tools
@@ -315,7 +324,7 @@ abstract class AgentModule(
 
         // Register built-in tools (sub-module, sub-agent, DB queries)
         if (includeBuiltInTools()) {
-            BuiltInTools.registerAll(toolRegistry, this)
+            BuiltInTools.registerAll(toolRegistry, this, agentDbClient)
         }
 
         logger.info("Agent tools: ${toolRegistry.names()}")
@@ -326,6 +335,11 @@ abstract class AgentModule(
 
         val transcript = AgentTranscriptWriter(logDir)
         val modelName = resolveModelName()
+
+        val contextLength = ModelContextLengthService.getContextLength(
+            llmClient.config.provider,
+            llmClient.config.modelName
+        )
 
         val agent = AkibaAgent(
             client = llmClient,
@@ -339,7 +353,9 @@ abstract class AgentModule(
             auditToolCalls = true,
             strategy = strategy,
             logger = logger,
-            transcript = transcript
+            transcript = transcript,
+            contextLength = contextLength,
+            agentDbClient = agentDbClient
         )
         this.agent = agent
 
@@ -372,7 +388,7 @@ abstract class AgentModule(
                         StopReason.MAX_ITERATIONS -> "error"
                         StopReason.ERROR -> "error"
                     }
-                    AgentDatabaseClient.updateSession(sessionId, status = status)
+                    agentDbClient.updateSession(sessionId, status = status)
                 } catch (_: Exception) {}
             }
         } catch (e: Exception) {
@@ -381,7 +397,7 @@ abstract class AgentModule(
 
             if (sessionId != null) {
                 try {
-                    AgentDatabaseClient.updateSession(sessionId, status = "error")
+                    agentDbClient.updateSession(sessionId, status = "error")
                 } catch (_: Exception) {}
             }
         } finally {

@@ -1,8 +1,7 @@
 package org.iotsplab.akiba.llm.tool
 
+import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.agent.AgentModule
-import org.iotsplab.akiba.llm.agent.Tool
-import org.iotsplab.akiba.llm.agent.ToolRegistry
 import org.iotsplab.akiba.module.AkibaModule
 
 // ============================================================
@@ -51,15 +50,15 @@ object BuiltInTools {
      * override fun defineTools() = BuiltInTools.all(this)
      * ```
      */
-    fun all(parent: AgentModule): List<Tool> = listOf(
+    fun all(parent: AgentModule, agentDbClient: AgentDatabaseClient): List<Tool> = listOf(
         RunModuleTool(parent),
-        RunSubAgentTool(parent),
+        RunSubAgentTool(parent, agentDbClient),
         QueryModuleDataTool(parent),
-        QuerySessionHistoryTool(),
-        QueryMemoriesTool(),
+        QuerySessionHistoryTool(agentDbClient),
+        QueryMemoriesTool(agentDbClient),
         ListModulesTool(),
-        ScriptLibraryTool(parent),
-        RunScriptTool(parent),
+        ScriptLibraryTool(parent, agentDbClient),
+        RunScriptTool(parent, agentDbClient),
         QueryGhidraAPITool(),
         RunShellTool(parent)
     )
@@ -68,10 +67,10 @@ object BuiltInTools {
      * Register all built-in tools into a [ToolRegistry].
      *
      * ```kotlin
-     * BuiltInTools.registerAll(registry, this)
+     * BuiltInTools.registerAll(registry, this, agentDbClient)
      * ```
      */
-    fun registerAll(registry: ToolRegistry, parent: AgentModule) {
-        registry.registerAll(all(parent))
+    fun registerAll(registry: ToolRegistry, parent: AgentModule, agentDbClient: AgentDatabaseClient) {
+        registry.registerAll(all(parent, agentDbClient))
     }
 }

@@ -1,0 +1,138 @@
+package org.iotsplab.akiba.server.routes
+
+import io.ktor.http.HttpStatusCode
+import io.ktor.server.application.ApplicationCall
+import io.ktor.server.request.header
+import io.ktor.server.response.respond
+import org.iotsplab.akiba.data.database.DatabaseClient
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+/**
+ * Helpers for HTTP routes that need to talk to the akiba_db_daemon.
+ *
+ * Each call to [withDaemonSession] creates a **new**, independent
+ * [DatabaseClient] instance — login, connect to the requested instance,
+ * run the caller's block, then disconnect + logout.
+ *
+ * The daemon only allows one active session per instance at a time, so
+ * we serialize access with a per-instance lock. Requests targeting
+ * **different** instances run in parallel; requests to the **same**
+ * instance wait for the previous session to release.
+ */
+
+/** Username used for daemon access. Currently a single hard-coded service account. */
+const val DAEMON_USER = "akiba"
+const val DAEMON_PASSWORD = "akiba"
+
+/**
+ * Header that the frontend uses to pin every request to a specific
+ * akiba_db_daemon instance. The Vue app stores the user's selection in
+ * Pinia and attaches it through an axios interceptor.
+ */
+const val INSTANCE_HEADER = "X-Akiba-Instance"
+
+/**
+ * Read the [INSTANCE_HEADER] from the request. Returns null if the
+ * header is missing or blank.
+ */
+fun ApplicationCall.instanceHeader(): String? =
+    request.header(INSTANCE_HEADER)?.takeIf { it.isNotBlank() }
+
+/**
+ * Read the [INSTANCE_HEADER]; if missing, respond with 400 and return null.
+ * Use this from routes that strictly require an instance.
+ */
+suspend fun ApplicationCall.requireInstanceHeader(): String? {
+    val name = instanceHeader()
+    if (name == null) {
+        respond(HttpStatusCode.BadRequest, mapOf(
+            "error" to "Missing instance selection. " +
+                "Please select an instance in the UI before making this request."
+        ))
+    }
+    return name
+}
+
+/**
+ * Per-instance locks. The daemon only allows one active database session
+ * per instance, so concurrent requests targeting the same instance must be
+ * serialized. Requests to *different* instances run in parallel.
+ */
+private val instanceLocks = ConcurrentHashMap<String, ReentrantLock>()
+
+private fun lockFor(instanceName: String): ReentrantLock =
+    instanceLocks.computeIfAbsent(instanceName) { ReentrantLock() }
+
+/**
+ * Run [block] inside a fresh [DatabaseClient] session, serialized per
+ * instance so the daemon never sees two concurrent connections to the
+ * same instance.
+ *
+ * The block receives the logged-in [DatabaseClient] as its argument.
+ * When [instanceName] is non-null, the client is connected to that
+ * instance before the block runs. Cleanup (disconnect + logout) happens
+ * in a `finally` block.
+ *
+ * Pass `instanceName = null` only for operations that legitimately work
+ * without a database session (login probe, create/delete instance).
+ */
+fun <T> withDaemonSession(
+    daemonHost: String,
+    daemonPort: Int,
+    instanceName: String? = null,
+    block: (DatabaseClient) -> T
+): T {
+    // Serialize per-instance to avoid daemon 423 Locked.
+    val lock = if (instanceName != null) lockFor(instanceName) else null
+
+    fun doSession(): T {
+        val dbClient = DatabaseClient(daemonHost, daemonPort)
+        dbClient.login(DAEMON_USER, DAEMON_PASSWORD)
+        val connectedInstance = instanceName?.also {
+            dbClient.connectToInstance(it)
+        }
+        return try {
+            block(dbClient)
+        } finally {
+            // Cleanup must be best-effort so errors inside `block` are
+            // never masked. But we also must *not* swallow teardown
+            // failures silently — a failed disconnect leaves the daemon
+            // session dangling, which causes 423 Locked for the next
+            // request targeting the same instance.
+            if (connectedInstance != null) {
+                try {
+                    dbClient.disconnectToInstance(connectedInstance)
+                } catch (e: Exception) {
+                    System.err.println(
+                        "[withDaemonSession] WARNING: disconnectToInstance('$connectedInstance') failed: ${e.message}. " +
+                        "The daemon may still hold this session."
+                    )
+                }
+            }
+            try {
+                dbClient.logout()
+            } catch (e: Exception) {
+                System.err.println(
+                    "[withDaemonSession] WARNING: logout() failed: ${e.message}. " +
+                    "A stale auth token may remain on the daemon."
+                )
+            }
+        }
+    }
+
+    return if (lock != null) lock.withLock { doSession() } else doSession()
+}
+
+/**
+ * Translate a [DatabaseClient.DatabaseDaemonException] into a stable
+ * `(HTTP status, error message)` pair. Falls back to 500 + the exception
+ * message for unexpected errors.
+ */
+fun errorPayload(e: Throwable): Pair<HttpStatusCode, Map<String, String?>> {
+    val msg = e.message ?: e.javaClass.simpleName
+    val status = (e as? DatabaseClient.DatabaseDaemonException)?.statusCode
+        ?: HttpStatusCode.InternalServerError
+    return status to mapOf("error" to msg)
+}

@@ -40,8 +40,10 @@ object WorkflowManager {
                 sqlSource = SqlSource(serverIP = "127.0.0.1", serverPort = 31777),
                 general = org.iotsplab.akiba.utils.General(threads = threads)
             )
-            DatabaseClient.login("akiba", "akiba")
-            DatabaseClient.connectToInstance(instanceName)
+            val dbClient = DatabaseClient("127.0.0.1", 31777)
+            dbClient.login("akiba", "akiba")
+            dbClient.connectToInstance(instanceName)
+            DatabaseClient.global = dbClient
 
             val job = CoroutineScope(Dispatchers.Default).launch {
                 try {
@@ -69,8 +71,9 @@ object WorkflowManager {
                         progress = 0f
                     )
                 } finally {
-                    DatabaseClient.disconnectToInstance(instanceName)
-                    DatabaseClient.logout()
+                    dbClient.disconnectToInstance(instanceName)
+                    dbClient.logout()
+                    DatabaseClient.global = null
                     WorkspaceManager.close()
                 }
             }

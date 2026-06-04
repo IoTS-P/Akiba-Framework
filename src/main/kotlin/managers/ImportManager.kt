@@ -21,6 +21,7 @@ import kotlin.io.path.*
 import kotlin.math.min
 
 object ImportManager {
+    private val db: DatabaseClient get() = DatabaseClient.global!!
     @Serializable
     data class ImportConfig(
         val entries: List<Map<String, String?>>? = null
@@ -112,13 +113,13 @@ object ImportManager {
         }
 
         val originalChecksum = ProgramManager.getFileMD5Checksum(originalPath)
-        if (DatabaseClient.checkMD5Duplicate(originalChecksum))
+        if (db.checkMD5Duplicate(originalChecksum))
             throw DuplicateChecksumException(originalChecksum)
 
         // If Ghidra can automatically detect the file format, import directly and insert it to database
         ProgramManager.tryCreateProgramWithAutoDetect(project, originalPath)?.let {
             // Ghidra successfully identified the binary format, import directly
-            val id = DatabaseClient.insertBinary(
+            val id = db.insertBinary(
                 DatabaseClient.InsertData(
                     originalPath = originalPath.absolutePathString(),
                     processedPath = null,
@@ -166,7 +167,7 @@ object ImportManager {
         // If no arch is specified, try to guess its arch, if no arch matched, use 'n/a'
         val resolvedArch = arch?.languageID?.toString() ?: program?.languageID?.toString() ?: "n/a"
 
-        val id = DatabaseClient.insertBinary(DatabaseClient.InsertData(
+        val id = db.insertBinary(DatabaseClient.InsertData(
             originalPath = originalPath.absolutePathString(),
             processedPath = preprocessed?.first?.absolutePathString(),
             checksum = originalChecksum,

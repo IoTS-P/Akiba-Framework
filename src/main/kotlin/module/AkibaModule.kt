@@ -95,6 +95,8 @@ abstract class AkibaModule (
     tableName: String? = null,
     private var runtimeReport: RuntimeReport? = null,
     val skipDbWrite: Boolean = false,
+    val dbClient: DatabaseClient = DatabaseClient.global
+        ?: error("DatabaseClient.global not initialized. In CLI mode this is set by WorkspaceManager.initDatabase(); in server mode pass a per-request instance explicitly."),
 ) : AutoCloseable {
     val logDir: Path = WorkspaceManager.logRootDir.resolve(id.toString())
     var logger: Logger = initLogger(logDir, consoleLogLevel, fileLogLevel)
@@ -504,6 +506,7 @@ abstract class AkibaModule (
             "tableName" to tableName,
             "runtimeReport" to childReport,
             "skipDbWrite" to skipDbWrite,
+            "dbClient" to this.dbClient,
         )
 
         // Construct the instance the same way ProcedureManager does, but capture it here so we
@@ -521,14 +524,14 @@ abstract class AkibaModule (
         instance.installRuntimeReport(childReport)
         if (!skipDbWrite && instance.hasResultTable) {
             try {
-                DatabaseClient.createModuleTable(instance.dbTableName, instance.allDefinedDbColumns)
+                dbClient.createModuleTable(instance.dbTableName, instance.allDefinedDbColumns)
             } catch (e: DatabaseClient.DatabaseDaemonException) {
                 if (e.statusCode == HttpStatusCode.Conflict)
                     logger.debug("callModule: child table ${instance.dbTableName} already exists")
                 else throw e
             }
             try {
-                DatabaseClient.tableLock(instance.dbTableName)
+                dbClient.tableLock(instance.dbTableName)
             } catch (e: DatabaseClient.DatabaseDaemonException) {
                 if (e.statusCode == HttpStatusCode.Conflict)
                     logger.debug("callModule: child table ${instance.dbTableName} already locked")
@@ -677,7 +680,7 @@ abstract class AkibaModule (
         runtimeReport?.recordStart(Instant.now())
 
         if (hasTable && !skipDbWrite)
-            DatabaseClient.startTask(dbTableName, id.toLong())
+            dbClient.startTask(dbTableName, id.toLong())
 
         val job = CoroutineScope(coroutineContext).launch(start = CoroutineStart.LAZY) {
             this@AkibaModule.startProcess()
@@ -732,7 +735,7 @@ abstract class AkibaModule (
         runtimeReport?.recordEnd(Instant.now())
 
         if (hasTable && !skipDbWrite)
-            DatabaseClient.finishTask(dbTableName, id.toLong())
+            dbClient.finishTask(dbTableName, id.toLong())
 
         if (failureSign == SUCCESS)
             clearErr()
@@ -763,7 +766,7 @@ abstract class AkibaModule (
             return
         }
         if (hasTable)
-            DatabaseClient.updateData(dbTableName, id.toLong(), data)
+            dbClient.updateData(dbTableName, id.toLong(), data)
         else
             logger.error("Update data not allowed in modules with 'DoNotCreateTable', " +
                 "if you want to save data, remove this annotation")
@@ -774,7 +777,7 @@ abstract class AkibaModule (
         runtimeReport?.recordErr(msg)
         if (skipDbWrite) return
         if (hasTable)
-            DatabaseClient.updateData(dbTableName, id.toLong(), mapOf("err_msg" to msg))
+            dbClient.updateData(dbTableName, id.toLong(), mapOf("err_msg" to msg))
     }
 
     @Throws(DatabaseClient.DatabaseDaemonException::class)
@@ -782,7 +785,7 @@ abstract class AkibaModule (
         runtimeReport?.recordErr(null)
         if (skipDbWrite) return
         if (hasTable)
-            DatabaseClient.updateData(dbTableName, id.toLong(), mapOf("err_msg" to null))
+            dbClient.updateData(dbTableName, id.toLong(), mapOf("err_msg" to null))
     }
 
     var logLevel: Level

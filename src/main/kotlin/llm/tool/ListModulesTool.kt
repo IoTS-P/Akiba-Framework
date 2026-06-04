@@ -1,8 +1,6 @@
 package org.iotsplab.akiba.llm.tool
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
-import org.iotsplab.akiba.llm.agent.Tool
-import org.iotsplab.akiba.llm.agent.ToolParameter
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 
 /**

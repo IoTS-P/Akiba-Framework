@@ -47,9 +47,9 @@ object ShutdownInstance: Runnable {
 
     override fun run() {
         ConfigManager.config = Configs(sqlSource = SqlSource(serverIP = host, serverPort = port))
-        DatabaseClient.urlHeader = "http://$host:$port"
+        val dbClient = DatabaseClient(host, port)
 
-        if (!DatabaseClient.testConnection())
+        if (!dbClient.testConnection())
             globalLogger.error("Cannot connect to database daemon")
 
         if (password == null) {
@@ -58,19 +58,19 @@ object ShutdownInstance: Runnable {
         }
 
         try {
-            DatabaseClient.login(user, password!!)
+            dbClient.login(user, password!!)
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             globalLogger.error("Cannot login to database daemon, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
             return
         }
 
         try {
-            DatabaseClient.shutdownInstance(name)
+            dbClient.shutdownInstance(name)
             globalLogger.info("Instance $name shut down successfully")
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             globalLogger.error("Cannot shut down instance, error: ${e.statusCode}, ${e.statusMsg?:"null"}")
         }
 
-        DatabaseClient.logout()
+        dbClient.logout()
     }
 }

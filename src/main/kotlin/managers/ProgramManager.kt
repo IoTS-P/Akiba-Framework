@@ -46,6 +46,7 @@ import kotlin.concurrent.withLock
 import kotlin.io.path.*
 
 object ProgramManager {
+    private val db: DatabaseClient get() = DatabaseClient.global!!
     lateinit var metadata: List<BinaryMetadata>
     private lateinit var taskSemaphore: Semaphore
 
@@ -184,11 +185,11 @@ object ProgramManager {
                         ))
         } else {
             // not a single file, ready to read the database and check the validity of binary paths
-            DatabaseClient.enableRoute("/get/id/sql")
-            val ids = DatabaseClient.getIdInSQL(sqlSource.constraint)
-            DatabaseClient.disableRoute("/get/id/sql")
+            db.enableRoute("/get/id/sql")
+            val ids = db.getIdInSQL(sqlSource.constraint)
+            db.disableRoute("/get/id/sql")
 
-            val metadata = ids.map { DatabaseClient.getMetadata(it) }
+            val metadata = ids.map { db.getMetadata(it) }
             data = metadata
         }
 
@@ -219,7 +220,7 @@ object ProgramManager {
         val heartbeatJob = launch {
             while (isActive) {
                 delay(30000)
-                DatabaseClient.sendHeartbeat()
+                db.sendHeartbeat()
             }
         }
 
@@ -243,9 +244,9 @@ object ProgramManager {
 
         heartbeatJob.cancelAndJoin()
 
-        DatabaseClient.lockedTables.toList().forEach {
+        db.lockedTables.toList().forEach {
             try {
-                DatabaseClient.tableUnlock(it)
+                db.tableUnlock(it)
             } catch (e: Exception) {
                 globalLogger.error("Failed to unlock table $it: ${e.message}")
                 throw IllegalStateException("Failed to unlock table $it")
@@ -310,7 +311,7 @@ object ProgramManager {
                     .associate { it.name to it.type }
 
                 try {
-                    DatabaseClient.createModuleTable(tableName, columns)
+                    db.createModuleTable(tableName, columns)
                 } catch (e: DatabaseClient.DatabaseDaemonException) {
                     if (e.statusCode == HttpStatusCode.Conflict)
                         globalLogger.warn(e.statusMsg)
@@ -322,7 +323,7 @@ object ProgramManager {
 
                 // Lock this table
                 try {
-                    DatabaseClient.tableLock(tableName)
+                    db.tableLock(tableName)
                 } catch (e: DatabaseClient.DatabaseDaemonException) {
                     if (e.statusCode == HttpStatusCode.Conflict)
                         globalLogger.warn(e.statusMsg)
@@ -340,7 +341,7 @@ object ProgramManager {
                 .associate { it.viewName to it.creationSql }
                 .forEach { viewName, viewSQL ->
                     try {
-                        DatabaseClient.createView(viewName, viewSQL, false)
+                        db.createView(viewName, viewSQL, false)
                     } catch (e: DatabaseClient.DatabaseDaemonException) {
                         if (e.statusCode == HttpStatusCode.Conflict)
                             globalLogger.warn(e.statusMsg)
@@ -560,7 +561,7 @@ object ProgramManager {
                 it[0] to if (it[1] == "*") null else listOf(it[1])
             }
 
-            val data = DatabaseClient.getModuleData(id.toLong(), table, column)
+            val data = db.getModuleData(id.toLong(), table, column)
 
             for (k in data.keys) {
                 currentCoroutineContext()[ModuleContext.Key]!!.data["$table.$k"] = data[k]

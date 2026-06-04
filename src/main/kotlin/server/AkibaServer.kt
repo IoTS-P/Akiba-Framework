@@ -10,6 +10,7 @@ import io.ktor.server.websocket.*
 import io.ktor.serialization.jackson.*
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import org.iotsplab.akiba.llm.agent.ModelContextLengthService
 import org.iotsplab.akiba.server.db.ServerDbConfig
 import org.iotsplab.akiba.server.db.ServerDatabase
 import org.iotsplab.akiba.server.security.JwtService
@@ -19,6 +20,8 @@ import org.iotsplab.akiba.server.routes.fileRoutes
 import org.iotsplab.akiba.server.routes.workflowRoutes
 import org.iotsplab.akiba.server.routes.scriptRoutes
 import org.iotsplab.akiba.server.routes.queryRoutes
+import org.iotsplab.akiba.server.routes.agentRoutes
+import org.iotsplab.akiba.server.routes.llmConfigRoutes
 
 object AkibaServer {
     fun start(config: org.iotsplab.akiba.server.ServerConfig) {
@@ -27,6 +30,7 @@ object AkibaServer {
         )
         ServerDatabase.init(dbConfig)
         JwtService.init(config.jwtSecret)
+        ModelContextLengthService.start()
 
         embeddedServer(Netty, config.port, config.host) {
             install(ContentNegotiation) {
@@ -43,18 +47,19 @@ object AkibaServer {
                     call.respondText("Akiba Server is running")
                 }
 
-                get("/api/health") {
-                    call.respond(mapOf("status" to "ok"))
-                }
-
-                authRoutes()
-
                 route("/api") {
+                    get("/health") {
+                        call.respond(mapOf("status" to "ok"))
+                    }
+
+                    authRoutes()
                     instanceRoutes(config.daemonHost, config.daemonPort)
-                    fileRoutes()
+                    fileRoutes(config.daemonHost, config.daemonPort)
                     workflowRoutes()
-                    scriptRoutes()
-                    queryRoutes()
+                    scriptRoutes(config.daemonHost, config.daemonPort)
+                    queryRoutes(config.daemonHost, config.daemonPort)
+                    agentRoutes(config.daemonHost, config.daemonPort)
+                    llmConfigRoutes()
                 }
             }
         }.start(wait = true)

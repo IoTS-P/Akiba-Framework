@@ -175,7 +175,7 @@ class Main : Runnable {
         fun finally() {
             globalLogger.info("Exiting...")
             try {
-                DatabaseClient.logout()
+                DatabaseClient.global?.logout()
                 WorkspaceManager.close()
                 AnsiConsole.systemUninstall()
             } catch (_: Exception) {}
