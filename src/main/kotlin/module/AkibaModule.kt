@@ -605,8 +605,9 @@ abstract class AkibaModule (
 
         val context = LoggerContext.getContext()
         val rootConfig = context.configuration.rootLogger
-        val consoleConfig = rootConfig.appenders["Console"]!!
-        val patternLayout = consoleConfig.layout
+        val patternLayout = rootConfig.appenders["Console"]?.layout ?: PatternLayout.newBuilder()
+            .withPattern("%d %-5level [%t] %c{1.}.%M(%L): %msg%n")
+            .build()
         val loggerFileName = this.javaClass.simpleName
         val loggerName = "$loggerFileName--$id"
 
@@ -620,12 +621,14 @@ abstract class AkibaModule (
         )
 
         // Create console appender
-        val individualConsoleAppender = ConsoleAppender.newBuilder()
-            .setLayout(patternLayout)
-            .setName("Console-${this.javaClass.simpleName}-$id")
-            .build()
-        individualConsoleAppender.start()
-        newLoggerConfig.addAppender(individualConsoleAppender, consoleLogLevel, null)
+        if (consoleLogLevel != Level.OFF) {
+            val individualConsoleAppender = ConsoleAppender.newBuilder()
+                .setLayout(patternLayout)
+                .setName("Console-${this.javaClass.simpleName}-$id")
+                .build()
+            individualConsoleAppender.start()
+            newLoggerConfig.addAppender(individualConsoleAppender, consoleLogLevel, null)
+        }
 
         loggerConfig = newLoggerConfig
 
@@ -648,6 +651,7 @@ abstract class AkibaModule (
         }
 
         context.configuration.addLogger(loggerName, loggerConfig)
+        context.updateLoggers()
         return LogManager.getLogger(loggerName)
     }
 

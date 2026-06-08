@@ -183,6 +183,31 @@ class DatabaseClient(
     }
 
     @Throws(DatabaseDaemonException::class)
+    fun getIdPage(offset: Int, limit: Int): List<Long> = runBlocking {
+        val response = post("/get/id/page", mapOf(
+            "offset" to offset,
+            "limit" to limit
+        )).let {
+            if (it.first == HttpStatusCode.OK)
+                it.second
+            else
+                throw DatabaseDaemonException(it.first, it.first.description)
+        }
+        return@runBlocking jacksonObjectMapper().readValue<List<Long>>(response)
+    }
+
+    @Throws(DatabaseDaemonException::class)
+    fun getIdCount(): Long = runBlocking {
+        val response = post("/get/id/count", null).let {
+            if (it.first == HttpStatusCode.OK)
+                it.second
+            else
+                throw DatabaseDaemonException(it.first, it.first.description)
+        }
+        return@runBlocking jacksonObjectMapper().readValue<Long>(response)
+    }
+
+    @Throws(DatabaseDaemonException::class)
     fun getMetadata(id: Long): BinaryMetadata = runBlocking {
         val response = post("/get/metadata", id).let {
             if (it.first == HttpStatusCode.OK)
@@ -191,6 +216,26 @@ class DatabaseClient(
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
         return@runBlocking jacksonObjectMapper().readValue<BinaryMetadata>(response)
+    }
+
+    /**
+     * Search binaries by name, id, architecture, or format.
+     *
+     * @param query Free-text search term; matches against original_path, arch, and format.
+     *              If the query is a number, also matches by exact id.
+     * @return List of binary metadata maps, each containing id, name, originalPath,
+     *         arch, format, compilerSpec, and checksum.
+     */
+    @Throws(DatabaseDaemonException::class)
+    fun searchBinaries(query: String): List<Map<String, Any?>> = runBlocking {
+        val response = post("/get/search", mapOf("query" to query)).let {
+            if (it.first == HttpStatusCode.OK)
+                it.second
+            else
+                throw DatabaseDaemonException(it.first, it.first.description)
+        }
+        @Suppress("UNCHECKED_CAST")
+        return@runBlocking (jacksonObjectMapper().readValue(response) as? List<Map<String, Any?>>) ?: emptyList()
     }
 
     @Throws(DatabaseDaemonException::class)

@@ -10,5 +10,7 @@ data class ServerConfig(
     val dbUser: String = "akiba",
     val dbPassword: String = "akiba",
     val daemonHost: String = "127.0.0.1",
-    val daemonPort: Int = 31777
+    val daemonPort: Int = 31777,
+    val serverLogLevel: String = "INFO",
+    val serverLogMaxFiles: Int = 5
 )

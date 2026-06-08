@@ -20,7 +20,8 @@ import org.iotsplab.akiba.llm.memory.persistentChatMemory
 data class CreateAgentSessionRequest(
     val sessionName: String? = null,
     val systemPrompt: String? = null,
-    val modelName: String? = null
+    val modelName: String? = null,
+    val binaryId: Int? = null
 )
 
 data class AgentSessionResponse(
@@ -95,6 +96,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 val agentDbClient = AgentDatabaseClient(dbClient)
                 val sessionId = agentDbClient.createSession(
                     sessionName = req.sessionName ?: "Chat ${System.currentTimeMillis()}",
+                    binaryId = req.binaryId,
                     moduleName = "chat",
                     modelName = req.modelName
                 )

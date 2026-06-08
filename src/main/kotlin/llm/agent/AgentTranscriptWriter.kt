@@ -1,5 +1,7 @@
 package org.iotsplab.akiba.llm.agent
 
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.io.BufferedWriter
 import java.io.IOException
 import java.nio.file.Files
@@ -76,10 +78,22 @@ class AgentTranscriptWriter(logDir: Path) {
         writeSection("User", "user", message)
     }
 
-    /** Record the assistant's raw response. */
-    fun writeAssistantMessage(message: String, iteration: Int) {
+    /** Record the assistant's raw response, with optional cumulative token usage. */
+    fun writeAssistantMessage(
+        message: String,
+        iteration: Int,
+        totalInputTokens: Int = 0,
+        totalOutputTokens: Int = 0
+    ) {
         val header = "Assistant (iteration $iteration)"
         writeSection(header, "assistant", message)
+
+        // Append cumulative token usage statistics after each iteration
+        if (totalInputTokens > 0 || totalOutputTokens > 0) {
+            writer.appendLine("**📊 Token Usage (cumulative):** input=`$totalInputTokens` | output=`$totalOutputTokens` | total=`${totalInputTokens + totalOutputTokens}`")
+            writer.appendLine()
+            flush()
+        }
     }
 
     /** Record a tool call (action). */
@@ -125,9 +139,12 @@ class AgentTranscriptWriter(logDir: Path) {
         writer.appendLine("### 📋 Tool Result — `$toolName`$durationPart <sub>$now</sub>")
         writer.appendLine()
 
-        // If result looks like JSON, use json block; otherwise plain text
         val trimmed = result.trim()
-        if ((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+
+        // Special handling for run_script: parse JSON and render as multi-line fields
+        if (toolName == "run_script" && trimmed.startsWith("{")) {
+            writeRunScriptResult(trimmed)
+        } else if ((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
             (trimmed.startsWith("[") && trimmed.endsWith("]"))
         ) {
             writer.appendLine("```json")
@@ -146,6 +163,82 @@ class AgentTranscriptWriter(logDir: Path) {
 
         writer.appendLine()
         flush()
+    }
+
+    /**
+     * Render a [run_script] JSON result as a readable multi-line summary.
+     *
+     * Instead of a compact single-line JSON blob like:
+     * ```
+     * {"success":true,"failureSign":"SUCCESS","output":"...","data":null,...}
+     * ```
+     *
+     * The output is split into labelled fields for readability. The script's
+     * text output is rendered in a plain code block, and timing information
+     * is displayed below.
+     */
+    private fun writeRunScriptResult(jsonStr: String) {
+        try {
+            val mapper = jacksonObjectMapper()
+            val node: JsonNode = mapper.readTree(jsonStr)
+
+            // ── Status line ───────────────────────────────────────────
+            val success = node.path("success").asBoolean(false)
+            val failureSign = node.path("failureSign").asText("FAILED")
+            val statusIcon = if (success) "✅ SUCCESS" else "❌ $failureSign"
+            writer.appendLine("**Status:** $statusIcon")
+            writer.appendLine()
+
+            // ── Script output ─────────────────────────────────────────
+            val output = node.path("output").asText()
+            if (output.isNotBlank()) {
+                writer.appendLine("**Output:**")
+                writer.appendLine()
+                writer.appendLine("```text")
+                writer.appendLine(output.take(MAX_RESULT_CHARS))
+                writer.appendLine("```")
+                if (output.length > MAX_RESULT_CHARS) {
+                    writer.appendLine()
+                    writer.appendLine("*... output truncated (${output.length} chars total)*")
+                }
+                writer.appendLine()
+            } else {
+                writer.appendLine("**Output:** *(empty)*")
+                writer.appendLine()
+            }
+
+            // ── Structured data ───────────────────────────────────────
+            val data = node.path("data")
+            if (!data.isNull && !data.isMissingNode) {
+                writer.appendLine("**Data:**")
+                writer.appendLine()
+                writer.appendLine("```json")
+                val dataStr = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(data)
+                writer.appendLine(dataStr.take(MAX_RESULT_CHARS))
+                writer.appendLine("```")
+                if (dataStr.length > MAX_RESULT_CHARS) {
+                    writer.appendLine()
+                    writer.appendLine("*... data truncated*")
+                }
+                writer.appendLine()
+            }
+
+            // ── Timing ────────────────────────────────────────────────
+            val execMs = node.path("executionTimeMs").asLong(-1)
+            val totalMs = node.path("totalTimeMs").asLong(-1)
+            val timingParts = mutableListOf<String>()
+            if (execMs >= 0) timingParts.add("Execution: `${execMs}ms`")
+            if (totalMs >= 0) timingParts.add("Total: `${totalMs}ms`")
+            if (timingParts.isNotEmpty()) {
+                writer.appendLine("**Timing:** ${timingParts.joinToString(" | ")}")
+                writer.appendLine()
+            }
+        } catch (_: Exception) {
+            // Fallback: render as plain JSON on parse failure
+            writer.appendLine("```json")
+            writer.appendLine(jsonStr.take(MAX_RESULT_CHARS))
+            writer.appendLine("```")
+        }
     }
 
     /** Record a format reminder injected by the strategy. */
@@ -170,9 +263,7 @@ class AgentTranscriptWriter(logDir: Path) {
         writer.appendLine()
         writer.appendLine("### Final Output")
         writer.appendLine()
-        writer.appendLine("```text")
         writer.appendLine(result.output)
-        writer.appendLine("```")
         writer.appendLine()
         writer.appendLine("---")
         writer.appendLine()
@@ -193,9 +284,7 @@ class AgentTranscriptWriter(logDir: Path) {
         val now = timestamp()
         writer.appendLine("### ${roleEmoji(role)} $header <sub>$now</sub>")
         writer.appendLine()
-        writer.appendLine("```text")
         writer.appendLine(content)
-        writer.appendLine("```")
         writer.appendLine()
         flush()
     }

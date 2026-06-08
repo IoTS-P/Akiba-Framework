@@ -1,16 +1,26 @@
+@file:Suppress("DEPRECATION")
 package org.iotsplab.akiba.server.routes
 
-import io.ktor.http.HttpStatusCode
+import io.ktor.http.*
+import io.ktor.http.content.PartData
+import io.ktor.http.content.forEachPart
+import io.ktor.http.content.streamProvider
 import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import org.iotsplab.akiba.data.database.DatabaseClient
-import org.iotsplab.akiba.managers.ImportManager
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.Logger
+import java.io.File
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
+import java.util.UUID
 
-data class ImportRequest(val instanceName: String = "", val files: List<String>)
-data class ImportResponse(val message: String, val fileIds: List<Long> = listOf())
+private val logger: Logger = LogManager.getLogger("FileRoutes")
+
 data class DeleteFileRequest(val instanceName: String = "", val fileIds: List<Long>)
 
 data class FileEntry(
@@ -25,43 +35,191 @@ data class FileEntry(
 
 fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
 
-    // ------ Import files ----------------------------------------------------
+    // ------ Import files (multipart upload + subprocess) --------------------
     post("/files/import") {
         val instance = call.requireInstanceHeader() ?: return@post
-        val req = call.receive<ImportRequest>()
-        if (req.files.isEmpty()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "No files specified"))
-            return@post
-        }
+        logger.info("File import request for instance '{}'", instance)
+
+        val uploadedFiles = mutableListOf<Pair<Path, String>>()
+        val taskId = UUID.randomUUID().toString().take(8)
+        val uploadDir = Path.of("/tmp", "akiba_upload_$taskId")
+        Files.createDirectories(uploadDir)
+
         try {
-            val results = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                // Temporarily set global so ImportManager (which reads DatabaseClient.global)
-                // can insert binary records through this session
-                val previous = DatabaseClient.global
-                DatabaseClient.global = dbClient
-                try {
-                    req.files.map { pathStr ->
-                        val path = Path.of(pathStr)
-                        require(path.toFile().exists()) {
-                            "File not found: $pathStr"
+            // 1. Receive uploaded files
+            call.receiveMultipart().forEachPart { part ->
+                when (part) {
+                    is PartData.FileItem -> {
+                        val originalName = part.originalFileName ?: "uploaded.bin"
+                        val tempFile = uploadDir.resolve(originalName)
+                        part.streamProvider().use { input ->
+                            Files.copy(input, tempFile, StandardCopyOption.REPLACE_EXISTING)
                         }
-                        require(path.toFile().isFile) {
-                            "Not a regular file: $pathStr"
-                        }
-                        ImportManager.importSingleFile(path)
+                        logger.debug("Received file '{}' ({} bytes)", originalName, Files.size(tempFile))
+                        uploadedFiles.add(tempFile to originalName)
+                        part.dispose()
                     }
-                } finally {
-                    DatabaseClient.global = previous
+                    else -> part.dispose()
                 }
             }
-            call.respond(ImportResponse("Import successful", results))
+
+            if (uploadedFiles.isEmpty()) {
+                Files.deleteIfExists(uploadDir)
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "No files uploaded"))
+                return@post
+            }
+
+            logger.info("Saving {} file(s) to {}", uploadedFiles.size, uploadDir)
+
+            // 2. Create import.json — list each uploaded file
+            val entries = uploadedFiles.map { (_, origName) ->
+                mapOf("path" to origName)
+            }
+            val importJson = mapper.writeValueAsString(mapOf("entries" to entries))
+            Files.writeString(uploadDir.resolve("import.json"), importJson)
+
+            // 3. Create config.json (the -c file)
+            val config = mapOf(
+                "username" to (call.parameters["username"] ?: "akiba"),
+                "password" to "akiba",
+                "usingInstance" to instance,
+                "general" to mapOf(
+                    "importRoot" to "/tmp/akiba_upload_$taskId/"
+                ),
+                "withGhidraProject" to mapOf(
+                    "projectRoot" to "/tmp/akiba_upload_$taskId",
+                    "name" to "import",
+                    "mode" to "new",
+                    "saveProject" to false,
+                    "noCreateProgram" to true
+                )
+            )
+            val configJson = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(config)
+            Files.writeString(uploadDir.resolve("config.json"), configJson)
+
+            // 4. Register task via ProgressManager (gets a unique token)
+            val progressToken = ProgressManager.registerTask(taskId)
+
+            // 5. Launch subprocess with HTTP-based progress reporting
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    val serverPort = call.request.local.serverPort
+                    runImportSubprocess(
+                        taskId = taskId,
+                        uploadDir = uploadDir,
+                        serverPort = serverPort,
+                        progressToken = progressToken
+                    )
+                    ProgressManager.updateStatus(progressToken, "completed")
+                    ProgressManager.setResult(progressToken,
+                        "Import completed successfully (${uploadedFiles.size} file(s))"
+                    )
+                } catch (e: Exception) {
+                    logger.error("Import subprocess failed: {}", e.message)
+                    ProgressManager.updateStatus(progressToken, "failed")
+                    ProgressManager.setResult(progressToken, "Import failed: ${e.message}")
+                } finally {
+                    ProgressManager.finish(taskId)
+                }
+            }
+
+            call.respond(mapOf(
+                "taskId" to taskId,
+                "message" to "Import started with ${uploadedFiles.size} file(s)"
+            ))
+
         } catch (e: Exception) {
-            val msg = e.message ?: "Import failed"
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to msg))
+            logger.error("Import setup failed: {}", e.message, e)
+            try { uploadDir.toFile().deleteRecursively() } catch (_: Exception) {}
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to e.message))
         }
     }
 
-    // ------ List files with metadata ---------------------------------------
+    // ------ Receive progress reports from child process (HTTP POST) ---------
+    post("/progress") {
+        val body = try {
+            call.receive<Map<String, String>>()
+        } catch (_: Exception) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid JSON"))
+            return@post
+        }
+        val token = body["token"] ?: run {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing token"))
+            return@post
+        }
+        val type = body["type"] ?: ""
+        val message = body["message"] ?: ""
+
+        when (type) {
+            "progress" -> ProgressManager.onProgress(token, message)
+            "status" -> ProgressManager.updateStatus(token, message)
+            "result" -> ProgressManager.setResult(token, message)
+            else -> ProgressManager.onProgress(token, message)
+        }
+
+        call.respond(HttpStatusCode.OK, mapOf("ok" to true))
+    }
+
+    // ------ Stream import progress (SSE) -----------------------------------
+    get("/files/import/stream/{taskId}") {
+        val taskId = call.parameters["taskId"] ?: run {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing taskId"))
+            return@get
+        }
+        val status = ProgressManager.getStatus(taskId)
+        if (status == "unknown") {
+            call.respond(HttpStatusCode.NotFound, mapOf("error" to "Task not found"))
+            return@get
+        }
+
+        // Set SSE headers via the raw response
+        call.response.header(HttpHeaders.ContentType, "text/event-stream")
+        call.response.header("Cache-Control", "no-cache")
+        call.response.header("X-Accel-Buffering", "no")
+
+        // Use respondTextWriter for streaming text output
+        call.respondTextWriter(contentType = ContentType.Text.EventStream) {
+            val ch = ProgressManager.getChannel(taskId)
+            if (ch != null) {
+                for (msg in ch) {
+                    write("data: $msg\n\n")
+                    flush()
+                }
+            }
+            val finalStatus = ProgressManager.getStatus(taskId)
+            val finalResult = ProgressManager.getResult(taskId)
+            write("data: [STATUS] $finalStatus\n\n")
+            write("data: [RESULT] ${finalResult ?: ""}\n\n")
+            write("data: [DONE]\n\n")
+            flush()
+        }
+    }
+
+    // ------ Search files by query -------------------------------------------
+    get("/files/search") {
+        val instance = call.parameters["instanceName"]
+            ?: call.instanceHeader()
+            ?: run {
+                call.respond(HttpStatusCode.BadRequest, mapOf(
+                    "error" to "Missing instance selection. Please select an instance first."
+                ))
+                return@get
+            }
+        val query = call.parameters["q"] ?: ""
+        logger.debug("File search requested: instance='{}', query='{}'", instance, query)
+        try {
+            val results = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                dbClient.searchBinaries(query)
+            }
+            call.respond(mapOf("files" to results, "query" to query))
+        } catch (e: Exception) {
+            logger.error("File search failed: {}", e.message, e)
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    // ------ List files with metadata (paginated) ---------------------------
     get("/files") {
         val instance = call.parameters["instanceName"]
             ?: call.instanceHeader()
@@ -71,9 +229,13 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
                 ))
                 return@get
             }
+        val offset = call.parameters["offset"]?.toIntOrNull() ?: 0
+        val limit = call.parameters["limit"]?.toIntOrNull() ?: 20
+        logger.debug("File list requested: instance='{}', offset={}, limit={}", instance, offset, limit)
         try {
             val files = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                val ids = dbClient.getIdInSQL("")
+                val ids = dbClient.getIdPage(offset, limit)
+                logger.debug("Got {} ids for page offset={} limit={}", ids.size, offset, limit)
                 ids.map { id ->
                     try {
                         val meta = dbClient.getMetadata(id)
@@ -100,8 +262,18 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
                     }
                 }
             }
-            call.respond(mapOf("files" to files))
+            val total = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                dbClient.getIdCount()
+            }
+            logger.debug("File list returned {}/{} items", files.size, total)
+            call.respond(mapOf(
+                "files" to files,
+                "total" to total,
+                "offset" to offset,
+                "limit" to limit
+            ))
         } catch (e: Exception) {
+            logger.error("File list failed: {}", e.message, e)
             val (status, body) = errorPayload(e)
             call.respond(status, body)
         }
@@ -116,3 +288,85 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
         ))
     }
 }
+
+// ---- Find the akiba jar path ------------------------------------------------
+// ---- Find the akiba start script -------------------------------------------
+//
+// Distribution layout:
+//   akiba_framework/
+//     bin/akiba              ← start script (handles classpath with all lib/*.jar)
+//     lib/akiba_framework-*.jar
+//     configs/
+//     scripts/
+//
+// We find the start script by resolving bin/akiba relative to the jar location.
+
+private fun findAkibaScript(): String {
+    // 1. From jar location: lib/akiba_framework-*.jar → ../bin/akiba
+    try {
+        val source = org.iotsplab.akiba.Main::class.java.protectionDomain.codeSource
+        val loc = source.location.toURI()
+        val jarFile = File(loc)
+        if (jarFile.name.endsWith(".jar")) {
+            val distRoot = jarFile.parentFile.parentFile  // lib/ → ../
+            val script = File(distRoot, "bin/akiba")
+            if (script.isFile) return script.absolutePath
+        }
+    } catch (_: Exception) { /* fall through */ }
+
+    // 2. Try common locations relative to the working directory
+    val cwd = System.getProperty("user.dir", ".")
+    val candidates = listOf(
+        File(cwd, "bin/akiba"),
+        File(cwd, "../bin/akiba"),
+        File(cwd, "akiba_framework/bin/akiba"),
+    )
+    for (candidate in candidates) {
+        if (candidate.isFile) return candidate.absolutePath
+    }
+
+    // 3. Last resort — assume bin/akiba is on PATH
+    return "akiba"
+}
+
+// ---- Run the import subprocess with HTTP-based progress reporting -----------
+private suspend fun runImportSubprocess(
+    taskId: String,
+    uploadDir: Path,
+    serverPort: Int,
+    progressToken: String
+) {
+    val scriptPath = findAkibaScript()
+    val configFile = uploadDir.resolve("config.json").toAbsolutePath().toString()
+    val importFile = uploadDir.resolve("import.json").toAbsolutePath().toString()
+    val progressUrl = "http://127.0.0.1:$serverPort/api/progress"
+
+    val pb = ProcessBuilder(
+        scriptPath,
+        "-c", configFile,
+        "-i", importFile
+    )
+    pb.directory(File(System.getProperty("user.dir", ".")))
+    pb.environment()["AKIBA_PROGRESS_URL"] = progressUrl
+    pb.environment()["AKIBA_PROGRESS_TOKEN"] = progressToken
+    pb.environment()["AKIBA_LLM_API_KEY"] = System.getenv("AKIBA_LLM_API_KEY") ?: ""
+
+    // Keep stderr merged so we still see errors in server log
+    pb.redirectErrorStream(true)
+    val process = pb.start()
+
+    // Still consume stdout to avoid buffer deadlock, but just log it instead of sending to channel
+    process.inputStream.bufferedReader().use { reader ->
+        var line: String?
+        while (reader.readLine().also { line = it } != null) {
+            logger.info("[import $taskId] $line")
+        }
+    }
+
+    val exitCode = process.waitFor()
+    if (exitCode != 0) {
+        throw RuntimeException("Import subprocess failed with exit code $exitCode")
+    }
+}
+
+private val mapper = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()

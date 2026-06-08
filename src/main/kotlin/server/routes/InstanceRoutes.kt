@@ -3,7 +3,11 @@ package org.iotsplab.akiba.server.routes
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.DatabaseClient
+
+private val logger: Logger = LogManager.getLogger("InstanceRoutes")
 
 data class InstanceRequest(val name: String)
 data class InstanceActionRequest(val instanceName: String)
@@ -60,12 +64,15 @@ fun Route.instanceRoutes(daemonHost: String, daemonPort: Int) {
      */
     post("/instances/create") {
         val req = call.receive<InstanceRequest>()
+        logger.info("Creating instance '{}'", req.name)
         try {
             withDaemonSession(daemonHost, daemonPort, instanceName = null) { dbClient ->
                 dbClient.createInstance(req.name)
             }
+            logger.info("Instance '{}' created successfully", req.name)
             call.respond(InstanceResponse("Instance created", req.name))
         } catch (e: Exception) {
+            logger.error("Failed to create instance '{}': {}", req.name, e.message, e)
             val (status, body) = errorPayload(e)
             call.respond(status, InstanceResponse(
                 body["error"] ?: "Failed to create instance", req.name
@@ -96,12 +103,15 @@ fun Route.instanceRoutes(daemonHost: String, daemonPort: Int) {
      */
     post("/instances/start") {
         val req = call.receive<InstanceActionRequest>()
+        logger.info("Starting instance '{}'", req.instanceName)
         try {
             withDaemonSession(daemonHost, daemonPort, instanceName = req.instanceName) { _ ->
                 // Just connecting + (auto) disconnecting is the start-probe.
             }
+            logger.info("Instance '{}' started successfully", req.instanceName)
             call.respond(InstanceResponse("Instance started", req.instanceName))
         } catch (e: Exception) {
+            logger.error("Failed to start instance '{}': {}", req.instanceName, e.message, e)
             val (status, body) = errorPayload(e)
             call.respond(status, InstanceResponse(
                 body["error"] ?: "Failed to start instance", req.instanceName
@@ -111,14 +121,17 @@ fun Route.instanceRoutes(daemonHost: String, daemonPort: Int) {
 
     post("/instances/shutdown") {
         val req = call.receive<InstanceActionRequest>()
+        logger.info("Shutting down instance '{}'", req.instanceName)
         try {
             // shutdownInstance does not require an active session — it is
             // an admin-level call.
             withDaemonSession(daemonHost, daemonPort, instanceName = null) { dbClient ->
                 dbClient.shutdownInstance(req.instanceName)
             }
+            logger.info("Instance '{}' shut down successfully", req.instanceName)
             call.respond(InstanceResponse("Instance shut down", req.instanceName))
         } catch (e: Exception) {
+            logger.error("Failed to shut down instance '{}': {}", req.instanceName, e.message, e)
             val (status, body) = errorPayload(e)
             call.respond(status, InstanceResponse(
                 body["error"] ?: "Failed to shut down instance", req.instanceName

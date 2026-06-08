@@ -10,7 +10,15 @@ import io.ktor.server.websocket.*
 import io.ktor.serialization.jackson.*
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import org.apache.logging.log4j.Level
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.core.LoggerContext
+import org.apache.logging.log4j.core.appender.RollingFileAppender
+import org.apache.logging.log4j.core.appender.rolling.DefaultRolloverStrategy
+import org.apache.logging.log4j.core.appender.rolling.SizeBasedTriggeringPolicy
+import org.apache.logging.log4j.core.layout.PatternLayout
 import org.iotsplab.akiba.llm.agent.ModelContextLengthService
+import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.server.db.ServerDbConfig
 import org.iotsplab.akiba.server.db.ServerDatabase
 import org.iotsplab.akiba.server.security.JwtService
@@ -22,6 +30,7 @@ import org.iotsplab.akiba.server.routes.scriptRoutes
 import org.iotsplab.akiba.server.routes.queryRoutes
 import org.iotsplab.akiba.server.routes.agentRoutes
 import org.iotsplab.akiba.server.routes.llmConfigRoutes
+import org.iotsplab.akiba.server.routes.runtimeConfigRoutes
 
 object AkibaServer {
     fun start(config: org.iotsplab.akiba.server.ServerConfig) {
@@ -31,6 +40,8 @@ object AkibaServer {
         ServerDatabase.init(dbConfig)
         JwtService.init(config.jwtSecret)
         ModelContextLengthService.start()
+
+        initServerLogger(config)
 
         embeddedServer(Netty, config.port, config.host) {
             install(ContentNegotiation) {
@@ -60,9 +71,52 @@ object AkibaServer {
                     queryRoutes(config.daemonHost, config.daemonPort)
                     agentRoutes(config.daemonHost, config.daemonPort)
                     llmConfigRoutes()
+                    runtimeConfigRoutes()
                 }
             }
         }.start(wait = true)
+    }
+
+    private fun initServerLogger(config: ServerConfig) {
+        val context = LogManager.getContext(false) as LoggerContext
+        val log4jConfig = context.configuration
+
+        val logDir = WorkspaceManager.logRootDir
+        val logFile = logDir.resolve("server.log").toAbsolutePath().toString()
+        val logFilePattern = logDir.resolve("server-%i.log").toAbsolutePath().toString()
+
+        val layout = PatternLayout.newBuilder()
+            .withPattern("%d %-5level [%t] %c{1.} - %msg%n")
+            .withConfiguration(log4jConfig)
+            .build()
+
+        val triggerPolicy = SizeBasedTriggeringPolicy.createPolicy("300KB")
+        val rolloverStrategy = DefaultRolloverStrategy.newBuilder()
+            .withMax(config.serverLogMaxFiles.toString())
+            .withFileIndex("min")
+            .build()
+
+        val appender = RollingFileAppender.newBuilder()
+            .setName("ServerRollingFile")
+            .withFileName(logFile)
+            .withFilePattern(logFilePattern)
+            .setLayout(layout)
+            .withPolicy(triggerPolicy)
+            .withStrategy(rolloverStrategy)
+            .setConfiguration(log4jConfig)
+            .build()
+
+        val logLevel = Level.getLevel(config.serverLogLevel)
+        if (logLevel != Level.OFF) {
+            appender.start()
+            log4jConfig.addAppender(appender)
+
+            val rootLogger = log4jConfig.rootLogger
+            rootLogger.addAppender(appender, logLevel, null)
+            rootLogger.level = Level.ALL
+
+            context.updateLoggers()
+        }
     }
 
     fun stop() {

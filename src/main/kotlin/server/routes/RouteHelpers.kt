@@ -4,10 +4,14 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.header
 import io.ktor.server.response.respond
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.DatabaseClient
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
+
+private val logger: Logger = LogManager.getLogger("RouteHelpers")
 
 /**
  * Helpers for HTTP routes that need to talk to the akiba_db_daemon.
@@ -93,6 +97,7 @@ fun <T> withDaemonSession(
         val connectedInstance = instanceName?.also {
             dbClient.connectToInstance(it)
         }
+        logger.debug("Daemon session established for instance '${instanceName ?: "<none>"}'")
         return try {
             block(dbClient)
         } finally {
@@ -105,18 +110,18 @@ fun <T> withDaemonSession(
                 try {
                     dbClient.disconnectToInstance(connectedInstance)
                 } catch (e: Exception) {
-                    System.err.println(
-                        "[withDaemonSession] WARNING: disconnectToInstance('$connectedInstance') failed: ${e.message}. " +
-                        "The daemon may still hold this session."
+                    logger.warn(
+                        "disconnectToInstance('$connectedInstance') failed: ${e.message}. " +
+                        "The daemon may still hold this session.", e
                     )
                 }
             }
             try {
                 dbClient.logout()
             } catch (e: Exception) {
-                System.err.println(
-                    "[withDaemonSession] WARNING: logout() failed: ${e.message}. " +
-                    "A stale auth token may remain on the daemon."
+                logger.warn(
+                    "logout() failed: ${e.message}. " +
+                    "A stale auth token may remain on the daemon.", e
                 )
             }
         }

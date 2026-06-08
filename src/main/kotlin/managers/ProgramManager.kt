@@ -32,6 +32,7 @@ import org.apache.logging.log4j.Level
 import org.iotsplab.akiba.utils.DoNotCreateTable
 import org.iotsplab.akiba.utils.WithTableColumn
 import org.iotsplab.akiba.utils.ProcedureArguments
+import org.iotsplab.akiba.utils.ProgressReporter
 import org.iotsplab.akiba.utils.WithView
 import sun.misc.Signal
 import java.io.BufferedInputStream
@@ -44,6 +45,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.io.path.*
+import com.google.errorprone.annotations.FormatString
 
 object ProgramManager {
     private val db: DatabaseClient get() = DatabaseClient.global!!
@@ -124,6 +126,12 @@ object ProgramManager {
                 globalLogger.error("Empty query results, quit immediately")
                 return false
             }
+
+            // Report file IDs to parent server for frontend display
+            val fileIds = metadata.joinToString(",") { it.id.toString() }
+            globalLogger.info("Processing ${metadata.size} file(s): [$fileIds]")
+            ProgressReporter.report("[FILES] $fileIds")
+            ProgressReporter.report("Processing ${metadata.size} file(s)")
         }
 
         setSkipList()
@@ -365,11 +373,10 @@ object ProgramManager {
      */
     @Throws(IllegalStateException::class, Exception::class)
     private suspend fun workOnBinary(metadata: BinaryMetadata, project: GhidraProject) {
-        // memoryLock()
-        // val path = Path.of(metadata.processedPath ?: metadata.originalPath)
-        val path = Path.of(config.general!!.binariesRoot, "processed/${metadata.id}.bin").let {
+        ProgressReporter.report("[FILE:${metadata.id}] running")
+        val path = WorkspaceManager.processedBinaryPath.resolve("${metadata.id}.bin").let {
             if (it.exists()) it
-            else Path.of(config.general!!.binariesRoot, "original/${metadata.id}.bin")
+            else WorkspaceManager.binaryPath.resolve("${metadata.id}.bin")
         } .let {
             if (it.exists()) it
             else throw IllegalStateException("File ${it.fileName} does not exist")
@@ -498,6 +505,9 @@ object ProgramManager {
             if (!failed) {
                 successTestCount++
                 logDir.moveTo(successDir.resolve(logDir.fileName))
+                ProgressReporter.report("[FILE:${metadata.id}] completed")
+            } else {
+                ProgressReporter.report("[FILE:${metadata.id}] failed")
             }
         } catch (e: NoSuchMethodError) {
             // Ensure tx is closed on error paths

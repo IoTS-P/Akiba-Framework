@@ -13,6 +13,7 @@ import org.iotsplab.akiba.managers.ProgramManager.autoAnalyzeInTimeout
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 import org.iotsplab.akiba.managers.WorkspaceManager.languageProvider
 import org.iotsplab.akiba.managers.WorkspaceManager.project
+import org.iotsplab.akiba.utils.ProgressReporter
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Path
@@ -51,16 +52,20 @@ object ImportManager {
         lockImport()
 
         readConfig()
+        ProgressReporter.report("Starting import of ${importList.size} file(s)")
 
         importList.mapIndexed { idx, entry ->
             val originalPath = if (entry.path.startsWith("/")) entry.path.absolute()
                                else Path.of(mainConf.importRoot!!).resolve(entry.path).absolute()
 
             globalLogger.info("Importing [${idx + 1}/${importList.size}] $originalPath")
+            ProgressReporter.report("Importing [${idx + 1}/${importList.size}] ${entry.path}")
 
             // Check if file exists
             if (originalPath.notExists() || !originalPath.isRegularFile()) {
-                globalLogger.error("File not found: $originalPath, skipped")
+                val errMsg = "File not found: $originalPath, skipped"
+                globalLogger.error(errMsg)
+                ProgressReporter.report(errMsg)
                 return@mapIndexed
             }
 
@@ -68,13 +73,24 @@ object ImportManager {
 
             try {
                 importSingleFile(originalPath, entry.arch)
+                ProgressReporter.report("Imported ${entry.path} successfully")
             } catch (e: DuplicateChecksumException) {
-                globalLogger.warn("Found duplicate checksum of ${entry.path}, skipped")
+                val msg = "Found duplicate checksum of ${entry.path}, skipped"
+                globalLogger.warn(msg)
+                ProgressReporter.report(msg)
             }
         }
 
+        ProgressReporter.report("Import completed (${importList.size} file(s) processed)")
         unlockImport()
     }
+
+    // Progress reporting is handled by the shared org.iotsplab.akiba.utils.ProgressReporter.
+    // Any code can report progress with:
+    //   ProgressReporter.report("message")
+    //   ProgressReporter.status("completed")
+    //   ProgressReporter.result("All done")
+    // It gracefully no-ops when the env vars are not set.
 
     class DuplicateChecksumException(checksum: String) :
         IllegalStateException("Duplicate checksum: $checksum")
@@ -199,7 +215,9 @@ object ImportManager {
 
     @Throws(IllegalStateException::class)
     private fun lockImport() {
-        val lockFile: Path = Path.of(mainConf.binariesRoot).resolve("import.lock")
+        // Use the resolved binaries root from WorkspaceManager (auto-computed if not configured)
+        val base = WorkspaceManager.binaryPath.parent
+        val lockFile: Path = base.resolve("import.lock")
         if (lockFile.exists()) {
             throw IllegalStateException("An import task is already running")
         }
@@ -207,7 +225,8 @@ object ImportManager {
 
     @Throws(IllegalStateException::class)
     private fun unlockImport() {
-        val lockFile: Path = Path.of(mainConf.binariesRoot).resolve("import.lock")
+        val base = WorkspaceManager.binaryPath.parent
+        val lockFile: Path = base.resolve("import.lock")
         if (lockFile.exists()) {
             lockFile.deleteIfExists()
         }

@@ -1,7 +1,7 @@
 plugins {
     application
-    kotlin("jvm") version "2.3.20"
-    kotlin("plugin.serialization") version "2.3.20"
+    kotlin("jvm")
+    kotlin("plugin.serialization")
 }
 
 group = "org.iotsplab"
@@ -94,11 +94,11 @@ application {
 }
 
 tasks.distZip {
-    into("akiba-$version/configs/") {
+    into("akiba-${version}/configs/") {
         from("src/main/resources/configs/log4j2.xml")
         from("src/main/resources/configs/ghidra_log.xml")
     }
-    into("akiba-$version/scripts") {
+    into("akiba-${version}/scripts") {
         from("src/main/scripts/match_progress_monitor.py")
         from("src/main/scripts/task_stage_monitor.py")
         from("src/main/scripts/start_monitor.sh")
@@ -106,7 +106,7 @@ tasks.distZip {
         from("src/main/scripts/starter.py")
         from("src/main/scripts/clear_cache.sh")
     }
-    into("akiba-$version/scripts/util") {
+    into("akiba-${version}/scripts/util") {
         from("src/main/scripts/util/colorama_extension.py")
     }
 }

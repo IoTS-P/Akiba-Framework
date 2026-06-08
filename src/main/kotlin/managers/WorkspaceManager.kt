@@ -269,11 +269,24 @@ object WorkspaceManager: Closeable {
     }
 
     fun initBinDirectories() {
-        // Initialize directories for saving binaries
-        binaryPath = Path.of(mainConf.binariesRoot).resolve("original")
-        processedBinaryPath = Path.of(mainConf.binariesRoot).resolve("processed")
+        // Resolve binaries root: auto-compute from username/instance if not explicitly configured
+        val resolvedRoot = if (mainConf.binariesRoot.isNotBlank()) {
+            mainConf.binariesRoot
+        } else {
+            val user = config.username ?: "default"
+            val instance = config.usingInstance ?: "default"
+            "${System.getProperty("user.home")}/.akiba/binaries/$user/$instance"
+        }
+        // Store the resolved root back so other code can use it consistently
+        mainConf.binariesRoot = resolvedRoot
+        binaryPath = Path.of(resolvedRoot).resolve("original")
+        processedBinaryPath = Path.of(resolvedRoot).resolve("processed")
         binaryPath.createDirectories()
         processedBinaryPath.createDirectories()
+
+        mainConf.importRoot ?:run {
+            mainConf.importRoot = mainConf.binariesRoot
+        }
     }
 
     fun initDatabase(): Boolean {

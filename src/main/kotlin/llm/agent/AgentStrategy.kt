@@ -291,7 +291,10 @@ class ReActStrategy : AgentStrategy {
             ctx.memory.addAssistantMessage(assistantText)
 
             logger.info("[ReAct] Assistant (${assistantText.length} chars): ${assistantText.take(300)}...")
-            ctx.transcript?.writeAssistantMessage(assistantText, ctx.stats.iterations)
+            ctx.transcript?.writeAssistantMessage(
+                assistantText, ctx.stats.iterations,
+                ctx.stats.totalInputTokens, ctx.stats.totalOutputTokens
+            )
 
             // Parse ALL tool calls (native first, then text-based fallback).
             // Up to MAX_BATCH_TOOL_CALLS will be executed sequentially in the
@@ -580,6 +583,11 @@ class PlanExecuteStrategy(
         val planText = ToolCallParser.stripThinking(completion.content)
         ctx.memory.addAssistantMessage(planText)
 
+        ctx.transcript?.writeAssistantMessage(
+            planText, ctx.stats.iterations,
+            ctx.stats.totalInputTokens, ctx.stats.totalOutputTokens
+        )
+
         return parsePlan(planText)
     }
 
@@ -668,7 +676,10 @@ class PlanExecuteStrategy(
 
                 val assistantText = ToolCallParser.stripThinking(completion.content)
                 ctx.memory.addAssistantMessage(assistantText)
-                ctx.transcript?.writeAssistantMessage(assistantText, ctx.stats.iterations)
+                ctx.transcript?.writeAssistantMessage(
+                    assistantText, ctx.stats.iterations,
+                    ctx.stats.totalInputTokens, ctx.stats.totalOutputTokens
+                )
 
                 // Check for replan request
                 if (assistantText.contains("Replan Needed:", ignoreCase = true)) {
@@ -722,6 +733,11 @@ class PlanExecuteStrategy(
 
         val reflection = ToolCallParser.stripThinking(completion.content)
         ctx.memory.addAssistantMessage(reflection)
+
+        ctx.transcript?.writeAssistantMessage(
+            reflection, ctx.stats.iterations,
+            ctx.stats.totalInputTokens, ctx.stats.totalOutputTokens
+        )
 
         // Store reflection as insight
         ctx.memoryManager?.remember(

@@ -93,6 +93,20 @@ class ServerCommand : Runnable {
     )
     var daemonPort: Int = 31777
 
+    @CommandLine.Option(
+        names = ["--log-level"],
+        description = ["Server log level (OFF, FATAL, ERROR, WARN, INFO, DEBUG, TRACE)"],
+        required = false
+    )
+    var logLevel: String = "INFO"
+
+    @CommandLine.Option(
+        names = ["--log-max-files"],
+        description = ["Maximum number of rolling server log files"],
+        required = false
+    )
+    var logMaxFiles: Int = 5
+
     override fun run() {
         if (!WorkspaceManager.isLogRootDirInitialized) {
             val serverLogDir: Path = Path.of(System.getProperty("user.home"), ".akiba", "logs", "server")
@@ -107,12 +121,12 @@ class ServerCommand : Runnable {
             val configFileToLoad: String = if (File(operatorConfigFile).isFile) {
                 org.iotsplab.akiba.Main.mainConfigPath
             } else {
-                val binariesRoot = Path.of(binRoot)
-                Files.createDirectories(binariesRoot.resolve("original"))
-                Files.createDirectories(binariesRoot.resolve("processed"))
-                val binariesRootJson = binariesRoot.toAbsolutePath().toString()
-                    .replace("\\", "\\\\")
-                    .replace("\"", "\\\"")
+                // Create the legacy-binary directories so initBinDirectories won't
+                // complain; initBinDirectories will auto-compute the actual path.
+                Path.of(binRoot).let { root ->
+                    Files.createDirectories(root.resolve("original"))
+                    Files.createDirectories(root.resolve("processed"))
+                }
 
                 val syntheticConfig = """
                     {
@@ -123,7 +137,6 @@ class ServerCommand : Runnable {
                         "globalConsoleLogLevel": "INFO",
                         "globalFileLogLevel": "DEBUG",
                         "general": {
-                          "binariesRoot": "$binariesRootJson",
                           "importRoot": null,
                           "processor": "n/a",
                           "autoAnalysisTimeout": 180,
@@ -175,7 +188,9 @@ class ServerCommand : Runnable {
             dbUser = dbUser,
             dbPassword = dbPassword,
             daemonHost = daemonHost,
-            daemonPort = daemonPort
+            daemonPort = daemonPort,
+            serverLogLevel = logLevel,
+            serverLogMaxFiles = logMaxFiles
         ))
     }
 }

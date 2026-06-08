@@ -25,7 +25,7 @@ data class Configs (
     var globalConsoleLogLevel: String = "INFO",
     var globalFileLogLevel: String = "DEBUG",
 
-    var general: General? = null,
+    var general: General? = General(),
     var withGhidraProject: WithGhidraProject? = null,
     var sqlSource: SqlSource = SqlSource(),
     /** Global LLM configuration shared by all AgentModules. */
@@ -41,8 +41,8 @@ data class Configs (
 
 data class General(
     // Root directory saving the binaries. When importing binaries, Akiba will copy them into a directory and rename
-    // them with ids, this refers to the directory
-    var binariesRoot: String = ".",
+    // them with ids. If left empty, it is auto-computed as ~/.akiba/binaries/<username>/<instance>/
+    var binariesRoot: String = "",
     // Root directory of files to be imported. When importing binaries, Akiba will resolve relative paths based on this
     // path. This will not be used if the task is not an import task
     var importRoot: String? = null,
