@@ -24,13 +24,14 @@ data class LLMProviderInfo(
 /** Request body for adding/updating a key entry. */
 data class AddKeyEntryRequest(
     val provider: String,
-    val modelName: String,
+    val modelNames: List<String>,
     val baseUrl: String? = null,
     val apiKey: String
 )
 
 /** Non-sensitive view of a key entry stored on disk. */
 data class StoredKeyEntryResponse(
+    val id: String,
     val provider: String,
     val modelNames: List<String>,
     val baseUrl: String?
@@ -63,6 +64,7 @@ fun Route.llmConfigRoutes() {
         call.respond(mapOf(
             "keys" to entries.map {
                 StoredKeyEntryResponse(
+                    id = it.id,
                     provider = it.provider,
                     modelNames = it.modelNames,
                     baseUrl = it.baseUrl
@@ -135,10 +137,10 @@ fun Route.llmConfigRoutes() {
             return@post
         }
 
-        if (req.provider.isBlank() || req.modelName.isBlank() || req.apiKey.isBlank()) {
+        if (req.provider.isBlank() || req.modelNames.isEmpty() || req.modelNames.all { it.isBlank() } || req.apiKey.isBlank()) {
             call.respond(
                 HttpStatusCode.BadRequest,
-                mapOf("error" to "provider, modelName and apiKey are required")
+                mapOf("error" to "provider, modelNames and apiKey are required")
             )
             return@post
         }
@@ -146,7 +148,7 @@ fun Route.llmConfigRoutes() {
         LLMKeyFileStore.addOrUpdate(
             LLMKeyFileStore.KeyEntry(
                 provider = req.provider,
-                modelNames = listOf(req.modelName),
+                modelNames = req.modelNames.filter { it.isNotBlank() },
                 baseUrl = req.baseUrl?.takeIf { it.isNotBlank() },
                 apiKey = req.apiKey
             )

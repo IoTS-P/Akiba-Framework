@@ -1,9 +1,12 @@
 package org.iotsplab.akiba.server
 
+import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
+import io.ktor.server.plugins.PayloadTooLargeException
 import io.ktor.server.plugins.contentnegotiation.*
+import io.ktor.server.plugins.statuspages.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.websocket.*
@@ -12,6 +15,7 @@ import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import org.apache.logging.log4j.Level
 import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.Logger
 import org.apache.logging.log4j.core.LoggerContext
 import org.apache.logging.log4j.core.appender.RollingFileAppender
 import org.apache.logging.log4j.core.appender.rolling.DefaultRolloverStrategy
@@ -33,6 +37,8 @@ import org.iotsplab.akiba.server.routes.llmConfigRoutes
 import org.iotsplab.akiba.server.routes.runtimeConfigRoutes
 
 object AkibaServer {
+    private val logger: Logger = LogManager.getLogger("AkibaServer")
+
     fun start(config: org.iotsplab.akiba.server.ServerConfig) {
         val dbConfig = ServerDbConfig(
             config.dbHost, config.dbPort, config.dbName, config.dbUser, config.dbPassword
@@ -52,6 +58,19 @@ object AkibaServer {
             }
 
             install(WebSockets)
+
+            // Catch 413 (Request Entity Too Large) and return a JSON error body
+            // so the frontend gets a structured response instead of a raw Netty
+            // hang-up.
+            install(StatusPages) {
+                exception<PayloadTooLargeException> { call, cause ->
+                    logger.warn("413: {}", cause.message ?: "Request entity too large")
+                    call.respond(
+                        HttpStatusCode.PayloadTooLarge,
+                        mapOf("error" to "Upload too large. Please upload fewer or smaller files per request.")
+                    )
+                }
+            }
 
             routing {
                 get("/") {

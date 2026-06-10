@@ -42,6 +42,7 @@ object LLMKeyFileStore {
 
     /** A single entry in the on-disk key file. */
     data class KeyEntry(
+        val id: String = java.util.UUID.randomUUID().toString(),
         val provider: String,
         val modelNames: List<String>,
         val baseUrl: String?,
@@ -127,6 +128,11 @@ object LLMKeyFileStore {
         return load().find {
             it.provider == provider && it.modelNames.contains(modelName)
         }
+    }
+
+    /** Find a single entry by its unique UUID. */
+    fun findById(id: String): KeyEntry? {
+        return load().find { it.id == id }
     }
 
     /** Restrict file access to the owner only (600 on POSIX). */

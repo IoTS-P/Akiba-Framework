@@ -133,6 +133,8 @@ class Main : Runnable {
 
         @JvmStatic
         fun main(args: Array<String>): Unit = runBlocking {
+            println(System.getenv())
+
             val source = Main::class.java.protectionDomain.codeSource
             val jarFile = source.location.toURI()
             val appHome = java.io.File(jarFile).parentFile.parentFile.absolutePath

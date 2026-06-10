@@ -55,6 +55,7 @@ dependencies {
     implementation("io.ktor:ktor-server-cors:3.4.2")
     implementation("io.ktor:ktor-server-compression:3.4.2")
     implementation("io.ktor:ktor-server-content-negotiation:3.4.2")
+    implementation("io.ktor:ktor-server-status-pages:3.4.2")
 
     // Ktor client supports (for internal use)
     implementation("io.ktor:ktor-client-core:3.4.2")

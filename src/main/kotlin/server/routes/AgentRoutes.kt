@@ -11,7 +11,18 @@ import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.data.database.AgentDatabaseClient.SessionInfo
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.llm.agent.akibaAgent
+import org.iotsplab.akiba.llm.client.LLMConfig
+import org.iotsplab.akiba.llm.client.LLMProvider
+import org.iotsplab.akiba.llm.config.LLMKeyFileStore
 import org.iotsplab.akiba.llm.memory.persistentChatMemory
+import org.iotsplab.akiba.llm.agent.AgentModule
+import org.iotsplab.akiba.llm.tool.BuiltInTools
+import org.iotsplab.akiba.llm.tool.ListModulesTool
+import org.iotsplab.akiba.llm.tool.QueryGhidraAPITool
+import org.iotsplab.akiba.llm.tool.QuerySessionHistoryTool
+import org.iotsplab.akiba.llm.tool.QueryMemoriesTool
+import org.iotsplab.akiba.llm.tool.Tool
+import org.iotsplab.akiba.llm.tool.RunScriptTool
 
 // ============================================================
 //  Request / Response DTOs
@@ -38,7 +49,9 @@ data class AgentMessageResponse(
     val messageIndex: Int,
     val role: String,
     val content: String?,
-    val createdAt: String?
+    val createdAt: String?,
+    val toolName: String? = null,
+    val toolResult: String? = null
 )
 
 data class ChatRequest(
@@ -55,6 +68,25 @@ data class ChatResponse(
     val iterations: Int,
     val tokenUsage: Map<String, Int>?
 )
+
+/**
+ * Minimal [AgentModule] used by the interactive chat agent.
+ * Provides no real task but gives access to [BuiltInTools] and
+ * the session's [Program] (if a binary was selected).
+ */
+private class ChatAgentModule(
+    dbClient: DatabaseClient,
+    program: ghidra.program.model.listing.Program? = null,
+    id: Int = -1
+) : AgentModule(
+    id = id,
+    program = program,
+    dbClient = dbClient
+) {
+    override fun taskPrompt(): String = ""
+    override fun defineTools(): List<Tool> = emptyList()
+    override fun includeBuiltInTools(): Boolean = true
+}
 
 private const val DEFAULT_AGENT_SYSTEM_PROMPT =
     "You are Akiba's interactive assistant. Help the user reason about " +
@@ -125,16 +157,8 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 val agentDbClient = AgentDatabaseClient(dbClient)
                 agentDbClient.getMessages(id, fromIndex, limit)
             }
-            val filtered = msgs.filter { it.role != "system" && it.role != "tool" }
-            call.respond(mapOf("messages" to filtered.map {
-                AgentMessageResponse(
-                    messageId = it.messageId,
-                    messageIndex = it.messageIndex,
-                    role = it.role,
-                    content = it.content,
-                    createdAt = it.createdAt
-                )
-            }))
+            val filtered = msgs.filter { it.role != "system" }
+            call.respond(mapOf("messages" to filtered.map { it.toMessageResponse() }))
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             if (e.statusCode == HttpStatusCode.NotFound) {
                 call.respond(HttpStatusCode.NotFound, mapOf("error" to "Session not found"))
@@ -189,18 +213,48 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             val (result, msgs) = withContext(Dispatchers.Default) {
                 withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                     val agentDbClient = AgentDatabaseClient(dbClient)
+                    val sessionInfo = agentDbClient.getSession(id)
+                    // Resolve LLM config from the saved key store using the
+                    // session's modelName (set by the frontend's LLM selector).
+                    val llmConfig = sessionInfo.modelName?.let { modelName ->
+                        LLMKeyFileStore.load().firstOrNull { entry ->
+                            entry.modelNames.any { it.equals(modelName, ignoreCase = true) }
+                        }
+                    }
+                    // Create a minimal AgentModule for the session's binary (if any)
+                    // so BuiltInTools has access to agentDbClient, dbClient, and program.
+                    val chatModule = ChatAgentModule(
+                        dbClient = dbClient,
+                        id = sessionInfo.binaryId ?: -1
+                        // program = … would require loading from Ghidra in a subprocess
+                    )
+                    // Register all built-in tools via the module
+                    val toolList = BuiltInTools.all(chatModule, agentDbClient).filter { it.name != "run_shell" }
+
                     val agent = akibaAgent {
-                        fromRuntimeOrGlobalConfig()
+                        if (llmConfig != null) {
+                            val provider = LLMProvider.fromString(llmConfig.provider)
+                                ?: throw IllegalStateException("Unknown LLM provider: ${llmConfig.provider}")
+                            config(LLMConfig(
+                                provider = provider,
+                                modelName = llmConfig.modelNames.first(),
+                                apiKey = llmConfig.apiKey,
+                                baseUrl = llmConfig.baseUrl
+                            ))
+                        } else {
+                            fromRuntimeOrGlobalConfig()
+                        }
+                        tools(toolList)
                         system(systemPrompt)
                         session(id)
                         memory(persistentChatMemory(agentDbClient, id))
-                        enrichSystemPrompt(false)
-                        auditToolCalls(false)
-                        maxIterations(1)
+                        enrichSystemPrompt(true)
+                        auditToolCalls(true)
+                        maxIterations(20)
                     }
                     val r = agent.run(req.content)
                     val all = agentDbClient.getMessages(id, 0, 1000)
-                        .filter { it.role == "user" || it.role == "assistant" }
+                        .filter { it.role != "system" }
                     r to all
                 }
             }
@@ -212,13 +266,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
 
             call.respond(ChatResponse(
                 sessionId = id,
-                userMessage = AgentMessageResponse(
-                    messageId = userMsg.messageId,
-                    messageIndex = userMsg.messageIndex,
-                    role = userMsg.role,
-                    content = userMsg.content,
-                    createdAt = userMsg.createdAt
-                ),
+                userMessage = userMsg.toMessageResponse(),
                 assistantMessage = AgentMessageResponse(
                     messageId = asstMsg.messageId,
                     messageIndex = asstMsg.messageIndex,
@@ -260,6 +308,76 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             call.respond(status, body)
         }
     }
+
+    // ------ Export session as Markdown -----------------------------------------
+    get("/agent/sessions/{id}/export") {
+        val instance = call.requireInstanceHeader() ?: return@get
+        val id = call.parameters["id"].orEmpty()
+        if (id.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@get
+        }
+        try {
+            val (sessionInfo, msgs) = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                val info = agentDbClient.getSession(id)
+                val messages = agentDbClient.getMessages(id, 0, 500)
+                    .filter { it.role != "system" }
+                info to messages
+            }
+            val md = buildString {
+                appendLine("# Agent Session: ${sessionInfo.sessionName ?: "Untitled"}")
+                appendLine()
+                appendLine("- **Session ID:** `$id`")
+                appendLine("- **Status:** ${sessionInfo.status}")
+                sessionInfo.modelName?.let { appendLine("- **Model:** $it") }
+                sessionInfo.binaryId?.let { appendLine("- **Binary ID:** $it") }
+                appendLine("- **Created:** ${sessionInfo.createdAt ?: "?"}")
+                appendLine("- **Updated:** ${sessionInfo.updatedAt ?: "?"}")
+                appendLine()
+                appendLine("---")
+                appendLine()
+                for (msg in msgs) {
+                    when (msg.role) {
+                        "user" -> {
+                            appendLine("## 👤 User")
+                            appendLine()
+                            appendLine(msg.content ?: "")
+                            appendLine()
+                        }
+                        "assistant" -> {
+                            appendLine("## 🤖 Akiba")
+                            appendLine()
+                            appendLine(msg.content ?: "")
+                            appendLine()
+                        }
+                        "tool" -> {
+                            val toolName = msg.toolName ?: "tool"
+                            appendLine("### 🛠 `$toolName`")
+                            val result = msg.toolResult ?: msg.content ?: ""
+                            if (result.isNotBlank()) {
+                                appendLine("```")
+                                appendLine(result.take(2000)) // truncate very long results
+                                appendLine("```")
+                            }
+                            appendLine()
+                        }
+                    }
+                }
+                appendLine("---")
+                appendLine()
+                appendLine("*Exported from Akiba*")
+            }
+            call.response.header(
+                HttpHeaders.ContentDisposition,
+                "attachment; filename=\"session_${id.take(8)}.md\""
+            )
+            call.respondText(md, ContentType.Text.Plain)
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
 }
 
 private fun SessionInfo.toResponse() = AgentSessionResponse(
@@ -269,4 +387,14 @@ private fun SessionInfo.toResponse() = AgentSessionResponse(
     modelName = modelName,
     createdAt = createdAt,
     updatedAt = updatedAt
+)
+
+private fun AgentDatabaseClient.MessageInfo.toMessageResponse() = AgentMessageResponse(
+    messageId = messageId,
+    messageIndex = messageIndex,
+    role = role,
+    content = if (role == "tool") toolResult ?: content else content,
+    createdAt = createdAt,
+    toolName = if (role == "tool") toolName else null,
+    toolResult = if (role == "tool") (toolResult ?: content) else null
 )

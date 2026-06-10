@@ -1,4 +1,3 @@
-@file:Suppress("DEPRECATION")
 package org.iotsplab.akiba.server.routes
 
 import io.ktor.http.*
@@ -20,6 +19,8 @@ import java.nio.file.StandardCopyOption
 import java.util.UUID
 
 private val logger: Logger = LogManager.getLogger("FileRoutes")
+
+private val MAX_UPLOAD_SIZE = 100L * 1024 * 1024   // 100 MB
 
 data class DeleteFileRequest(val instanceName: String = "", val fileIds: List<Long>)
 
@@ -47,6 +48,7 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
 
         try {
             // 1. Receive uploaded files
+            var totalBytes = 0L
             call.receiveMultipart().forEachPart { part ->
                 when (part) {
                     is PartData.FileItem -> {
@@ -55,7 +57,17 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
                         part.streamProvider().use { input ->
                             Files.copy(input, tempFile, StandardCopyOption.REPLACE_EXISTING)
                         }
-                        logger.debug("Received file '{}' ({} bytes)", originalName, Files.size(tempFile))
+                        val fileSize = Files.size(tempFile)
+                        totalBytes += fileSize
+                        if (totalBytes > MAX_UPLOAD_SIZE) {
+                            // Exceeded limit — clean up and let the caller know
+                            // before processing any further.
+                            throw SizeLimitExceededException(
+                                "Total upload size ${totalBytes / (1024 * 1024)} MB exceeds the 100 MB limit. " +
+                                "Please upload files in smaller batches."
+                            )
+                        }
+                        logger.debug("Received file '{}' ({} bytes)", originalName, fileSize)
                         uploadedFiles.add(tempFile to originalName)
                         part.dispose()
                     }
@@ -179,11 +191,19 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
 
         // Use respondTextWriter for streaming text output
         call.respondTextWriter(contentType = ContentType.Text.EventStream) {
-            val ch = ProgressManager.getChannel(taskId)
-            if (ch != null) {
-                for (msg in ch) {
-                    write("data: $msg\n\n")
-                    flush()
+            val flow = ProgressManager.getFlow(taskId)
+            if (flow != null) {
+                coroutineScope {
+                    val collectJob = launch {
+                        flow.collect { msg ->
+                            write("data: $msg\n\n")
+                            flush()
+                        }
+                    }
+                    while (ProgressManager.getStatus(taskId) == "running") {
+                        delay(100)
+                    }
+                    collectJob.cancel()
                 }
             }
             val finalStatus = ProgressManager.getStatus(taskId)
@@ -370,3 +390,6 @@ private suspend fun runImportSubprocess(
 }
 
 private val mapper = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
+
+/** Thrown when the total size of uploaded files exceeds [FileRoutes.MAX_UPLOAD_SIZE]. */
+private class SizeLimitExceededException(message: String) : Exception(message)
