@@ -4,6 +4,9 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.module.RuntimeReport
+import java.io.PrintWriter
+import java.io.StringWriter
+import java.util.HashSet
 import kotlin.system.measureTimeMillis
 
 /**
@@ -81,7 +84,7 @@ fun RunModuleTool(parent: AkibaModule): Tool = Tool(
             runBlocking {
                 // Resolve the program for the target binary
                 val targetProgram = if (targetId == parent.id) {
-                    parent.currentProgram
+                    parent.currentProgram ?: parent.getProgram(targetId)
                 } else {
                     parent.getProgram(targetId)
                         ?: return@runBlocking run {
@@ -105,10 +108,14 @@ fun RunModuleTool(parent: AkibaModule): Tool = Tool(
                 val success = instance.failureSign == AkibaModule.SUCCESS
                 @Suppress("UNCHECKED_CAST")
                 val data = report?.get(RuntimeReport.KEY_DATA) as? Map<String, Any?>
+                val errMsg = report?.get(RuntimeReport.KEY_ERR_MSG) as? String
+                val traceback = report?.get(RuntimeReport.KEY_TRACEBACK) as? String
 
                 resultJson = mapper.writeValueAsString(mapOf(
                     "success" to success,
                     "failureSign" to instance.failureSign,
+                    "error" to if (success) null else (errMsg ?: "Module finished with failureSign=${instance.failureSign} but did not report an error message"),
+                    "traceback" to traceback,
                     "data" to data,
                     "executionTimeMs" to report?.get(RuntimeReport.KEY_EXECUTION_TIME_MS)
                 ))
@@ -116,10 +123,59 @@ fun RunModuleTool(parent: AkibaModule): Tool = Tool(
         }
         resultJson
     } catch (e: ClassNotFoundException) {
-        "Error: Module class '$className' not found. Ensure the module jar is in the modules/ directory."
+        mapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "Module class '$className' not found. Ensure the module jar is in the modules/ directory.",
+            "exceptionType" to e.javaClass.name,
+            "traceback" to tracebackOf(e)
+        ))
     } catch (e: IllegalArgumentException) {
-        "Error: ${e.message}"
+        mapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to describeThrowable(e),
+            "exceptionType" to rootCause(e).javaClass.name,
+            "traceback" to tracebackOf(e)
+        ))
+    } catch (e: LinkageError) {
+        mapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "Error loading module '$className': ${describeThrowable(e)}",
+            "exceptionType" to rootCause(e).javaClass.name,
+            "traceback" to tracebackOf(e)
+        ))
     } catch (e: Exception) {
-        "Error running module '$className': ${e.message}"
+        mapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "Error running module '$className': ${describeThrowable(e)}",
+            "exceptionType" to rootCause(e).javaClass.name,
+            "traceback" to tracebackOf(e)
+        ))
     }
+}
+
+private fun rootCause(t: Throwable): Throwable {
+    var current = t
+    val seen = HashSet<Throwable>()
+    while (current.cause != null && current.cause !in seen) {
+        seen.add(current)
+        current = current.cause!!
+    }
+    return current
+}
+
+private fun describeThrowable(t: Throwable): String {
+    val root = rootCause(t)
+    val message = root.message?.takeIf { it.isNotBlank() }
+        ?: t.message?.takeIf { it.isNotBlank() }
+    return if (message != null) {
+        "${root.javaClass.simpleName}: $message"
+    } else {
+        root.javaClass.name
+    }
+}
+
+private fun tracebackOf(t: Throwable): String {
+    val sw = StringWriter()
+    t.printStackTrace(PrintWriter(sw))
+    return sw.toString()
 }

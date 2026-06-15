@@ -71,6 +71,11 @@ class RuntimeReport {
         backing[KEY_ERR_MSG] = msg
     }
 
+    /** Record a failure stack trace for diagnostics. */
+    internal fun recordTraceback(traceback: String?) {
+        backing[KEY_TRACEBACK] = traceback
+    }
+
     /** Record the moment `DatabaseClient.startTask` is invoked. */
     internal fun recordStart(time: Instant) {
         backing[KEY_START_TIME] = time
@@ -94,6 +99,9 @@ class RuntimeReport {
 
         /** Map key for the latest [AkibaModule.updateErr] message (or `null`). */
         const val KEY_ERR_MSG: String = "err_msg"
+
+        /** Map key for the stack trace captured when the module failed. */
+        const val KEY_TRACEBACK: String = "traceback"
 
         /** Map key for the [Instant] at which `DatabaseClient.startTask` was reported. */
         const val KEY_START_TIME: String = "start_time"

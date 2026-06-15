@@ -93,6 +93,15 @@ object GhidraDocsManager {
     data class TypeEntry(val pkg: String, val className: String)
     data class MemberEntry(val pkg: String, val className: String, val memberName: String)
 
+    private data class RankedApiResult(
+        val key: String,
+        val score: Int,
+        val keyword: String,
+        val category: String,
+        val display: String,
+        val detail: String? = null,
+    )
+
     /**
      * Resolve the root directory for Ghidra API docs.
      * Points to `~/.akiba/docs/ghidra_api_<version>`. The directory is
@@ -364,6 +373,147 @@ object GhidraDocsManager {
     // ============================================================
 
     /**
+     * Split a possibly compound LLM query into independent API-search keywords.
+     *
+     * LLMs often send one keyword field containing several concepts, e.g.
+     * "FunctionManager Listing getComment" or "setComment, getComment, CommentType".
+     * The docs index works best when those are searched independently.
+     */
+    fun splitSearchKeywords(raw: String): List<String> {
+        val stopWords = setOf(
+            "ghidra", "api", "class", "classes", "method", "methods", "field", "fields",
+            "for", "how", "to", "use", "using", "and", "or", "the", "a", "an",
+            "类", "方法", "函数", "字段", "接口", "枚举", "和", "或", "以及", "使用"
+        )
+        return raw
+            .replace(Regex("(?i)\\b(and|or)\\b"), ",")
+            .split(Regex("[\\s,;，；、|\\n\\r]+"))
+            .map { token -> token.trim().trim('`', '\'', '"', '(', ')', '[', ']', '{', '}') }
+            .filter { token -> token.length >= 2 && token.lowercase() !in stopWords }
+            .distinctBy { it.lowercase() }
+            .take(8)
+    }
+
+    private fun packagePriority(pkg: String): Int = when {
+        pkg.startsWith("ghidra.program.model") -> 40
+        pkg.startsWith("ghidra.program.flatapi") -> 36
+        pkg.startsWith("ghidra.app.decompiler") -> 34
+        pkg.startsWith("ghidra.app.util") -> 24
+        pkg.startsWith("ghidra.program.util") -> 22
+        pkg.startsWith("ghidra.util") -> 10
+        else -> 0
+    }
+
+    private fun classMatchScore(entry: TypeEntry, keyword: String): Int? {
+        val cls = entry.className.lowercase()
+        val kw = keyword.lowercase()
+        val base = when {
+            cls == kw -> 10_000
+            cls.startsWith(kw) -> 8_000
+            cls.contains(kw) -> 6_000
+            else -> return null
+        }
+        return base + packagePriority(entry.pkg) + keyword.length.coerceAtMost(40)
+    }
+
+    private fun memberMatchScore(entry: MemberEntry, keyword: String): Int? {
+        val member = entry.memberName.lowercase()
+        val kw = keyword.lowercase()
+        val base = when {
+            member == kw -> 7_500
+            member.startsWith(kw) -> 6_200
+            member.contains(kw) -> 4_800
+            else -> return null
+        }
+        return base + packagePriority(entry.pkg) + keyword.length.coerceAtMost(40)
+    }
+
+    private fun searchAPIMultipleKeywords(keywords: List<String>, maxResults: Int): String {
+        val typeEntries = loadTypeIndex()
+        val memberEntries = loadMemberIndex()
+        val ranked = LinkedHashMap<String, RankedApiResult>()
+        val matchedKeywords = mutableSetOf<String>()
+
+        fun addResult(item: RankedApiResult) {
+            val existing = ranked[item.key]
+            if (existing == null || item.score > existing.score) ranked[item.key] = item
+            matchedKeywords.add(item.keyword.lowercase())
+        }
+
+        for (keyword in keywords) {
+            for (entry in typeEntries) {
+                val score = classMatchScore(entry, keyword) ?: continue
+                val fqn = "${entry.pkg}.${entry.className}"
+                val category = when {
+                    entry.className.equals(keyword, ignoreCase = true) -> "exact class"
+                    entry.className.startsWith(keyword, ignoreCase = true) -> "prefix class"
+                    else -> "contains class"
+                }
+                val members = memberEntries
+                    .filter { it.pkg == entry.pkg && it.className == entry.className }
+                    .map { it.memberName }
+                    .distinct()
+                val detail = if (members.isNotEmpty()) {
+                    "members: " + members.take(12).joinToString(", ") +
+                        if (members.size > 12) ", ... +${members.size - 12}" else ""
+                } else null
+                addResult(RankedApiResult("C:$fqn", score, keyword, category, fqn, detail))
+            }
+
+            for (entry in memberEntries) {
+                val score = memberMatchScore(entry, keyword) ?: continue
+                val fqn = "${entry.pkg}.${entry.className}.${entry.memberName}"
+                val category = when {
+                    entry.memberName.equals(keyword, ignoreCase = true) -> "exact member"
+                    entry.memberName.startsWith(keyword, ignoreCase = true) -> "prefix member"
+                    else -> "contains member"
+                }
+                addResult(RankedApiResult("M:$fqn", score, keyword, category, fqn))
+            }
+        }
+
+        val sorted = ranked.values.sortedWith(
+            compareByDescending<RankedApiResult> { it.score }
+                .thenBy { it.display.length }
+                .thenBy { it.display }
+        )
+
+        val sb = StringBuilder()
+        sb.appendLine("=== Multi-keyword Ghidra API search ===")
+        sb.appendLine("Keywords: ${keywords.joinToString(", ")}")
+        sb.appendLine("Ranking: exact class > prefix class > exact member > contains class > prefix/contains member; common Ghidra program-model packages are boosted.")
+        sb.appendLine()
+
+        if (sorted.isEmpty()) {
+            val grepLines = keywords.flatMap { kw ->
+                grepJsonDocs(kw, maxLines = 5).map { "[$kw] $it" }
+            }.take(maxResults)
+            if (grepLines.isEmpty()) {
+                return "No results found for any keyword: ${keywords.joinToString(", ")}."
+            }
+            sb.appendLine("=== Grep fallback results ===")
+            grepLines.forEach { sb.appendLine("  $it") }
+            return sb.toString().trimEnd()
+        }
+
+        sb.appendLine("=== Top ranked results ===")
+        sorted.take(maxResults).forEachIndexed { idx, item ->
+            sb.appendLine("${idx + 1}. [${item.category}; keyword='${item.keyword}'] ${item.display}")
+            if (item.detail != null) sb.appendLine("   ${item.detail}")
+        }
+        if (sorted.size > maxResults) {
+            sb.appendLine("... and ${sorted.size - maxResults} more ranked results")
+        }
+
+        val missed = keywords.filter { it.lowercase() !in matchedKeywords }
+        if (missed.isNotEmpty()) {
+            sb.appendLine()
+            sb.appendLine("No indexed matches for: ${missed.joinToString(", ")}")
+        }
+        return sb.toString().trimEnd()
+    }
+
+    /**
      * Search for Ghidra types (classes/interfaces/enums) matching a keyword.
      * Uses the pre-built `type-search-index.js` for fast lookup.
      *
@@ -379,8 +529,15 @@ object GhidraDocsManager {
             return "Error: Ghidra API docs not found at '${resolveDocsRoot()}'."
         }
 
+        val splitKeywords = splitSearchKeywords(keyword)
+        if (splitKeywords.size > 1) {
+            return searchAPIMultipleKeywords(splitKeywords, maxResults)
+        }
+        val effectiveKeyword = splitKeywords.firstOrNull() ?: keyword.trim()
+        if (effectiveKeyword.isBlank()) return "Error: keyword must not be blank."
+
         val results = mutableListOf<String>()
-        val lowerKeyword = keyword.lowercase()
+        val lowerKeyword = effectiveKeyword.lowercase()
 
         // 1. Search type index for matching class names
         val typeEntries = loadTypeIndex()
@@ -389,13 +546,13 @@ object GhidraDocsManager {
         }
 
         // Partition into exact match, prefix match, and contains match
-        val exactClassMatches = typeMatches.filter { it.className.equals(keyword, ignoreCase = true) }
+        val exactClassMatches = typeMatches.filter { it.className.equals(effectiveKeyword, ignoreCase = true) }
         val prefixClassMatches = typeMatches.filter {
-            !it.className.equals(keyword, ignoreCase = true) &&
+            !it.className.equals(effectiveKeyword, ignoreCase = true) &&
                 it.className.lowercase().startsWith(lowerKeyword)
         }
         val containsClassMatches = typeMatches.filter {
-            !it.className.equals(keyword, ignoreCase = true) &&
+            !it.className.equals(effectiveKeyword, ignoreCase = true) &&
                 !it.className.lowercase().startsWith(lowerKeyword)
         }
 
@@ -452,15 +609,15 @@ object GhidraDocsManager {
         if (otherMemberMatches.isNotEmpty()) {
             // Prioritize: exact member name match first, then contains
             val exactMembers = otherMemberMatches.filter {
-                it.memberName.equals(keyword, ignoreCase = true)
+                it.memberName.equals(effectiveKeyword, ignoreCase = true)
             }
             val otherMembers = otherMemberMatches.filter {
-                !it.memberName.equals(keyword, ignoreCase = true)
+                !it.memberName.equals(effectiveKeyword, ignoreCase = true)
             }
             val sortedMembers = exactMembers + otherMembers
 
             val memberLimit = maxResults.coerceAtMost(20)
-            results.add("=== Members in other classes matching '$keyword' ===")
+            results.add("=== Members in other classes matching '$effectiveKeyword' ===")
             sortedMembers.take(memberLimit).forEach { entry ->
                 results.add("  ${entry.pkg}.${entry.className}.${entry.memberName}")
             }
@@ -471,7 +628,7 @@ object GhidraDocsManager {
 
         if (results.isEmpty()) {
             // Fallback: grep the JSON files directly
-            val grepResults = grepJsonDocs(keyword, maxLines = maxResults)
+            val grepResults = grepJsonDocs(effectiveKeyword, maxLines = maxResults)
             if (grepResults.isNotEmpty()) {
                 results.add("=== Grep results in JSON docs ===")
                 results.addAll(grepResults)
@@ -479,7 +636,7 @@ object GhidraDocsManager {
         }
 
         if (results.isEmpty()) {
-            return "No results found for '$keyword' in Ghidra API documentation."
+            return "No results found for '$effectiveKeyword' in Ghidra API documentation."
         }
 
         return results.joinToString("\n")
@@ -766,7 +923,10 @@ fun QueryGhidraAPITool(): Tool = Tool(
         appendLine("and usage patterns BEFORE writing scripts that call Ghidra APIs.")
         appendLine()
         appendLine("Actions:")
-        appendLine("  search <keyword> — find classes and members matching a keyword (case-insensitive)")
+        appendLine("  search <keyword> — find classes and members matching one or more keywords (case-insensitive)")
+        appendLine("    If keyword contains multiple terms separated by spaces, comma, semicolon, newline, or '|',")
+        appendLine("    the tool searches each term separately, de-duplicates results, and ranks the most useful")
+        appendLine("    results first: exact class > prefix class > exact member > contains class > member matches.")
         appendLine("  read_class <className> — read full documentation for a class (fields, methods, constructors)")
         appendLine()
         appendLine("IMPORTANT: Always query the API docs before writing a script if you are unsure about:")
@@ -787,6 +947,8 @@ fun QueryGhidraAPITool(): Tool = Tool(
         appendLine("=== Example workflow ===")
         appendLine("1. query_ghidra_api {\"action\":\"search\", \"keyword\":\"decompile\"}")
         appendLine("   → finds DecompInterface, DecompileResults, etc.")
+        appendLine("1b. query_ghidra_api {\"action\":\"search\", \"keyword\":\"CommentType getComment setComment\"}")
+        appendLine("   → searches all three terms separately and ranks exact class/member hits first")
         appendLine("2. query_ghidra_api {\"action\":\"read_class\", \"keyword\":\"DecompInterface\"}")
         appendLine("   → shows openProgram(), decompileFunction() signatures")
         appendLine("3. run_script with a script using the discovered API")
@@ -800,7 +962,7 @@ fun QueryGhidraAPITool(): Tool = Tool(
         ),
         ToolParameter(
             "keyword", "string",
-            "For 'search': keyword to search for. For 'read_class': class name (simple or fully-qualified).",
+            "For 'search': one keyword or multiple keywords separated by spaces, comma, semicolon, newline, or '|'; multi-keyword search is split, de-duplicated, and ranked globally. For 'read_class': class name (simple or fully-qualified).",
             required = true
         ),
         ToolParameter(

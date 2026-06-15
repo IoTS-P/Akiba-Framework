@@ -10,6 +10,7 @@ import org.iotsplab.akiba.llm.memory.MemoryType
 import org.iotsplab.akiba.llm.memory.MemoryScope
 import org.iotsplab.akiba.llm.tool.ToolCallParser
 import org.iotsplab.akiba.llm.tool.ToolRegistry
+import java.util.UUID
 import kotlin.system.measureTimeMillis
 
 // ============================================================
@@ -59,7 +60,11 @@ class StrategyContext(
     /** Optional hook invoked before every LLM chat call. Used for context compaction. */
     val beforeChatHook: (() -> Unit)? = null,
     /** Agent database client for audit / session updates. */
-    val agentDbClient: AgentDatabaseClient? = null
+    val agentDbClient: AgentDatabaseClient? = null,
+    /** Optional provider for the compacted context view sent to the model. */
+    val contextMessagesProvider: (() -> List<org.iotsplab.akiba.llm.memory.AgentChatMessage>)? = null,
+    /** Advisory detector for repeated tool outputs within the same session. */
+    val toolResultDuplicateDetector: ToolResultDuplicateDetector? = null
 ) {
     /** Accumulated counters during the loop. Mutable, shared across the strategy. */
     @Suppress("LeakingThis")
@@ -93,7 +98,7 @@ class StrategyContext(
         return try {
             client.chat(
                 systemPrompt = systemPrompt,
-                messages = memory.messages(),
+                messages = contextMessagesProvider?.invoke() ?: memory.messages(),
                 tools = if (toolRegistry.isEmpty()) null else toolRegistry.toJsonSchemas()
             )
         } catch (e: Exception) {
@@ -111,12 +116,18 @@ class StrategyContext(
      * repeating the "same" call at a later point may legitimately yield
      * a different result. We always re-execute.
      */
-    fun executeTool(toolCall: ParsedToolCall): String {
+    /** Result of executing a single tool call. */
+    data class ToolResult(
+        val output: String,
+        val durationMs: Long
+    )
+
+    fun executeToolWithDuration(toolCall: ParsedToolCall): ToolResult {
         val tool = toolRegistry.get(toolCall.name)
         if (tool == null) {
             val errMsg = "Unknown tool: ${toolCall.name}. Available: ${toolRegistry.names()}"
             transcript?.writeToolResult(toolCall.name, errMsg)
-            return errMsg
+            return ToolResult(errMsg, 0L)
         }
 
         // Write tool call to transcript
@@ -124,40 +135,58 @@ class StrategyContext(
             toolCall.name, toolCall.argumentsJson, toolCall.arguments, stats.iterations
         )
 
-        var result: String
+        var rawResult: String
         val durationMs = measureTimeMillis {
-            result = tool.safeExecute(toolCall.arguments)
+            rawResult = tool.safeExecute(toolCall.arguments)
         }
 
         stats.toolCallsMade++
 
         // Write tool result to transcript
-        transcript?.writeToolResult(toolCall.name, result, durationMs)
+        transcript?.writeToolResult(toolCall.name, rawResult, durationMs)
 
-        // Audit to database
+        val resultUuid = UUID.randomUUID().toString()
+        val stored = ToolResultContext.prepareForStorage(rawResult)
+        val duplicateDetection = toolResultDuplicateDetector?.inspect(
+            ToolResultInspectionRequest(
+                sessionId = sessionId,
+                iteration = stats.iterations,
+                toolCall = toolCall,
+                resultUuid = resultUuid,
+                stored = stored
+            )
+        )
+        var result = ToolResultContext.formatCurrentResult(rawResult, resultUuid, stored)
+        duplicateDetection?.toObservationPrefix(toolCall.name)?.let { prefix ->
+            result = "$prefix\n\n$result"
+        }
+
+        // Audit to database and store the retrievable result snapshot.
         if (auditToolCalls && sessionId != null && agentDbClient != null) {
             try {
                 agentDbClient.recordToolCall(
                     sessionId = sessionId,
+                    toolCallId = toolCall.callId,
                     toolName = toolCall.name,
                     toolArgs = toolCall.argumentsJson,
+                    resultUuid = resultUuid,
                     resultSummary = result.take(2000),
-                    success = !result.startsWith("Tool '${toolCall.name}' execution error"),
+                    resultContent = stored.content,
+                    resultOriginalBytes = stored.originalBytes,
+                    resultStoredBytes = stored.storedBytes,
+                    resultTruncated = stored.truncated,
+                    resultSha256 = stored.sha256,
+                    storagePolicy = stored.storagePolicy,
+                    success = !rawResult.startsWith("Tool '${toolCall.name}' execution error"),
                     durationMs = durationMs
                 )
             } catch (_: Exception) {}
         }
 
-        // Truncate very long results
-        if (result.length > AkibaAgent.MAX_TOOL_RESULT_LENGTH) {
-            result = result.substring(0, AkibaAgent.MAX_TOOL_RESULT_LENGTH) +
-                "\n... [truncated, ${result.length} chars total]"
-        }
-
         // Auto-remember significant tool results
         if (memoryManager != null && auditToolCalls &&
             result.length >= 100 &&
-            !result.startsWith("Tool '${toolCall.name}' execution error")
+            !rawResult.startsWith("Tool '${toolCall.name}' execution error")
         ) {
             memoryManager.remember(
                 content = "[${toolCall.name}] ${result.take(500)}",
@@ -168,8 +197,11 @@ class StrategyContext(
             )
         }
 
-        return result
+        return ToolResult(result, durationMs)
     }
+
+    // Backward-compatible wrapper
+    fun executeTool(toolCall: ParsedToolCall): String = executeToolWithDuration(toolCall).output
 
     /** Update session status in the database. */
     fun updateSessionStatus(status: String) {
@@ -288,7 +320,11 @@ class ReActStrategy : AgentStrategy {
                 }
                 else -> ToolCallParser.stripThinking(completion.content)
             }
-            ctx.memory.addAssistantMessage(assistantText)
+            ctx.memory.addAssistantMessage(
+                assistantText,
+                tokenCount = completion.tokenUsage?.outputTokenCount,
+                inputTokenCount = completion.tokenUsage?.inputTokenCount
+            )
 
             logger.info("[ReAct] Assistant (${assistantText.length} chars): ${assistantText.take(300)}...")
             ctx.transcript?.writeAssistantMessage(
@@ -317,12 +353,15 @@ class ReActStrategy : AgentStrategy {
                 for ((idx, toolCall) in batch.withIndex()) {
                     logger.info("[ReAct] Action ${idx + 1}/${batch.size}: " +
                         "${toolCall.name}(${toolCall.argumentsJson.take(200)})")
-                    val observation = ctx.executeTool(toolCall)
+                    val toolResult = ctx.executeToolWithDuration(toolCall)
+                    val observation = toolResult.output
+                    val durationMs = toolResult.durationMs
+                    val durationStr = if (durationMs > 0) ", duration=${durationMs}ms" else ""
 
                     val obsMessage = if (batch.size == 1) {
-                        "**Observation (${toolCall.name}, args=${toolCall.argumentsJson}):** $observation"
+                        "**Observation (${toolCall.name}, args=${toolCall.argumentsJson}$durationStr):** $observation"
                     } else {
-                        "**Observation (call ${idx + 1}/${batch.size}, ${toolCall.name}, args=${toolCall.argumentsJson}):** $observation"
+                        "**Observation (call ${idx + 1}/${batch.size}, ${toolCall.name}, args=${toolCall.argumentsJson}$durationStr):** $observation"
                     }
                     ctx.memory.addToolMessage(
                         toolCallId = toolCall.callId,
@@ -355,14 +394,29 @@ class ReActStrategy : AgentStrategy {
                     return result
                 }
 
-                // LLM did not provide a Final Answer nor a valid tool call.
-                logger.warn("[ReAct] No tool call or final answer detected in response. " +
-                    "Text preview: ${assistantText.take(500)}")
+                // When finishReason is "length", the LLM output was cut off
+                // (e.g. a mid-reply JSON tool call was truncated), so we must
+                // NOT conclude — the agent should keep going.
+                if (completion.finishReason == "length") {
+                    logger.warn("[ReAct] LLM response truncated (finishReason=length). " +
+                        "Requesting continuation instead of ending loop.")
+                    val note = "Your previous response was truncated because it exceeded " +
+                        "the output length limit. Continue from where you left off. " +
+                        "If you had started a tool call, please repeat it now."
+                    ctx.memory.addUserMessage(note)
+                    ctx.transcript?.writeFormatReminder(note)
+                } else {
+                    // LLM did not provide a Final Answer or valid tool call.
+                    // Do NOT end the loop — instead inject a format reminder so the
+                    // LLM has a chance to correct its output in the next turn.
+                    logger.info("[ReAct] No tool call or final answer detected. " +
+                        "Sending format reminder. Text preview: ${assistantText.take(300)}")
 
-                val toolNames = ctx.toolRegistry.names().joinToString(", ")
-                val reminder = AgentPrompts.formatReminder(toolNames)
-                ctx.memory.addUserMessage(reminder)
-                ctx.transcript?.writeFormatReminder(reminder)
+                    val toolNames = ctx.toolRegistry.names().joinToString(", ")
+                    val reminder = AgentPrompts.formatReminder(toolNames)
+                    ctx.memory.addUserMessage(reminder)
+                    ctx.transcript?.writeFormatReminder(reminder)
+                }
             }
         }
 
@@ -581,7 +635,11 @@ class PlanExecuteStrategy(
         }
 
         val planText = ToolCallParser.stripThinking(completion.content)
-        ctx.memory.addAssistantMessage(planText)
+        ctx.memory.addAssistantMessage(
+            planText,
+            tokenCount = completion.tokenUsage?.outputTokenCount,
+            inputTokenCount = completion.tokenUsage?.inputTokenCount
+        )
 
         ctx.transcript?.writeAssistantMessage(
             planText, ctx.stats.iterations,
@@ -675,7 +733,11 @@ class PlanExecuteStrategy(
                 }
 
                 val assistantText = ToolCallParser.stripThinking(completion.content)
-                ctx.memory.addAssistantMessage(assistantText)
+                ctx.memory.addAssistantMessage(
+                    assistantText,
+                    tokenCount = completion.tokenUsage?.outputTokenCount,
+                    inputTokenCount = completion.tokenUsage?.inputTokenCount
+                )
                 ctx.transcript?.writeAssistantMessage(
                     assistantText, ctx.stats.iterations,
                     ctx.stats.totalInputTokens, ctx.stats.totalOutputTokens
@@ -732,7 +794,11 @@ class PlanExecuteStrategy(
         }
 
         val reflection = ToolCallParser.stripThinking(completion.content)
-        ctx.memory.addAssistantMessage(reflection)
+        ctx.memory.addAssistantMessage(
+            reflection,
+            tokenCount = completion.tokenUsage?.outputTokenCount,
+            inputTokenCount = completion.tokenUsage?.inputTokenCount
+        )
 
         ctx.transcript?.writeAssistantMessage(
             reflection, ctx.stats.iterations,

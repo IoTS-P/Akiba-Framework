@@ -35,6 +35,7 @@ import org.iotsplab.akiba.server.routes.queryRoutes
 import org.iotsplab.akiba.server.routes.agentRoutes
 import org.iotsplab.akiba.server.routes.llmConfigRoutes
 import org.iotsplab.akiba.server.routes.runtimeConfigRoutes
+import org.iotsplab.akiba.server.routes.skillRoutes
 
 object AkibaServer {
     private val logger: Logger = LogManager.getLogger("AkibaServer")
@@ -45,7 +46,7 @@ object AkibaServer {
         )
         ServerDatabase.init(dbConfig)
         JwtService.init(config.jwtSecret)
-        ModelContextLengthService.start()
+
 
         initServerLogger(config)
 
@@ -85,10 +86,11 @@ object AkibaServer {
                     authRoutes()
                     instanceRoutes(config.daemonHost, config.daemonPort)
                     fileRoutes(config.daemonHost, config.daemonPort)
-                    workflowRoutes()
+                    workflowRoutes(config.daemonHost, config.daemonPort)
                     scriptRoutes(config.daemonHost, config.daemonPort)
                     queryRoutes(config.daemonHost, config.daemonPort)
                     agentRoutes(config.daemonHost, config.daemonPort)
+                    skillRoutes()
                     llmConfigRoutes()
                     runtimeConfigRoutes()
                 }

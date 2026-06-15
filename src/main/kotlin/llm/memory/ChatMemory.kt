@@ -19,7 +19,9 @@ data class AgentChatMessage(
     val role: String,
     val content: String,
     val toolCallId: String? = null,
-    val toolName: String? = null
+    val toolName: String? = null,
+    val tokenCount: Int? = null,
+    val inputTokenCount: Int? = null
 )
 
 /**
@@ -47,6 +49,10 @@ interface ChatMemory : AutoCloseable {
 
     /** Add an assistant message. */
     fun addAssistantMessage(content: String) = add("assistant", content)
+
+    /** Add an assistant message with known token counts (from the LLM response). */
+    fun addAssistantMessage(content: String, tokenCount: Int?, inputTokenCount: Int? = null) =
+        add(AgentChatMessage(role = "assistant", content = content, tokenCount = tokenCount, inputTokenCount = inputTokenCount))
 
     /** Add a system message. */
     fun addSystemMessage(content: String) = add("system", content)
@@ -235,7 +241,12 @@ class PersistentChatMemory(
             try {
                 agentDbClient.appendMessages(
                     sessionId,
-                    listOf(AgentDatabaseClient.MessageData(role = message.role, content = message.content))
+                    listOf(AgentDatabaseClient.MessageData(
+                        role = message.role,
+                        content = message.content,
+                        tokenCount = message.tokenCount,
+                        inputTokenCount = message.inputTokenCount
+                    ))
                 )
             } catch (e: Exception) {
                 logger.error("Failed to persist message to DB for session $sessionId", e)

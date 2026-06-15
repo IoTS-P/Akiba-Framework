@@ -38,10 +38,12 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         val moduleName: String?,
         val graphId: String?,
         val modelName: String?,
+        val projectName: String? = null,
         val createdAt: String?,
         val updatedAt: String?,
         val resumedAt: String?,
-        val completedAt: String?
+        val completedAt: String?,
+        val transcript: String? = null
     )
 
     /**
@@ -53,13 +55,15 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         sessionName: String? = null,
         binaryId: Int? = null,
         moduleName: String? = null,
-        modelName: String? = null
+        modelName: String? = null,
+        projectName: String? = null
     ): String = runBlocking {
         val body = mapOf(
             "sessionName" to sessionName,
             "binaryId" to binaryId,
             "moduleName" to moduleName,
-            "modelName" to modelName
+            "modelName" to modelName,
+            "projectName" to projectName
         )
         val response = dbClient.post("/agent/session/create", body)
         if (response.first == HttpStatusCode.OK)
@@ -114,14 +118,16 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         status: String? = null,
         sessionName: String? = null,
         graphId: String? = null,
-        modelName: String? = null
+        modelName: String? = null,
+        transcript: String? = null
     ) = runBlocking {
         val body = mapOf(
             "sessionId" to sessionId,
             "status" to status,
             "sessionName" to sessionName,
             "graphId" to graphId,
-            "modelName" to modelName
+            "modelName" to modelName,
+            "transcript" to transcript
         )
         val response = dbClient.post("/agent/session/update", body)
         if (response.first != HttpStatusCode.OK)
@@ -142,6 +148,7 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         val toolCallArgs: String?,
         val toolResult: String?,
         val tokenCount: Int?,
+        val inputTokenCount: Int? = null,
         val createdAt: String?
     )
 
@@ -152,7 +159,8 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         val toolName: String? = null,
         val toolCallArgs: String? = null,
         val toolResult: String? = null,
-        val tokenCount: Int? = null
+        val tokenCount: Int? = null,
+        val inputTokenCount: Int? = null
     )
 
     /**
@@ -326,6 +334,22 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<ContextInfo>(response.second)
         else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    // ============================================================
+    //  Transcript Append
+    // ============================================================
+
+    /**
+     * Append Markdown content to a session's transcript field.
+     * Content is concatenated to any existing transcript text.
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun appendTranscript(sessionId: String, content: String) = runBlocking {
+        val body = mapOf("sessionId" to sessionId, "content" to content)
+        val response = dbClient.post("/agent/transcript/append", body)
+        if (response.first != HttpStatusCode.OK)
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }
 
@@ -820,6 +844,42 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
     //  Tool Call Audit
     // ============================================================
 
+    data class ToolCallResultInfo(
+        val resultUuid: String,
+        val callId: Long?,
+        val sessionId: String,
+        val messageId: Long?,
+        val toolCallId: String?,
+        val toolName: String,
+        val toolArgs: String?,
+        val content: String,
+        val offset: Int,
+        val returnedChars: Int,
+        val storedChars: Int,
+        val originalBytes: Int,
+        val storedBytes: Int,
+        val truncated: Boolean,
+        val sha256: String?,
+        val storagePolicy: String?,
+        val createdAt: String?
+    )
+
+    data class ToolCallResultSummaryInfo(
+        val resultUuid: String,
+        val callId: Long?,
+        val sessionId: String,
+        val messageId: Long?,
+        val toolCallId: String?,
+        val toolName: String,
+        val toolArgs: String?,
+        val originalBytes: Int,
+        val storedBytes: Int,
+        val truncated: Boolean,
+        val sha256: String?,
+        val storagePolicy: String?,
+        val createdAt: String?
+    )
+
     /**
      * Record a tool call for auditing.
      * @return the generated call ID
@@ -829,9 +889,17 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         sessionId: String,
         messageId: Long? = null,
         nodeId: String? = null,
+        toolCallId: String? = null,
         toolName: String,
         toolArgs: String? = null,
+        resultUuid: String? = null,
         resultSummary: String? = null,
+        resultContent: String? = null,
+        resultOriginalBytes: Int? = null,
+        resultStoredBytes: Int? = null,
+        resultTruncated: Boolean? = null,
+        resultSha256: String? = null,
+        storagePolicy: String? = null,
         success: Boolean = true,
         durationMs: Long? = null
     ): Long = runBlocking {
@@ -839,15 +907,67 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
             "sessionId" to sessionId,
             "messageId" to messageId,
             "nodeId" to nodeId,
+            "toolCallId" to toolCallId,
             "toolName" to toolName,
             "toolArgs" to toolArgs,
+            "resultUuid" to resultUuid,
             "resultSummary" to resultSummary,
+            "resultContent" to resultContent,
+            "resultOriginalBytes" to resultOriginalBytes,
+            "resultStoredBytes" to resultStoredBytes,
+            "resultTruncated" to resultTruncated,
+            "resultSha256" to resultSha256,
+            "storagePolicy" to storagePolicy,
             "success" to success,
             "durationMs" to durationMs
         )
         val response = dbClient.post("/agent/tool_call/record", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<Long>(response.second)
+        else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun findToolCallResults(
+        sessionId: String,
+        resultSha256: String? = null,
+        toolName: String? = null,
+        toolArgs: String? = null,
+        limit: Int = 20
+    ): List<ToolCallResultSummaryInfo> = runBlocking {
+        val body = mapOf(
+            "sessionId" to sessionId,
+            "resultSha256" to resultSha256,
+            "toolName" to toolName,
+            "toolArgs" to toolArgs,
+            "limit" to limit
+        )
+        val response = dbClient.post("/agent/tool_call/result/find", body)
+        if (response.first == HttpStatusCode.OK)
+            mapper.readValue<List<ToolCallResultSummaryInfo>>(response.second)
+        else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun getToolCallResult(
+        resultUuid: String,
+        offset: Int = 0,
+        limit: Int = 8000,
+        grep: String? = null,
+        around: Int = 3
+    ): ToolCallResultInfo = runBlocking {
+        val body = mapOf(
+            "resultUuid" to resultUuid,
+            "offset" to offset,
+            "limit" to limit,
+            "grep" to grep,
+            "around" to around
+        )
+        val response = dbClient.post("/agent/tool_call/result/get", body)
+        if (response.first == HttpStatusCode.OK)
+            mapper.readValue<ToolCallResultInfo>(response.second)
         else
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }

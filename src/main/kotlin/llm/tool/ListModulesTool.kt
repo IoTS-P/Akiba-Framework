@@ -27,6 +27,7 @@ fun ListModulesTool(): Tool = Tool(
     val mapper = jacksonObjectMapper()
 
     try {
+        ProcedureArgumentsDeserializer.peekAllModules()
         val modules = ProcedureArgumentsDeserializer.allModules.map { (className, path) ->
             mapOf(
                 "className" to className,

@@ -241,6 +241,7 @@ class AgentBuilder {
     private var enrich: Boolean = true
     private var audit: Boolean = true
     private var agentStrategy: AgentStrategy = ReActStrategy()
+    private var duplicateDetector: ToolResultDuplicateDetector? = null
 
     /** Set the maximum iteration limit. */
     fun maxIterations(n: Int) {
@@ -255,6 +256,11 @@ class AgentBuilder {
     /** Whether to audit tool calls to the database. */
     fun auditToolCalls(value: Boolean) {
         audit = value
+    }
+
+    /** Override the default tool result duplicate detector. */
+    fun toolResultDuplicateDetector(detector: ToolResultDuplicateDetector?) {
+        duplicateDetector = detector
     }
 
     /**
@@ -330,7 +336,8 @@ class AgentBuilder {
             auditToolCalls = audit,
             strategy = agentStrategy,
             contextLength = contextLength,
-            agentDbClient = agentDbClient
+            agentDbClient = agentDbClient,
+            toolResultDuplicateDetector = duplicateDetector
         )
     }
 }

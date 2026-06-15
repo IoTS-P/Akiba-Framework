@@ -7,6 +7,9 @@ import io.ktor.server.response.respond
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.DatabaseClient
+import org.iotsplab.akiba.server.db.UserDao
+import org.iotsplab.akiba.server.security.JwtService
+import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -59,6 +62,24 @@ suspend fun ApplicationCall.requireInstanceHeader(): String? {
     return name
 }
 
+/** Current authenticated username, falling back to daemon user for legacy/no-auth calls. */
+fun ApplicationCall.currentUsernameOrDefault(): String {
+    val authHeader = request.header("Authorization") ?: return DAEMON_USER
+    if (!authHeader.startsWith("Bearer ")) return DAEMON_USER
+    val token = authHeader.substring(7)
+    val session = JwtService.validateToken(token) ?: return DAEMON_USER
+    return UserDao.getUserById(session.userId)?.username ?: DAEMON_USER
+}
+
+/** Directory name under the configured Ghidra project root for this request's user. */
+fun ApplicationCall.currentUserProjectDirectory(): Path =
+    Path.of(safePathSegment(currentUsernameOrDefault()))
+
+private fun safePathSegment(value: String): String =
+    value.replace(Regex("[^A-Za-z0-9._-]+"), "_")
+        .take(64)
+        .ifBlank { DAEMON_USER }
+
 /**
  * Per-instance locks. The daemon only allows one active database session
  * per instance, so concurrent requests targeting the same instance must be
@@ -86,10 +107,10 @@ fun <T> withDaemonSession(
     daemonHost: String,
     daemonPort: Int,
     instanceName: String? = null,
+    serialize: Boolean = true,
     block: (DatabaseClient) -> T
 ): T {
-    // Serialize per-instance to avoid daemon 423 Locked.
-    val lock = if (instanceName != null) lockFor(instanceName) else null
+    val lock = if (serialize && instanceName != null) lockFor(instanceName) else null
 
     fun doSession(): T {
         val dbClient = DatabaseClient(daemonHost, daemonPort)

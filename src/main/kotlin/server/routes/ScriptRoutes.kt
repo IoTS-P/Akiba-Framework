@@ -38,6 +38,7 @@ data class ScriptResponse(
     val id: Int,
     val name: String,
     val description: String?,
+    val author: String?,
     val code: String?,
     val codeSize: Int?,
     val language: String?,
@@ -80,13 +81,23 @@ fun Route.scriptRoutes(daemonHost: String, daemonPort: Int) {
         val instance = call.requireInstanceHeader() ?: return@get
         val limit = call.parameters["limit"]?.toIntOrNull() ?: 100
         val offset = call.parameters["offset"]?.toIntOrNull() ?: 0
+        val query = call.parameters["query"]?.trim()?.lowercase()
 
         try {
             val scripts = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
                 agentDbClient.listScripts(limit, offset)
             }
-            call.respond(mapOf("scripts" to scripts.map { it.toResponse() }))
+            val filtered = if (!query.isNullOrBlank()) {
+                scripts.filter { s ->
+                    s.name.lowercase().contains(query) ||
+                    (s.description?.lowercase()?.contains(query) == true) ||
+                    (s.author?.lowercase()?.contains(query) == true)
+                }
+            } else {
+                scripts
+            }
+            call.respond(mapOf("scripts" to filtered.map { it.toResponse() }))
         } catch (e: Exception) {
             val (status, body) = errorPayload(e)
             call.respond(status, body)
@@ -427,6 +438,7 @@ private fun ScriptInfo.toResponse() = ScriptResponse(
     id = id,
     name = name,
     description = description,
+    author = author,
     code = code,
     codeSize = codeSize,
     language = language,

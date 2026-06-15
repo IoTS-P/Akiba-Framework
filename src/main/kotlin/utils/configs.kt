@@ -262,33 +262,52 @@ object ProcedureArgumentsDeserializer: JsonDeserializer<ProcedureArguments>() {
                 return@forEach
             }
             allModules.keys.firstOrNull {
-                it.split(".").last() == mainClassAttr.split(".").last() } ?.let {
+                it != mainClassAttr && it.split(".").last() == mainClassAttr.split(".").last()
+            } ?.let {
                 throw IllegalStateException("Conflicted module main class: $it, " +
-                        "in ${allModules[mainClassAttr]} and $filename")
+                        "in ${allModules[it]} and $filename")
             }
-            globalLogger.info("Found: $mainClassAttr in ${filename.name}")
-            allModules[mainClassAttr] = filename.toPath()
+            if (allModules[mainClassAttr] != filename.toPath()) {
+                globalLogger.info("Found: $mainClassAttr in ${filename.name}")
+                allModules[mainClassAttr] = filename.toPath()
+            }
+        }
+    }
+
+    @Throws(ClassNotFoundException::class)
+    private fun canonicalModuleClassName(className: String): String {
+        allModules[className]?.let { return className }
+        peekAllModules()
+        allModules[className]?.let { return className }
+
+        val matches = allModules.keys.filter { it.substringAfterLast('.') == className }
+        return when (matches.size) {
+            1 -> matches.first()
+            0 -> className
+            else -> throw ClassNotFoundException(
+                "Ambiguous module class '$className'; use one of: ${matches.joinToString()}")
         }
     }
 
     @Throws(ClassNotFoundException::class)
     fun addJar(className: String, jarNeeded: MutableSet<URL> = mutableSetOf()) {
+        val resolvedClassName = canonicalModuleClassName(className)
         try {
-            Class.forName(className)
+            Class.forName(resolvedClassName)
             return
         } catch (_: ClassNotFoundException) {}
 
         // Find in /modules to see if there is a jar file
-        val modulePath = allModules[className]?.let {
+        val modulePath = allModules[resolvedClassName]?.let {
             if (it.isRegularFile()) it.toFile()
-            else throw ClassNotFoundException("Module not found: $className")
-        } ?: throw ClassNotFoundException("Module not found: $className")
+            else throw ClassNotFoundException("Module not found: $resolvedClassName")
+        } ?: throw ClassNotFoundException("Module not found: $resolvedClassName")
 
         if (jarNeeded.contains(modulePath.toURI().toURL()))
             return
 
         val tempLoader = URLClassLoader(arrayOf(modulePath.toURI().toURL()))
-        val mainClass = tempLoader.loadClass(className)
+        val mainClass = tempLoader.loadClass(resolvedClassName)
 
         if (AkibaModule::class.java.isAssignableFrom(mainClass)) {
             globalLogger.info("Got: ${modulePath.name}")
@@ -301,7 +320,7 @@ object ProcedureArgumentsDeserializer: JsonDeserializer<ProcedureArguments>() {
             jarNeeded.add(modulePath.toURI().toURL())
         } else
             throw ClassNotFoundException(
-                "Module invalid: $className is not a subclass of `AkibaModule`")
+                "Module invalid: $resolvedClassName is not a subclass of `AkibaModule`")
     }
 
     private fun getRequireModules(clazz: Class<*>): List<String> {
@@ -310,17 +329,35 @@ object ProcedureArgumentsDeserializer: JsonDeserializer<ProcedureArguments>() {
     }
 
     @Throws(ClassNotFoundException::class)
-    fun resolveModule(className: String) {
+    fun resolveModule(className: String): String {
+        val resolvedClassName = canonicalModuleClassName(className)
         val jarNeeded: MutableSet<URL> = mutableSetOf()
 
-        try { Class.forName(className) }
+        try { Class.forName(resolvedClassName) }
         catch (_: ClassNotFoundException) {
             // Find all Jars needed to be loaded, including dependencies
-            addJar(className, jarNeeded)
+            addJar(resolvedClassName, jarNeeded)
         }
 
         jarLoaded.addAll(jarNeeded)
         globalLogger.info("Loading modules: ${jarNeeded.map { it.file }}")
+        return resolvedClassName
+    }
+
+    @Throws(ClassNotFoundException::class)
+    @Synchronized
+    fun ensureModuleLoaded(className: String): Class<*> {
+        val loadedBefore = jarLoaded.toSet()
+        val resolvedClassName = resolveModule(className)
+        val shouldRebuildLoader = !isLoaderInitialized() || loadedBefore != jarLoaded
+        if (shouldRebuildLoader) {
+            loadAllModules(emptyList())
+        }
+        return try {
+            Class.forName(resolvedClassName)
+        } catch (_: ClassNotFoundException) {
+            loader.loadClass(resolvedClassName)
+        }
     }
 
     fun loadAllModules(tasks: List<ProcedureArguments>) {

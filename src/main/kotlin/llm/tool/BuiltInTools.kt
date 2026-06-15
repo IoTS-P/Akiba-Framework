@@ -20,9 +20,11 @@ import org.iotsplab.akiba.module.AkibaModule
  * - [QueryModuleDataTool] — query analysis results from the database
  * - [QuerySessionHistoryTool] — review past agent sessions
  * - [QueryMemoriesTool] — search the long-term memory store
+ * - [ReadHistoryToolCallTool] — retrieve stored historical tool-call results
  * - [ListModulesTool] — list all available modules
  * - [RunScriptTool] — compile and run a Kotlin script dynamically
  * - [ScriptLibraryTool] — search and run pre-built scripts from the library
+ * - [SearchSkillTool] / [ReadSkillTool] — discover installed skills and read skill files
  * - [QueryGhidraAPITool] — search and read Ghidra API documentation
  * - [RunShellTool] — execute shell commands in the module workspace
  *
@@ -50,14 +52,17 @@ object BuiltInTools {
      * override fun defineTools() = BuiltInTools.all(this)
      * ```
      */
-    fun all(parent: AgentModule, agentDbClient: AgentDatabaseClient): List<Tool> = listOf(
+    fun all(parent: AgentModule, agentDbClient: AgentDatabaseClient, username: String? = null): List<Tool> = listOf(
         RunModuleTool(parent),
         RunSubAgentTool(parent, agentDbClient),
         QueryModuleDataTool(parent),
         QuerySessionHistoryTool(agentDbClient),
         QueryMemoriesTool(agentDbClient),
+        ReadHistoryToolCallTool(agentDbClient),
         ListModulesTool(),
         ScriptLibraryTool(parent, agentDbClient),
+        SearchSkillTool(username),
+        ReadSkillTool(username),
         RunScriptTool(parent, agentDbClient),
         QueryGhidraAPITool(),
         RunShellTool(parent)
@@ -70,7 +75,7 @@ object BuiltInTools {
      * BuiltInTools.registerAll(registry, this, agentDbClient)
      * ```
      */
-    fun registerAll(registry: ToolRegistry, parent: AgentModule, agentDbClient: AgentDatabaseClient) {
-        registry.registerAll(all(parent, agentDbClient))
+    fun registerAll(registry: ToolRegistry, parent: AgentModule, agentDbClient: AgentDatabaseClient, username: String? = null) {
+        registry.registerAll(all(parent, agentDbClient, username))
     }
 }

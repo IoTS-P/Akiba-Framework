@@ -36,6 +36,8 @@ import org.iotsplab.akiba.utils.CoroutineTaskMonitor
 import org.iotsplab.akiba.utils.CoroutineTaskMonitor.Companion.asCoroutineAware
 import java.io.File
 import java.io.FileOutputStream
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Instant
@@ -52,6 +54,24 @@ import kotlin.reflect.full.findAnnotation
 import kotlin.reflect.full.primaryConstructor
 import kotlin.system.exitProcess
 import kotlin.system.measureTimeMillis
+
+private fun describeModuleThrowable(t: Throwable): String {
+    var root = t
+    val seen = HashSet<Throwable>()
+    while (root.cause != null && root.cause !in seen) {
+        seen.add(root)
+        root = root.cause!!
+    }
+    val message = root.message?.takeIf { it.isNotBlank() }
+        ?: t.message?.takeIf { it.isNotBlank() }
+    return if (message != null) "${root.javaClass.simpleName}: $message" else root.javaClass.name
+}
+
+private fun moduleTracebackOf(t: Throwable): String {
+    val sw = StringWriter()
+    t.printStackTrace(PrintWriter(sw))
+    return sw.toString()
+}
 
 /**
  * Abstract class for auto-processing tasks, providing basic functionality for loading configurations and logging.
@@ -442,18 +462,12 @@ abstract class AkibaModule (
         skipDbWrite: Boolean = false,
     ): AkibaModule {
         val moduleCtx = coroutineContext[ModuleContext.Key]
-            ?: throw IllegalStateException(
-                "callModule must be invoked from within a coroutine carrying a ModuleContext " +
-                "(typically from inside startProcess of an AkibaModule)")
+            ?: createStandaloneModuleContext(targetId)
 
         // Resolve the target class. If it is not yet on the classpath, ProcedureArgumentsDeserializer
-        // will locate the jar under modules/ and load all its dependencies.
-        ProcedureArgumentsDeserializer.resolveModule(mainClassName)
-        val mainClass: Class<*> = try {
-            Class.forName(mainClassName)
-        } catch (_: ClassNotFoundException) {
-            ProcedureArgumentsDeserializer.loader.loadClass(mainClassName)
-        }
+        // will locate the jar under modules/, rebuild the dynamic loader when needed,
+        // and load all its dependencies.
+        val mainClass: Class<*> = ProcedureArgumentsDeserializer.ensureModuleLoaded(mainClassName)
         require(AkibaModule::class.java.isAssignableFrom(mainClass)) {
             "$mainClassName is not a subclass of AkibaModule"
         }
@@ -539,7 +553,7 @@ abstract class AkibaModule (
             }
         }
 
-        kotlinx.coroutines.withContext(coroutineContext + ModuleLogContext(instance.logger)) {
+        kotlinx.coroutines.withContext(coroutineContext + moduleCtx + ModuleLogContext(instance.logger)) {
             instance.startProcess(timeout)
         }
 
@@ -556,6 +570,22 @@ abstract class AkibaModule (
         }
 
         return instance
+    }
+
+    /**
+     * Build a ModuleContext for call sites that are not already running inside
+     * ProgramManager's module coroutine (for example the interactive chat agent).
+     */
+    private fun createStandaloneModuleContext(targetId: Int): ModuleContext {
+        val contextId = when {
+            targetId >= 0 -> targetId
+            id >= 0 -> id
+            else -> throw IllegalStateException(
+                "run_module requires a selected binary or an explicit targetId"
+            )
+        }
+        val metadata = dbClient.getMetadata(contextId.toLong())
+        return ModuleContext(metadata)
     }
 
     /**
@@ -705,21 +735,30 @@ abstract class AkibaModule (
             } catch (_: CancelledException) {
                 logger.warn("Process cancelled")
             } catch (e: Exception) {
-                logger.error("Process failed: ${e.message}")
+                val detail = describeModuleThrowable(e)
+                logger.error("Process failed: $detail")
                 e.printStackTrace()
                 failureSign = FAILED
+                runtimeReport?.recordErr("Process failed: $detail")
+                runtimeReport?.recordTraceback(moduleTracebackOf(e))
                 if (hasTable)
-                    updateErr("Process failed: ${e.message}(${e.javaClass.simpleName})")
-            } catch (_: OutOfMemoryError) {
-                logger.error("Process out of memory")
+                    updateErr("Process failed: $detail")
+            } catch (e: OutOfMemoryError) {
+                val detail = describeModuleThrowable(e)
+                logger.error("Process out of memory: $detail")
                 failureSign = RUNTIME_ERROR
+                runtimeReport?.recordErr("Process out of memory: $detail")
+                runtimeReport?.recordTraceback(moduleTracebackOf(e))
                 if (hasTable)
-                    updateErr("Process out of memory")
+                    updateErr("Process out of memory: $detail")
             } catch (e: Error) {
-                logger.error("Process error: ${e.message}")
+                val detail = describeModuleThrowable(e)
+                logger.error("Process error: $detail")
                 failureSign = RUNTIME_ERROR
+                runtimeReport?.recordErr("Process error: $detail")
+                runtimeReport?.recordTraceback(moduleTracebackOf(e))
                 if (hasTable)
-                    updateErr("Process error: ${e.message}(${e.javaClass.simpleName})")
+                    updateErr("Process error: $detail")
             }
         }
 

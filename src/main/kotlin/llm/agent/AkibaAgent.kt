@@ -132,7 +132,10 @@ class AkibaAgent(
 
     /** Agent database client for audit logging and session management.
      *  Null means audits are silently skipped. */
-    val agentDbClient: AgentDatabaseClient? = null
+    val agentDbClient: AgentDatabaseClient? = null,
+
+    /** Optional tool result duplicate detector. Defaults to session-level exact-hash detection. */
+    val toolResultDuplicateDetector: ToolResultDuplicateDetector? = null
 ) {
 
     // ---- Public API ------------------------------------------------------
@@ -189,12 +192,18 @@ class AkibaAgent(
             beforeChatHook = {
                 if (autoCompact) maybeCompact()
             },
-            agentDbClient = agentDbClient
+            agentDbClient = agentDbClient,
+            contextMessagesProvider = { contextMessages() },
+            toolResultDuplicateDetector = toolResultDuplicateDetector
+                ?: DefaultToolResultDuplicateDetector(sessionId, agentDbClient, logger = logger)
         )
         return strategy.execute(ctx)
     }
 
     // ---- Context compaction ----------------------------------------------
+
+    private fun contextMessages(): List<AgentChatMessage> =
+        ToolResultContext.compactHistoricalToolMessages(memory.messages())
 
     /**
      * Compact the conversation history if the estimated token count exceeds

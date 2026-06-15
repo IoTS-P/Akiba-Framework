@@ -81,8 +81,8 @@ data class LLMConfig(
     /** Top-P nucleus sampling.  null = provider default. */
     val topP: Double? = null,
 
-    /** Maximum tokens the model may generate in a single response. */
-    val maxTokens: Int? = null,
+    /** Maximum tokens the model may generate in a single response. Default 8K. */
+    val maxTokens: Int? = 8192,
 
     /** Stop sequences.  null = no custom stop. */
     val stopSequences: List<String>? = null,

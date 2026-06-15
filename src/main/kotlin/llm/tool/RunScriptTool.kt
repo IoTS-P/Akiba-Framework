@@ -64,6 +64,13 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
         appendLine("- All Ghidra API packages (ghidra.program.model.*, ghidra.util.*, etc.) are available")
         appendLine("- Use `appendLine(text)` instead of `println()` — println output is not captured")
         appendLine("- The execute() method is `suspend` but you can call blocking Ghidra APIs directly")
+        appendLine("- Add comments for non-obvious Ghidra API usage, hard assumptions, and output structure")
+        appendLine("- Keep `saveToLibrary=false` for one-off experiments or scripts with hard-coded addresses/symbols")
+        appendLine("- If `saveToLibrary=true`, the source MUST start with metadata comments before imports:")
+        appendLine("  // @name: concise_snake_case_name")
+        appendLine("  // @author: LLM Agent")
+        appendLine("  // @description: reusable task description")
+        appendLine("  // @parameters: JSON object schema or none")
         appendLine("- IMPORTANT: You MUST NOT write scripts that invoke the decompiler (DecompInterface,")
         appendLine("  FlatDecompilerAPI, ghidra.app.decompiler.*) before the target function has been")
         appendLine("  disassembled via `disassemble_function`. Decompilation is ONLY allowed AFTER disassembly.")
@@ -154,9 +161,11 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
         ToolParameter(
             "saveToLibrary", "boolean",
             "If true, save this script to the script library for future reuse (author='LLM Agent'). " +
-                "Only set this to true when the script runs successfully and performs a useful, reusable task. " +
-                "Note: a script can only be overwritten by the same author. You cannot overwrite scripts authored by 'Akiba'. " +
-                "Defaults to false.",
+            "Only set this to true after the script runs successfully and performs a useful, reusable task. " +
+            "Do NOT save one-off scripts with hard-coded addresses, symbol names, binary-specific constants, or experimental code. " +
+            "Saved scripts must start with // @name, // @author, // @description, and // @parameters metadata comments. " +
+            "Note: a script can only be overwritten by the same author. You cannot overwrite scripts authored by 'Akiba'. " +
+            "Defaults to false.",
             required = false
         ),
         ToolParameter(
@@ -180,16 +189,24 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
 
     val mapper = jacksonObjectMapper()
 
+    if (saveToLibrary) {
+        val metadataError = validateLibraryScriptMetadata(source)
+        if (metadataError != null) {
+            return@Tool "Error: saveToLibrary=true requires reusable script metadata: $metadataError"
+        }
+    }
+
     // 1. Record the script in the per-instance DB (best-effort, before any processing)
     var executionId: Int? = null
+    var scriptDbId: Int = -1
     try {
-        val scriptId = agentDbClient.createScript(
+        scriptDbId = agentDbClient.createScript(
             name = className,
             code = source,
-            saveResult = false,
+            saveResult = true,
             maxOutputSize = 10 * 1024 * 1024
         )
-        executionId = agentDbClient.createScriptExecution(scriptId, targetId)
+        executionId = agentDbClient.createScriptExecution(scriptDbId, targetId)
         agentDbClient.updateScriptExecution(executionId, null, "running", null)
     } catch (_: Exception) {
         // Recording is best-effort; don't block execution if it fails
@@ -268,13 +285,16 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
             resultJson
         }
 
-        // Update execution record as completed
+        // Update execution record and script output
+        val outputText = (mapper.readTree(finalResult)["output"]?.asText() ?: "").take(10000)
         try {
             if (executionId != null) {
-                val output = (mapper.readTree(finalResult)["output"]?.asText() ?: "").take(10000)
-                agentDbClient.updateScriptExecution(
-                    executionId, output, "completed", null
-                )
+                agentDbClient.updateScriptExecution(executionId, outputText, "completed", null)
+            }
+        } catch (_: Exception) { }
+        try {
+            if (scriptDbId >= 0) {
+                agentDbClient.updateScriptOutput(scriptDbId, outputText, "completed")
             }
         } catch (_: Exception) { }
 
@@ -284,10 +304,14 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
                 val resultNode = mapper.readTree(finalResult)
                 val success = resultNode["success"]?.asBoolean() ?: false
                 if (success) {
+                    val libraryName = scriptMetadataValue(source, "name") ?: className
+                    val libraryDescription = scriptMetadataValue(source, "description")
+                        ?: scriptDescription
+                    val libraryAuthor = scriptMetadataValue(source, "author") ?: "LLM Agent"
                     agentDbClient.createScript(
-                        name = className,
-                        description = scriptDescription,
-                        author = "LLM Agent",
+                        name = libraryName,
+                        description = libraryDescription,
+                        author = libraryAuthor,
                         code = source,
                         language = "kotlin",
                         saveResult = true,
@@ -299,35 +323,47 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
 
         finalResult
     } catch (e: CompilationException) {
-        // Update execution record with compilation error
+        val errorMsg = "Compilation error: ${e.message}"
         try {
-            if (executionId != null) {
-                agentDbClient.updateScriptExecution(
-                    executionId, null, "failed", "Compilation error: ${e.message}"
-                )
-            }
+            if (executionId != null) agentDbClient.updateScriptExecution(executionId, null, "failed", errorMsg)
+            if (scriptDbId >= 0) agentDbClient.updateScriptOutput(scriptDbId, errorMsg, "failed")
         } catch (_: Exception) { }
         "Error: script compilation failed: ${e.message}"
     } catch (e: IllegalStateException) {
-        // Update execution record with instantiation error
+        val errorMsg = "Instantiation error: ${e.message}"
         try {
-            if (executionId != null) {
-                agentDbClient.updateScriptExecution(
-                    executionId, null, "failed", "Instantiation error: ${e.message}"
-                )
-            }
+            if (executionId != null) agentDbClient.updateScriptExecution(executionId, null, "failed", errorMsg)
+            if (scriptDbId >= 0) agentDbClient.updateScriptOutput(scriptDbId, errorMsg, "failed")
         } catch (_: Exception) { }
         "Error: script instantiation failed: ${e.message}"
     } catch (e: Exception) {
-        // Update execution record with runtime error
+        val errorMsg = "${e.javaClass.simpleName}: ${e.message}"
         try {
-            if (executionId != null) {
-                val errorMsg = "${e.javaClass.simpleName}: ${e.message}"
-                agentDbClient.updateScriptExecution(
-                    executionId, null, "failed", errorMsg
-                )
-            }
+            if (executionId != null) agentDbClient.updateScriptExecution(executionId, null, "failed", errorMsg)
+            if (scriptDbId >= 0) agentDbClient.updateScriptOutput(scriptDbId, errorMsg, "failed")
         } catch (_: Exception) { }
         "Error running script: ${e.message}"
     }
+}
+
+private fun validateLibraryScriptMetadata(source: String): String? {
+    val required = listOf("name", "author", "description", "parameters")
+    val missing = required.filter { scriptMetadataValue(source, it).isNullOrBlank() }
+    if (missing.isNotEmpty()) {
+        return "missing ${missing.joinToString(", ")} comments at the top of source"
+    }
+    return null
+}
+
+private fun scriptMetadataValue(source: String, key: String): String? {
+    for (line in source.lines()) {
+        val trimmed = line.trim()
+        if (trimmed.isBlank()) continue
+        if (!trimmed.startsWith("//")) return null
+        val prefix = "// @$key:"
+        if (trimmed.startsWith(prefix)) {
+            return trimmed.removePrefix(prefix).trim().takeIf { it.isNotBlank() }
+        }
+    }
+    return null
 }

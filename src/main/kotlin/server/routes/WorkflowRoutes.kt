@@ -10,7 +10,9 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
+import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.config.LLMKeyFileStore
+import org.iotsplab.akiba.managers.WorkspaceManager
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
@@ -256,7 +258,17 @@ private fun findAkibaScript(): String {
     return "akiba"
 }
 
-fun Route.workflowRoutes() {
+fun Route.workflowRoutes(daemonHost: String, daemonPort: Int) {
+
+    get("/workflow/projects") {
+        try {
+            val projectDirectory = call.currentUserProjectDirectory()
+            call.respond(mapOf("projects" to WorkspaceManager.listGhidraProjects(projectDirectory)))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
 
     post("/workflow/start") {
         val req = runCatching { call.receive<StartWorkflowRequest>() }
@@ -272,11 +284,23 @@ fun Route.workflowRoutes() {
 
     post("/workflow/stop/{workflowId}") {
         val workflowId = call.parameters["workflowId"] ?: ""
-        if (WorkflowManager.stopWorkflow(workflowId)) {
-            call.respond(mapOf("workflowId" to workflowId, "message" to "Workflow stopped"))
-        } else {
-            call.respond(HttpStatusCode.NotFound, mapOf("error" to "Workflow not found"))
+        val instance = call.requireInstanceHeader() ?: return@post
+        WorkflowManager.stopWorkflow(workflowId)
+        // Also cancel all active automated (non-chat) agent sessions for this instance
+        try {
+            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                val sessions = agentDbClient.listSessions(limit = 100)
+                for (s in sessions) {
+                    if (s.status == "active" && s.moduleName != null && s.moduleName != "chat") {
+                        agentDbClient.updateSession(s.sessionId, status = "completed")
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // Non-critical; workflow is already stopped
         }
+        call.respond(mapOf("workflowId" to workflowId, "message" to "Workflow stopped"))
     }
 
     get("/workflow/status/{workflowId}") {

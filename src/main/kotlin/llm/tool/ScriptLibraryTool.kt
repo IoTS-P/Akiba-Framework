@@ -22,9 +22,10 @@ import kotlin.system.measureTimeMillis
  *
  * Each `.kts` file begins with comment-style annotations:
  * ```
- * // @name: list_functions
- * // @description: List all functions in the binary
- * // @parameters: none
+* // @name: list_functions
+* // @author: Akiba
+* // @description: List all functions in the binary
+* // @parameters: none
  * ```
  *
  * ### Why use this instead of run_script?
@@ -46,6 +47,8 @@ fun ScriptLibraryTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): 
         appendLine()
         appendLine("IMPORTANT: Prefer using scripts from this library over writing custom scripts")
         appendLine("with run_script. Only write custom scripts when the library doesn't cover your need.")
+        appendLine("User-saved scripts are also listed here; only reusable scripts with metadata comments")
+        appendLine("should be saved to avoid polluting future sessions with one-off analysis code.")
         appendLine()
         appendLine("Available scripts include: binary_info, list_functions, disassemble_function,")
         appendLine("find_dangerous_calls, list_strings, get_xrefs, decompile_function, and more.")
@@ -60,6 +63,12 @@ fun ScriptLibraryTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): 
         appendLine("CRITICAL: 'parameters' MUST be a nested JSON object, NOT a string!")
         appendLine("  ✅ CORRECT: \"parameters\": {\"target\": \"main\", \"direction\": \"to\"}")
         appendLine("  ❌ WRONG:   \"parameters\": \"{\\\"target\\\": \\\"main\\\"}\"")
+        appendLine()
+        appendLine("CRITICAL: The key name is \"parameters\", NOT \"scriptArgs\"!")
+        appendLine("  ✅ CORRECT: \"action\":\"run\", \"scriptName\":\"search_strings\", \"parameters\":{\"query\":\"fmt\"}")
+        appendLine("  ❌ WRONG:   \"action\":\"run\", \"scriptName\":\"search_strings\", \"scriptArgs\":{\"query\":\"fmt\"}")
+        appendLine("  (\"scriptArgs\" is the VARIABLE name used inside scripts to READ the parameters —")
+        appendLine("   the API parameter key that carries the values is always \"parameters\".)")
     },
     parameters = listOf(
         ToolParameter(
@@ -80,7 +89,7 @@ fun ScriptLibraryTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): 
         ),
         ToolParameter(
             "parameters", "object",
-            "For 'run': optional parameters to pass to the script (as JSON object).",
+            "For 'run': the script's runtime parameters as a JSON object. Key name MUST be \"parameters\" — do NOT use \"scriptArgs\" (that is the internal variable name inside script source code, not the API key). Example: {\"target\":\"main\",\"direction\":\"to\"}.",
             required = false
         )
     )
@@ -145,7 +154,8 @@ private data class ScriptMeta(
     val author: String,
     val parameters: String,
     val source: String,
-    val className: String
+    val className: String,
+    val dbId: Int? = null   // script row id in the DB, set when loaded from library
 )
 
 /** Cached script library entries. */
@@ -169,14 +179,16 @@ private fun loadDbLibraryScripts(agentDbClient: AgentDatabaseClient): List<Scrip
             meta?.copy(
                 name = displayName,
                 description = meta.description.ifBlank { (info.description ?: "") },
-                author = meta.author.ifBlank { (info.author ?: "") }
+                author = meta.author.ifBlank { (info.author ?: "") },
+                dbId = if (meta.name == displayName) info.id else null
             ) ?: ScriptMeta(
                 name = displayName,
                 description = info.description ?: "",
                 author = info.author ?: "",
                 parameters = "none",
                 source = source,
-                className = className
+                className = className,
+                dbId = info.id
             )
         }
     } catch (_: Exception) {
@@ -327,16 +339,19 @@ private fun runLibraryScript(
 
     // Record execution in DB (best-effort)
     var executionId: Int? = null
-    try {
-        val scriptId = agentDbClient.createScript(
-            name = script.name,
-            code = sourceWithArgs,
-            saveResult = false,
-            maxOutputSize = 10 * 1024 * 1024
-        )
-        executionId = agentDbClient.createScriptExecution(scriptId, parent.id)
-        agentDbClient.updateScriptExecution(executionId, null, "running", null)
-    } catch (_: Exception) { }
+    val scriptDbId: Int = script.dbId ?: try {
+        // Fallback: if no dbId, look up the script by name from all scripts
+        agentDbClient.listScripts(limit = 500).firstOrNull { it.name == script.name }?.id
+            ?: agentDbClient.createScript(
+                name = script.name, code = sourceWithArgs, maxOutputSize = 10 * 1024 * 1024
+            )
+    } catch (_: Exception) { -1 }
+    if (scriptDbId >= 0) {
+        try {
+            executionId = agentDbClient.createScriptExecution(scriptDbId, parent.id)
+            agentDbClient.updateScriptExecution(executionId, null, "running", null)
+        } catch (_: Exception) { }
+    }
 
     return try {
         var resultJson = ""
@@ -369,11 +384,17 @@ private fun runLibraryScript(
             node?.toString() ?: resultJson
         } catch (_: Exception) { resultJson }
 
-        // Update DB record
+        val outputText = (mapper.readTree(finalResult)["output"]?.asText() ?: "").take(10000)
+
+        // Update execution record and script output
         try {
             if (executionId != null) {
-                val output = (mapper.readTree(finalResult)["output"]?.asText() ?: "").take(10000)
-                agentDbClient.updateScriptExecution(executionId, output, "completed", null)
+                agentDbClient.updateScriptExecution(executionId, outputText, "completed", null)
+            }
+        } catch (_: Exception) { }
+        try {
+            if (scriptDbId >= 0) {
+                agentDbClient.updateScriptOutput(scriptDbId, outputText, "completed")
             }
         } catch (_: Exception) { }
 
@@ -382,12 +403,16 @@ private fun runLibraryScript(
         try {
             if (executionId != null)
                 agentDbClient.updateScriptExecution(executionId, null, "failed", "Compilation: ${e.message}")
+            if (scriptDbId >= 0)
+                agentDbClient.updateScriptOutput(scriptDbId, "Compilation: ${e.message}", "failed")
         } catch (_: Exception) { }
         "Error: library script '${script.name}' compilation failed: ${e.message}"
     } catch (e: Exception) {
         try {
             if (executionId != null)
                 agentDbClient.updateScriptExecution(executionId, null, "failed", "${e.javaClass.simpleName}: ${e.message}")
+            if (scriptDbId >= 0)
+                agentDbClient.updateScriptOutput(scriptDbId, "Error: ${e.message}", "failed")
         } catch (_: Exception) { }
         "Error running library script '${script.name}': ${e.message}"
     }

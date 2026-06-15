@@ -9,6 +9,7 @@ import org.iotsplab.akiba.llm.memory.MemoryManager
 import org.iotsplab.akiba.llm.memory.inMemoryChatMemory
 import org.iotsplab.akiba.llm.memory.persistentChatMemory
 import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.llm.tool.BuiltInTools
 import org.iotsplab.akiba.llm.tool.Tool
@@ -225,6 +226,13 @@ abstract class AgentModule(
     protected open fun includeBuiltInTools(): Boolean = true
 
     /**
+     * Username used for user-scoped built-in resources such as skills.
+     * Batch modules normally fall back to the default `akiba` user; interactive
+     * chat modules can override this with the authenticated web username.
+     */
+    protected open fun toolUsername(): String? = null
+
+    /**
      * Maximum ReAct iterations for the agent.
      * Can be overridden or set via [WithAgentMaxIterations] annotation.
      */
@@ -292,7 +300,8 @@ abstract class AgentModule(
                 sessionName = "${this.javaClass.simpleName}-$id",
                 binaryId = id,
                 moduleName = this.javaClass.simpleName,
-                modelName = resolveModelName()
+                modelName = resolveModelName(),
+                projectName = WorkspaceManager.activeProjectName
             )
         } catch (e: Exception) {
             logger.warn("Failed to create agent session: ${e.message}")
@@ -324,7 +333,7 @@ abstract class AgentModule(
 
         // Register built-in tools (sub-module, sub-agent, DB queries)
         if (includeBuiltInTools()) {
-            BuiltInTools.registerAll(toolRegistry, this, agentDbClient)
+            BuiltInTools.registerAll(toolRegistry, this, agentDbClient, toolUsername())
         }
 
         logger.info("Agent tools: ${toolRegistry.names()}")
@@ -333,7 +342,7 @@ abstract class AgentModule(
         val strategy = agentStrategy()
         logger.info("Agent strategy: ${strategy.name}")
 
-        val transcript = AgentTranscriptWriter(logDir)
+        val transcript = AgentTranscriptWriter(agentDbClient, sessionId)
         val modelName = resolveModelName()
 
         val contextLength = ModelContextLengthService.getContextLength(

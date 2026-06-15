@@ -67,7 +67,12 @@ object WorkspaceManager: Closeable {
     private var proj: GhidraProject? = null
     val project: GhidraProject
         get() = proj!!
+    val isProjectInitialized: Boolean
+        get() = proj != null
     lateinit var projectName: String
+    private var activeProjectDirectory: Path? = null
+    val activeProjectName: String?
+        get() = if (::projectName.isInitialized) projectName else null
     // Global language provider, we only need one
     lateinit var languageProvider: LanguageProvider
 
@@ -359,6 +364,96 @@ object WorkspaceManager: Closeable {
         }
 
         return true
+    }
+
+    fun listGhidraProjects(projectDirectory: Path): List<String> {
+        val root = normalizeInteractiveProjectDirectory(projectDirectory)
+        if (!Files.isDirectory(root)) return emptyList()
+        return Files.list(root).use { stream ->
+            stream
+                .filter { it.isRegularFile() && it.fileName.toString().endsWith(".gpr") }
+                .map { it.fileName.toString().removeSuffix(".gpr") }
+                .sorted()
+                .toList()
+        }
+    }
+
+    fun openOrCreateInteractiveProject(name: String, createNew: Boolean, projectDirectory: Path): GhidraProject {
+        requireValidProjectName(name)
+        if (!initializeGhidra()) error("Failed to initialize Ghidra")
+        if (!initGhidraProjectDir()) error("Failed to initialize Ghidra project directory")
+
+        val root = normalizeInteractiveProjectDirectory(projectDirectory)
+        Files.createDirectories(root)
+        val grpFile = root.resolve("$name.gpr")
+        val repFile = root.resolve("$name.rep")
+
+        if (activeProjectName == name && activeProjectDirectory == root && proj != null) return proj!!
+        proj?.close()
+
+        proj = if (createNew) {
+            if (grpFile.exists() || repFile.exists()) {
+                throw IllegalArgumentException("Ghidra project '$name' already exists in '${root.fileName}'; choose 'Use existing project' or a different name")
+            }
+            GhidraProject.createProject(root.toString(), name, false)
+        } else {
+            if (grpFile.exists() && repFile.isDirectory()) {
+                GhidraProject.openProject(root.toString(), name)
+            } else {
+                GhidraProject.createProject(root.toString(), name, false)
+            }
+        }
+        projectName = name
+        activeProjectDirectory = root
+        return proj!!
+    }
+
+    fun ensureProgramForBinary(dbClient: DatabaseClient, binaryId: Int): ghidra.program.model.listing.Program? {
+        if (!::binaryPath.isInitialized || !::processedBinaryPath.isInitialized) initBinDirectories()
+        dbClient.getMetadata(binaryId.toLong())
+        val path = processedBinaryPath.resolve("$binaryId.bin").let {
+            if (it.exists()) it else binaryPath.resolve("$binaryId.bin")
+        }
+        if (!path.exists()) return null
+
+        val expectedName = "$binaryId-${path.fileName}"
+        project.projectData.rootFolder.files.firstOrNull { it.name == expectedName || it.name.startsWith("$binaryId-") }
+            ?.let { return project.openProgram("/", it.name, false) }
+
+        val program = ProgramManager.loadProgram(path, project) ?: return null
+        val txId = program.startTransaction("agent-session-import")
+        try {
+            program.name = expectedName
+        } finally {
+            program.endTransaction(txId, true)
+        }
+        try {
+            ProgramManager.autoAnalyzeInTimeout(program, mainConf.autoAnalysisTimeout)
+        } catch (_: Exception) { }
+        try {
+            project.saveAs(program, "/", program.name, true)
+        } catch (_: Exception) { }
+        return program
+    }
+
+    private fun normalizeInteractiveProjectDirectory(projectDirectory: Path): Path {
+        val base = Path.of(projectConf.projectRoot).toAbsolutePath().normalize()
+        val root = if (projectDirectory.isAbsolute) {
+            projectDirectory.toAbsolutePath().normalize()
+        } else {
+            base.resolve(projectDirectory).normalize()
+        }
+        require(root.startsWith(base)) {
+            "Ghidra project directory must stay under configured project root"
+        }
+        return root
+    }
+
+    private fun requireValidProjectName(name: String) {
+        require(Regex("^[A-Za-z0-9._-]{1,64}$").matches(name)) {
+            "Invalid project name. Use 1-64 characters: letters, digits, dot, underscore or hyphen"
+        }
+        require(!name.contains("..")) { "Invalid project name" }
     }
 
     @OptIn(ExperimentalPathApi::class)

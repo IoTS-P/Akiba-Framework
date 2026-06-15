@@ -97,11 +97,59 @@ class Tool(
      * an error message instead of propagating the exception.
      */
     fun safeExecute(args: Map<String, Any?>): String {
+        validateArguments(args)?.let { return it }
         return try {
             execute(args)
         } catch (e: Exception) {
             "Tool '$name' execution error: ${e.message}"
         }
+    }
+
+    private fun validateArguments(args: Map<String, Any?>): String? {
+        val schemaNames = parameters.map { it.name }.toSet()
+        val provided = args.keys.sorted()
+
+        val missing = parameters
+            .filter { it.required && (!args.containsKey(it.name) || args[it.name] == null) }
+            .map { it.name }
+        if (missing.isNotEmpty()) {
+            return buildString {
+                append("Tool argument error for '$name': missing required parameter(s): ")
+                append(missing.joinToString(", ") { "'$it'" })
+                append(". Provided argument keys: ")
+                append(if (provided.isEmpty()) "<none>" else provided.joinToString(", ") { "'$it'" })
+                append(". Use the exact parameter names from this tool's schema.")
+            }
+        }
+
+        for (param in parameters) {
+            val value = args[param.name]
+            val enum = param.enum
+            if (enum != null && value is String && enum.none { it.equals(value, ignoreCase = false) }) {
+                return "Tool argument error for '$name': parameter '${param.name}' has invalid value '$value'. " +
+                    "Allowed values: ${enum.joinToString(", ")}."
+            }
+        }
+
+        val unknown = provided.filter { it !in schemaNames }
+        if (unknown.isNotEmpty()) {
+            val hints = unknown.mapNotNull { key ->
+                when {
+                    key == "scriptArgs" && "parameters" in schemaNames ->
+                        "'scriptArgs' is the internal variable name inside library scripts; use tool parameter 'parameters' instead."
+                    key == "params" && "parameters" in schemaNames ->
+                        "Use 'parameters' instead of 'params'."
+                    key == "args" && "arguments" in schemaNames ->
+                        "Use 'arguments' instead of 'args'."
+                    else -> null
+                }
+            }
+            if (hints.isNotEmpty()) {
+                return "Tool argument error for '$name': unexpected parameter(s): " +
+                    unknown.joinToString(", ") { "'$it'" } + ". " + hints.joinToString(" ")
+            }
+        }
+        return null
     }
 }
 
