@@ -413,7 +413,9 @@ class BinaryAnalyst(
 | 工具名称 | 描述 | 参数 |
 |---------|------|------|
 | `run_module` | 在当前或不同二进制文件上运行另一个 AkibaModule | `className` (必需), `targetId`, `configJson`, `timeout`, `skipDbWrite` |
-| `run_sub_agent` | 生成子 LLM agent 处理子任务 | `systemPrompt` (必需), `taskPrompt` (必需), `toolNames`, `maxIterations` |
+| `spawn_sub_agent` | 异步生成子 LLM agent（模板路径或自由路径），立即返回 handle | `templateId` 或 `systemPrompt`+`taskPrompt`, `inputs`, `overrides`, `toolNames`, `maxIterations` |
+| `await_agent` | 等待单个子 agent 达到目标状态 | `childId` (必需), `until`, `timeoutMs`, `pollMs` |
+| `await_multiple_children` | 批量等待多个子 agent（任一完成或全部完成即返回） | `childIds` (必需), `mode` (any/all/any_idle/all_idle), `until`, `timeoutMs`, `pollMs` |
 | `query_module_data` | 从数据库查询分析结果 | `tableName` (必需), `columns` |
 | `query_session_history` | 查看过去的 agent 会话或获取消息 | `sessionId`, `binaryId`, `limit` |
 | `query_memories` | 搜索长期记忆存储 | `sessionId`, `memoryType`, `key`, `minImportance`, `limit` |
@@ -436,9 +438,21 @@ class BinaryAnalyst(
 }
 ```
 
-#### run_sub_agent
+#### spawn_sub_agent
 
-生成具有独立对话历史和工具的子 agent。
+异步生成子 LLM agent 并立即返回 handle（用于后续 `await_agent`）。
+
+模板路径（推荐）：
+
+```json
+{
+  "templateId": "binary_crypto_worker",
+  "inputs": { "addressRange": "0x401000-0x402000" },
+  "name": "crypto-sweep"
+}
+```
+
+自由路径（不依赖模板）：
 
 ```json
 {

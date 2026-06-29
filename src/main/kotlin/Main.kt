@@ -162,14 +162,54 @@ class Main : Runnable {
         @JvmStatic
         fun interruptHandler() {
             globalLogger.error("Interrupted by user")
+            // 1. Tell ProgramManager to stop accepting new binaries. New
+            //    jobs launched after this flag is set will bail out
+            //    immediately (see ProgramManager.startProcess), so we
+            //    never start work that cannot finish.
+            try {
+                ProgramManager.stopRequested = true
+            } catch (_: Exception) {}
+            // 2. Cancel every in-flight module's task monitor. This is
+            //    the key step: each registered `taskGlobalMonitor` in
+            //    `ActiveTaskMonitors` wraps both a Ghidra `TaskMonitor`
+            //    and a coroutine `Job`. Calling `cancel()` propagates
+            //    to both layers, so the Ghidra analyzer stack unwinds
+            //    at its next `checkCancelled()` checkpoint and the
+            //    coroutine unwinds at its next suspension point. This
+            //    is much faster than waiting for the analyzer to
+            //    finish on its own (which can take minutes for deep
+            //    disassembly).
+            try {
+                val cancelled = org.iotsplab.akiba.utils.ActiveTaskMonitors.cancelAll()
+                globalLogger.info(
+                    "Sent cancel to $cancelled active task monitor(s)"
+                )
+            } catch (e: Exception) {
+                globalLogger.warn("cancelAll() failed: ${e.message}")
+            }
+            // 3. Drain in-flight coroutines. With the monitors
+            //    cancelled, Ghidra analyzers and module coroutines
+            //    unwind quickly (a few seconds), so the drain window
+            //    can be much shorter than the 60-second timeout in the
+            //    previous design. We still cap at 30 seconds so a
+            //    pathological module cannot hang the JVM indefinitely.
+            try {
+                ProgramManager.drainGracefully(timeoutMs = 30_000L)
+            } catch (e: Exception) {
+                globalLogger.warn("Drain failed: ${e.message}")
+            }
+            // 4. Now safe to flush the DB connection, close the Ghidra
+            //    project, and exit. `finally()` is unchanged from before;
+            //    it just runs *after* the in-flight binaries have
+            //    completed their cleanup, so the saved counts and log
+            //    directory layout match the actual on-disk state.
             try {
                 finally()
-
             } catch (_: Exception) {}
             globalLogger.info("Tested ${ProgramManager.successCount + ProgramManager.failureCount} cases")
             globalLogger.info("Success: ${ProgramManager.successCount}")
             globalLogger.info("Failed: ${ProgramManager.failureCount}")
-            exitProcess(1)
+            exitProcess(0)
         }
 
         fun finally() {

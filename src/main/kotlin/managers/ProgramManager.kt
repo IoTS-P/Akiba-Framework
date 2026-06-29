@@ -75,6 +75,65 @@ object ProgramManager {
 
     val programCoroutineScope: CoroutineScope = CoroutineScope(Dispatchers.IO)
 
+    /**
+     * Set by [Main.interruptHandler] when the user clicks Stop or the
+     * subprocess receives SIGINT/SIGTERM. Coroutines in
+     * [programCoroutineScope] consult this flag at well-defined checkpoints
+     * (entry of [workOnBinary], end of a module loop iteration) so that an
+     * in-flight binary can finish its cleanup — moving the log directory to
+     * `runtime_error/`, releasing the Ghidra program, and reporting the
+     * final status — before the JVM exits.
+     *
+     * Marked `@Volatile` because the writer is the JVM's signal-handler
+     * thread, while readers run on the coroutine dispatcher threads.
+     */
+    @Volatile
+    var stopRequested: Boolean = false
+
+    /**
+     * Reset the stop flag. Currently only used by tests; production code
+     * runs the program manager once per subprocess lifetime.
+     */
+    fun resetStopFlag() {
+        stopRequested = false
+    }
+
+    /**
+     * Block the calling thread until all coroutines launched on
+     * [programCoroutineScope] have completed.
+     *
+     * This is called from the JVM's signal-handler thread (when the user
+     * presses Ctrl-C or the route's `stopWorkflow` sends SIGINT) to give
+     * the in-flight `workOnBinary` calls a chance to finalize their state
+     * on disk before the JVM exits.
+     *
+     * @param timeoutMs Maximum time to wait for the drain. After the
+     *                  timeout the call returns regardless, so that a
+     *                  misbehaving task cannot hang the entire shutdown
+     *                  indefinitely.
+     */
+    fun drainGracefully(timeoutMs: Long = 60_000L) {
+        if (!::taskSemaphore.isInitialized) {
+            // `startProcess` was never called, nothing to drain.
+            return
+        }
+        globalLogger.info("Draining in-flight binaries (timeout=${timeoutMs}ms)...")
+        val job = programCoroutineScope.coroutineContext[Job]
+        runBlocking {
+            try {
+                withTimeoutOrNull(timeoutMs) {
+                    job?.children?.forEach { it.join() }
+                } ?: globalLogger.warn(
+                    "Drain timed out after ${timeoutMs}ms; " +
+                        "some in-flight binaries may not have been finalized."
+                )
+            } catch (e: Exception) {
+                globalLogger.warn("Drain interrupted: ${e.message}")
+            }
+        }
+        globalLogger.info("Drain complete. success=${successTestCount} failure=${failureTestCount}")
+    }
+
     // TODO: Use ClassGraph to find all loaders
     private val loaderMap: Map<String, Class<out Loader>> = mapOf(
         "Raw Binary" to BinaryLoader::class.java,
@@ -237,6 +296,12 @@ object ProgramManager {
                 withContext(coroutineContext + ModuleContext(p) + GlobalContext) {
                     taskSemaphore.acquire()
                     try {
+                        if (stopRequested) {
+                            globalLogger.info(
+                                "Skipping file #${p.id} because stop was requested before this job started"
+                            )
+                            return@withContext
+                        }
                         workOnBinary(p, project)
                     } catch (e: Exception) {
                         globalLogger.error("Error while processing file #${p.id}: ${e.message}")
@@ -392,8 +457,17 @@ object ProgramManager {
             return
         }
 
+        if (stopRequested) {
+            globalLogger.info("Stop requested before #${metadata.id} started setup; skipping")
+            try { logDir.moveTo(runtimeErrorDir.resolve(logDir.fileName)) } catch (_: Exception) {}
+            ProgressReporter.report("[FILE:${metadata.id}] stopped")
+            return
+        }
+
         if (logDir.notExists())
             logDir.createDirectories()
+
+        var finalized = false
 
         // Import the program into the project
         var program: Program? = null
@@ -467,7 +541,8 @@ object ProgramManager {
         val moduleTxId = if (program != null) program!!.startTransaction("modules") else -1
 
         try {
-            for (procedure: ProcedureArguments in config.tasks) {
+            program ?. let { initialAnalysis(it) }
+            for ((procIndex, procedure) in config.tasks.withIndex()) {
                 globalLogger.info("Running ${procedure.mainClass!!.name} on #${metadata.id}")
                 val arguments = hashMapOf(
                     "configPath" to procedure.configKey,
@@ -477,7 +552,15 @@ object ProgramManager {
                     "fileLogLevel" to procedure.fileLogLevel,
                     "tableName" to procedure.tableName
                 )
-                program ?. let { initialAnalysis(it) }
+                // Race-avoidance check
+                if (stopRequested) {
+                    globalLogger.info(
+                        "Stop requested after initialAnalysis for procedure " +
+                            "#${procIndex + 1} (${procedure.mainClass!!.name}) on " +
+                            "#${metadata.id}; breaking out of the module loop"
+                    )
+                    break
+                }
                 if (ProcedureManager.invokeProcedure(
                         path, procedure, arguments, currentCoroutineContext()[ModuleContext.Key]!!)) {
                     failed = true
@@ -506,8 +589,11 @@ object ProgramManager {
                 successTestCount++
                 logDir.moveTo(successDir.resolve(logDir.fileName))
                 ProgressReporter.report("[FILE:${metadata.id}] completed")
+                finalized = true
             } else {
                 ProgressReporter.report("[FILE:${metadata.id}] failed")
+                try { logDir.moveTo(failedDir.resolve(logDir.fileName)) } catch (_: Exception) {}
+                finalized = true
             }
         } catch (e: NoSuchMethodError) {
             // Ensure tx is closed on error paths
@@ -530,6 +616,48 @@ object ProgramManager {
             globalLogger.error(
                 "Exception occurred while running #${metadata.id}: ${e.message} (${e.javaClass.simpleName})")
             e.printStackTrace()
+        } finally {
+            // Catch-all: if this binary was interrupted mid-flight (signal
+            // arrived between module launches, Ghidra save threw, etc.)
+            // and we never reached the success/failed logDir move above,
+            // promote the log directory to `runtime_error/` so the
+            // parent's skip-set logic and the user's audit trail both
+            // stay consistent. We only do this when:
+            //
+            //   1. The log directory still exists at its original
+            //      location (i.e. we did not already move it).
+            //   2. The binary was not skipped via `skipList` (those return
+            //      early and never create a logDir).
+            //   3. We are not still inside an early-bail-out path where
+            //      the dir was already handled in the `if (stopRequested)`
+            //      block above.
+            //
+            // Best-effort: any failure here is logged but does not
+            // propagate, so we can never make a bad situation worse.
+            if (!finalized && logDir.exists()) {
+                val destination = if (stopRequested) {
+                    runtimeErrorDir.resolve(logDir.fileName)
+                } else {
+                    // Unexpected exception path — also treat as runtime
+                    // error so the user can find the trace.
+                    runtimeErrorDir.resolve(logDir.fileName)
+                }
+                try {
+                    logDir.moveTo(destination)
+                    globalLogger.info(
+                        "Moved orphaned logDir for #${metadata.id} to ${destination} " +
+                            "(stopRequested=$stopRequested)"
+                    )
+                } catch (e: Exception) {
+                    globalLogger.warn(
+                        "Failed to move orphaned logDir for #${metadata.id} to " +
+                            "${destination}: ${e.message}"
+                    )
+                }
+                ProgressReporter.report(
+                    "[FILE:${metadata.id}] " + (if (stopRequested) "stopped" else "runtime_error")
+                )
+            }
         }
     }
 

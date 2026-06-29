@@ -728,6 +728,8 @@ abstract class AkibaModule (
             else
                 TaskMonitorAdapter(true).asCoroutineAware(job)
 
+        val monitorId = ActiveTaskMonitors.register(taskGlobalMonitor)
+
         val executionTime = measureTimeMillis {
             try {
                 job.start()
@@ -774,6 +776,8 @@ abstract class AkibaModule (
                     taskGlobalMonitor.cancel()
             } catch (_: Exception) {}
         }
+
+        ActiveTaskMonitors.unregister(monitorId)
 
         runtimeReport?.recordEnd(Instant.now())
 

@@ -21,7 +21,8 @@ data class ToolResultInspectionRequest(
     val iteration: Int,
     val toolCall: ParsedToolCall,
     val resultUuid: String,
-    val stored: ToolResultContext.StoredResult
+    val stored: ToolResultContext.StoredResult,
+    val isError: Boolean = false,
 )
 
 data class ToolResultDuplicateDetection(
@@ -81,9 +82,19 @@ class DefaultToolResultDuplicateDetector(
                 return ToolResultDuplicateDetection(skippedReason = "missing result hash")
             }
 
-            if (request.stored.originalBytes < minComparableBytes) {
+            // Successful results are exempt from the duplicate check
+            // when they are very short — that mostly catches the "empty
+            // OK" outputs that aren't really evidence of a loop. Failed
+            // tool results, on the other hand, are *always* checked: a
+            // repeated short error message is the canonical signature of
+            // an agent that's stuck retrying a broken tool, and we want
+            // to surface the loop as soon as possible instead of waiting
+            // for the LLM to escalate to a long error string.
+            if (!request.isError && request.stored.originalBytes < minComparableBytes) {
                 inMemoryHistory.add(current)
-                return ToolResultDuplicateDetection(skippedReason = "short result below ${minComparableBytes} bytes")
+                return ToolResultDuplicateDetection(
+                    skippedReason = "short result below ${minComparableBytes} bytes (success)"
+                )
             }
 
             val matchesByUuid = linkedMapOf<String, ToolResultDuplicateMatch>()

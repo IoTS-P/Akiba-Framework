@@ -192,11 +192,15 @@ object WorkflowManager {
     }
 
     fun stopWorkflow(workflowId: String): Boolean {
-        // Cancel the coroutine Job first
+        // Cancel the coroutine Job first. This stops *this* route's
+        // `process.inputStream` reader loop (the one that fills
+        // ProgressManager with stdout lines). The subprocess running the
+        // actual `akiba` work is handled separately below — cancelling
+        // the route's Job does not stop the subprocess.
         runningWorkflows[workflowId]?.cancel()
         runningWorkflows.remove(workflowId)
 
-        // Destroy the subprocess — cancel() alone won't stop a blocking process.waitFor()
+        // Destroy the subprocess
         runningProcesses[workflowId]?.let { process ->
             try {
                 // Try SIGINT (Unix) first for a graceful shutdown
@@ -213,10 +217,22 @@ object WorkflowManager {
                         }
                     }
                 }
-                // Wait briefly, then force kill if still alive
-                if (!process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
-                    process.destroyForcibly()
-                    logger.warn("Force killed workflow subprocess (pid ${process.pid()})")
+                // Wait up to 10 seconds for the child to drain gracefully.
+                if (!process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                    logger.warn(
+                        "Workflow subprocess (pid ${process.pid()}) did not exit " +
+                            "within 10s of SIGINT; escalating to SIGTERM"
+                    )
+                    process.destroy()
+                    if (!process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                        logger.warn(
+                            "Workflow subprocess (pid ${process.pid()}) still alive " +
+                                "after SIGTERM; force killing"
+                        )
+                        process.destroyForcibly()
+                    }
+                } else {
+                    logger.info("Workflow subprocess (pid ${process.pid()}) exited cleanly")
                 }
             } catch (_: Exception) {
                 process.destroyForcibly()
@@ -292,8 +308,16 @@ fun Route.workflowRoutes(daemonHost: String, daemonPort: Int) {
                 val agentDbClient = AgentDatabaseClient(dbClient)
                 val sessions = agentDbClient.listSessions(limit = 100)
                 for (s in sessions) {
-                    if (s.status == "active" && s.moduleName != null && s.moduleName != "chat") {
-                        agentDbClient.updateSession(s.sessionId, status = "completed")
+                    if (s.status != "closed" && s.status != "error" &&
+                        s.moduleName != null && s.moduleName != "chat") {
+                        agentDbClient.updateSession(s.sessionId, status = "closed")
+                        runCatching {
+                            agentDbClient.setRuntimeState(
+                                s.sessionId,
+                                org.iotsplab.akiba.llm.agent.RuntimeState.CLOSED.wire(),
+                                "workflow_stop",
+                            )
+                        }
                     }
                 }
             }

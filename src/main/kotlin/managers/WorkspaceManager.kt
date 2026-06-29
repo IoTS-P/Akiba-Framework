@@ -54,6 +54,31 @@ object WorkspaceManager: Closeable {
     lateinit var taskConfigPath: File
 
     /**
+     * Expand a leading `~` (or `~/...`) in [path] to the current user's home
+     * directory. This mirrors shell behaviour so config files written by the
+     * Settings UI (which displays paths like `~/.akiba/logs/<username>`) work
+     * correctly with [java.nio.file.Path] APIs.
+     */
+    fun expandUserHome(path: String?): String {
+        if (path.isNullOrEmpty()) return ""
+        val home = System.getProperty("user.home")
+        return when {
+            path == "~" -> home
+            path.startsWith("~/") || path.startsWith("~\\") -> home + path.substring(1)
+            else -> path
+        }
+    }
+
+    /** Expand all path-like fields on the loaded config. Mutates in place. */
+    private fun normalizePathFields() {
+        mainConf.logsRoot = expandUserHome(mainConf.logsRoot).ifEmpty { mainConf.logsRoot }
+        mainConf.workspaceRoot = expandUserHome(mainConf.workspaceRoot).ifEmpty { mainConf.workspaceRoot }
+        mainConf.binariesRoot = expandUserHome(mainConf.binariesRoot)
+        mainConf.importRoot = expandUserHome(mainConf.importRoot)
+        projectConf.projectRoot = expandUserHome(projectConf.projectRoot)
+    }
+
+    /**
      * Public accessor for `::logRootDir.isInitialized`. Kotlin only allows the
      * `isInitialized` reference on a `lateinit` property to be queried from inside the
      * declaring class/object, so callers outside this object (e.g. `ServerCommand`, which
@@ -123,6 +148,11 @@ object WorkspaceManager: Closeable {
             // and then find the config according to the project name
             projectName = it
 
+            // Expand `~/...` placeholders in path-like config fields so the
+            // Settings UI can display friendly paths like `~/.akiba/logs/<user>`
+            // while the rest of the codebase still receives absolute Paths.
+            normalizePathFields()
+
             logRootDir = Path.of(mainConf.logsRoot, it)
             if (logRootDir.resolve("config.json").notExists()) {
                 globalLogger.error("Failed to find config file")
@@ -161,6 +191,11 @@ object WorkspaceManager: Closeable {
             // and then get the project name in the config
             globalLogger.info("Main config path: $mainConfigPath")
             config = ConfigManager.loadGlobalConfig()
+
+            // Expand `~/...` placeholders so path-like config fields resolve to
+            // absolute paths regardless of how the user authored the JSON.
+            normalizePathFields()
+
             projectName =
                 if (projectConf.mode == "fork") projectConf.forkTo ?: run {
                     globalLogger.error("Fork target not specified while in mode `fork`")

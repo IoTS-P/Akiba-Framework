@@ -18,6 +18,26 @@ import kotlin.system.measureTimeMillis
 // ============================================================
 
 /**
+ * Information about a failed LLM call, passed to [StrategyContext.onLLMErrorHook].
+ *
+ * The hook can inspect this struct to decide whether to retry (e.g. compact
+ * memory on the first error but give up on subsequent ones), and may also
+ * read or update [stats] to track recovery state.
+ */
+data class LLMErrorInfo(
+    /** The exception thrown by the LLM client. */
+    val exception: Throwable,
+    /** 1-based attempt counter for errors within the current run. 1 = first error, 2 = second, ... */
+    val attempt: Int,
+    /** Total number of LLM calls attempted so far (including this failed one and all previous ones). */
+    val totalCalls: Int,
+    /** Current estimated token count of the conversation memory at the time of the error. */
+    val currentTokens: Int,
+    /** Mutable counters for the current loop run. The hook may read or update fields (e.g. `lastError`). */
+    val stats: LoopStats
+)
+
+/**
  * Strategy that controls how an [AkibaAgent] iterates through the
  * LLM → tool-call → observe cycle.
  *
@@ -57,14 +77,79 @@ class StrategyContext(
     val auditToolCalls: Boolean,
     val logger: org.apache.logging.log4j.Logger = LogManager.getLogger(StrategyContext::class.java),
     val transcript: AgentTranscriptWriter? = null,
-    /** Optional hook invoked before every LLM chat call. Used for context compaction. */
+    /** Optional hook invoked before every LLM chat call. Used for threshold-based context compaction. */
     val beforeChatHook: (() -> Unit)? = null,
+    /**
+     * Optional hook invoked **on every LLM call failure** (not just the first).
+     *
+     * The hook may:
+     * - Inspect the failure context via [LLMErrorInfo] (exception, attempt, token count, ...).
+     * - Perform side effects (e.g. compact memory, lower effective context cap).
+     * - Return `true` to retry the same LLM call, or `false` to propagate the error.
+     *
+     * The hook is invoked at most [maxLLMErrorRetries] times per failed call to
+     * prevent infinite loops. Implementations can gate their own policy using
+     * [LLMErrorInfo.attempt] (e.g. only retry on the first error to keep the
+     * previous "single compaction attempt" behavior).
+     *
+     * If null (default), the first LLM error is propagated without retry,
+     * matching pre-recovery behavior.
+     */
+    val onLLMErrorHook: ((LLMErrorInfo) -> Boolean)? = null,
+    /**
+     * Maximum number of times [onLLMErrorHook] may request a retry per failed
+     * LLM call. Defaults to 1 so an accidentally-infinite hook cannot lock up
+     * the loop. Set higher only if the hook is well-tested and uses
+     * [LLMErrorInfo.attempt] to bound its own behavior.
+     */
+    val maxLLMErrorRetries: Int = 1,
     /** Agent database client for audit / session updates. */
     val agentDbClient: AgentDatabaseClient? = null,
     /** Optional provider for the compacted context view sent to the model. */
     val contextMessagesProvider: (() -> List<org.iotsplab.akiba.llm.memory.AgentChatMessage>)? = null,
     /** Advisory detector for repeated tool outputs within the same session. */
-    val toolResultDuplicateDetector: ToolResultDuplicateDetector? = null
+    val toolResultDuplicateDetector: ToolResultDuplicateDetector? = null,
+    /** Optional domain-specific workflow harness. Defaults to no-op. */
+    val harness: AgentHarness = DefaultAgentHarness,
+    /**
+     * Optional mailbox service threaded into [StrategyContext] so the
+     * default [AgentHarness.beforeIteration] can drain unread messages
+     * before each LLM call. Null disables the drain.
+     */
+    val mailboxService: AgentMailboxService? = null,
+    /**
+     * True when this run was triggered by a STANDBY resume
+     * (i.e. the user input matches the
+     * `[[AKIBA_INTERNAL:STANDBY_RESUME:<uuid>]]` marker produced
+     * by [AgentRuntime.newStandbyResumePrompt]).  Strategies can
+     * read this to inject a system-prompt hint so the LLM
+     * knows "I am being woken by mail, not starting fresh"
+     * and skips re-introductions.  False on a cold start.
+     */
+    val resumedFromStandby: Boolean = false,
+    /**
+     * Lifecycle the agent was constructed with.  Strategies
+     * use this to decide whether to compact-on-park: when
+     * [Lifecycle.STANDBY] the agent is going to park, and a
+     * smaller memory footprint means a cheaper next resume.
+     * When [Lifecycle.ONE_SHOT] the session is terminal so
+     * compacting would be wasted work.
+     */
+    val lifecycle: Lifecycle = Lifecycle.ONE_SHOT,
+    /**
+     * Callback to compress [memory] in-place, persisting the
+     * summary back to the underlying store (DB when
+     * `agentDbClient` is set).  Provided by [AkibaAgent] via
+     * `::compact` so strategies do not need a back-reference
+     * to the agent instance.  Null when compact is disabled
+     * (e.g. `autoCompact=false` or `compactOnStandby=false`).
+     *
+     * Not a suspend function: [AkibaAgent.compact] blocks
+     * synchronously on the LLM call.
+     */
+    val compactFn: (() -> Boolean)? = null,
+    /** Returns a cancellation reason when the runtime has requested this agent to stop. */
+    val cancellationReasonProvider: (() -> String?)? = null,
 ) {
     /** Accumulated counters during the loop. Mutable, shared across the strategy. */
     @Suppress("LeakingThis")
@@ -91,18 +176,83 @@ class StrategyContext(
     /**
      * Call the LLM with the current conversation history.
      *
-     * @return the completion, or null on error (error is logged).
+     * If [onLLMErrorHook] is provided and the provider call fails, the hook is
+     * invoked (up to [maxLLMErrorRetries] times) with full [LLMErrorInfo]
+     * context. The hook decides whether to retry the same call; typical
+     * implementations compact memory on the first error to recover from
+     * underestimated token usage, then lower the effective context cap so the
+     * next iteration compacts earlier. If the hook returns false (or is null)
+     * the error is propagated as a normal LLM failure.
+     *
+     * @return the completion, or null on unrecoverable error (error is logged).
      */
     fun callLLM(systemPrompt: String): ChatCompletion? {
+        fun invokeChat(): ChatCompletion = client.chat(
+            systemPrompt = systemPrompt,
+            messages = contextMessagesProvider?.invoke() ?: memory.messages(),
+            tools = if (toolRegistry.isEmpty()) null else toolRegistry.toJsonSchemas()
+        )
+
+        cancellationReasonProvider?.invoke()?.let { reason ->
+            stats.lastError = "Agent cancelled before LLM call: $reason"
+            logger.warn(stats.lastError)
+            return null
+        }
         beforeChatHook?.invoke()
+        cancellationReasonProvider?.invoke()?.let { reason ->
+            stats.lastError = "Agent cancelled before LLM call: $reason"
+            logger.warn(stats.lastError)
+            return null
+        }
         return try {
-            client.chat(
-                systemPrompt = systemPrompt,
-                messages = contextMessagesProvider?.invoke() ?: memory.messages(),
-                tools = if (toolRegistry.isEmpty()) null else toolRegistry.toJsonSchemas()
-            )
-        } catch (e: Exception) {
-            stats.lastError = e.message
+            invokeChat()
+        } catch (initialError: Exception) {
+            stats.lastError = initialError.message
+            logger.warn("LLM chat failed: ${initialError.message}")
+
+            val hook = onLLMErrorHook ?: return null
+
+            var errorAttempt = 0
+            while (errorAttempt < maxLLMErrorRetries) {
+                errorAttempt++
+                val currentTokens = memory.messages().sumOf { client.estimateTokenCount(it.content) }
+                val info = LLMErrorInfo(
+                    exception = initialError,
+                    attempt = errorAttempt,
+                    totalCalls = stats.iterations + 1,
+                    currentTokens = currentTokens,
+                    stats = stats
+                )
+
+                logger.warn(
+                    "Invoking onLLMErrorHook (attempt $errorAttempt/$maxLLMErrorRetries, " +
+                        "currentTokens=$currentTokens): ${initialError.message}"
+                )
+
+                val shouldRetry = try {
+                    hook(info)
+                } catch (hookError: Exception) {
+                    stats.lastError = "${initialError.message}; recovery hook failed: ${hookError.message}"
+                    logger.warn("onLLMErrorHook threw: ${hookError.message}", hookError)
+                    return null
+                }
+
+                if (!shouldRetry) {
+                    logger.info("onLLMErrorHook declined retry on attempt $errorAttempt; propagating error.")
+                    return null
+                }
+
+                logger.info("onLLMErrorHook requested retry (attempt $errorAttempt/$maxLLMErrorRetries); retrying LLM chat.")
+                try {
+                    return invokeChat()
+                } catch (retryError: Exception) {
+                    stats.lastError = "${initialError.message}; retry #$errorAttempt failed: ${retryError.message}"
+                    logger.warn("LLM chat retry #$errorAttempt failed: ${retryError.message}", retryError)
+                    // Fall through to call the hook again with the same original error.
+                }
+            }
+
+            logger.warn("onLLMErrorHook retry budget exhausted after $maxLLMErrorRetries retries; giving up.")
             null
         }
     }
@@ -147,13 +297,16 @@ class StrategyContext(
 
         val resultUuid = UUID.randomUUID().toString()
         val stored = ToolResultContext.prepareForStorage(rawResult)
+
+        val isError = rawResult.startsWith("Tool '${toolCall.name}' execution error")
         val duplicateDetection = toolResultDuplicateDetector?.inspect(
             ToolResultInspectionRequest(
                 sessionId = sessionId,
                 iteration = stats.iterations,
                 toolCall = toolCall,
                 resultUuid = resultUuid,
-                stored = stored
+                stored = stored,
+                isError = isError
             )
         )
         var result = ToolResultContext.formatCurrentResult(rawResult, resultUuid, stored)
@@ -286,8 +439,41 @@ class ReActStrategy : AgentStrategy {
         val REACT_INSTRUCTION: String get() = AgentPrompts.REACT_INSTRUCTION
     }
 
+    /**
+     * Built-in ReAct harness for generic recovery behaviours that used to live
+     * inline in [execute]. Domain harnesses supplied by modules are still run
+     * first; this one only handles ReAct's default no-action recovery.
+     */
+    private object DefaultReActHarness : AgentHarness {
+        override val name: String = "DefaultReActHarness"
+
+        override fun afterNoAction(
+            ctx: StrategyContext,
+            assistantText: String,
+            completion: ChatCompletion?
+        ): AgentHarnessDirective {
+            if (completion?.finishReason == "length") {
+                ctx.logger.warn("[ReAct] LLM response truncated (finishReason=length). Requesting continuation instead of ending loop.")
+                return AgentHarnessDirective.userMessage(
+                    "Your previous response was truncated because it exceeded the output length limit. " +
+                        "Continue from where you left off. If you had started a tool call, please repeat it now."
+                )
+            }
+
+            ctx.logger.info(
+                "[ReAct] No tool call or final answer detected. Sending format reminder. " +
+                    "Text preview: ${assistantText.take(300)}"
+            )
+            val toolNames = ctx.toolRegistry.names().joinToString(", ")
+            return AgentHarnessDirective.userMessage(AgentPrompts.formatReminder(toolNames))
+        }
+    }
+
     override fun execute(ctx: StrategyContext): AgentResult {
         val logger = ctx.logger
+
+        logger.info("[ReAct] Harness: ${ctx.harness.name}")
+        ctx.applyHarnessDirective(ctx.harness.beforeRun(ctx), "harness.beforeRun")
 
         // Write system prompt to transcript (only on first iteration)
         ctx.transcript?.writeSystemPrompt(ctx.buildEffectiveSystemPrompt(REACT_INSTRUCTION))
@@ -296,12 +482,36 @@ class ReActStrategy : AgentStrategy {
             ctx.stats.iterations++
             logger.debug("[ReAct] iteration ${ctx.stats.iterations}/${ctx.maxIterations}")
 
-            val systemPrompt = ctx.buildEffectiveSystemPrompt(REACT_INSTRUCTION)
-
-            val completion = ctx.callLLM(systemPrompt) ?: return ctx.stats.toResult(
-                output = "Agent error: ${ctx.stats.lastError}",
-                stopReason = StopReason.ERROR
+            val beforeIteration = ctx.harness.beforeIteration(ctx)
+            ctx.applyHarnessDirective(beforeIteration, "harness.beforeIteration")
+            val beforeChat = ctx.harness.beforeChat(ctx)
+            ctx.applyHarnessDirective(beforeChat, "harness.beforeChat")
+            val resumeHint = if (ctx.resumedFromStandby) {
+                "[system: you are being woken from standby by new mailbox messages; " +
+                    "the default harness has drained the unread messages into this turn " +
+                    "as user messages. Continue from where you parked — do NOT re-introduce " +
+                    "yourself or restart the task.]"
+            } else null
+            val systemPrompt = ctx.buildEffectiveSystemPrompt(
+                joinPromptParts(
+                    REACT_INSTRUCTION,
+                    beforeIteration.systemPromptAppend,
+                    beforeChat.systemPromptAppend,
+                    resumeHint,
+                )
             )
+
+            val completion = ctx.callLLM(systemPrompt) ?: run {
+                ctx.updateSessionStatus("error")
+                return ctx.stats.toResult(
+                    output = buildErrorOutput(
+                        errorLabel = "Agent error",
+                        errorDetail = ctx.stats.lastError,
+                        memory = ctx.memory,
+                    ),
+                    stopReason = StopReason.ERROR
+                )
+            }
 
             completion.tokenUsage?.let { usage ->
                 ctx.stats.totalInputTokens += usage.inputTokenCount
@@ -331,15 +541,75 @@ class ReActStrategy : AgentStrategy {
                 assistantText, ctx.stats.iterations,
                 ctx.stats.totalInputTokens, ctx.stats.totalOutputTokens
             )
+            ctx.applyHarnessDirective(
+                ctx.harness.afterAssistantMessage(ctx, assistantText, completion),
+                "harness.afterAssistantMessage"
+            )
 
-            // Parse ALL tool calls (native first, then text-based fallback).
-            // Up to MAX_BATCH_TOOL_CALLS will be executed sequentially in the
-            // same iteration before another LLM round-trip.
-            val allToolCalls = ToolCallParser.parseAllFromCompletion(completion).ifEmpty {
-                ToolCallParser.parseAll(assistantText)
+            // Parse tool calls.  Final-Answer check MUST come first
+            // because the LLM's Final Answer payload is itself JSON and
+            // can contain nested objects with `name` / `tool` keys that
+            // would otherwise be misclassified as tool calls.  Without
+            // this precedence fix, sub-agents that emit a structured JSON
+            // final answer (e.g. linear_checker's
+            // `{ "suspiciousFunctions": [ { "name": "...", ... } ] }`)
+            // trigger spurious tool calls, the agent thinks the LLM has
+            // not finished, and the loop runs until maxIterations.
+            //
+            // Native provider tool calls (`completion.toolCalls`) are
+            // untouched by this fix: providers that support native
+            // function calling do not interleave tool calls with
+            // Final-Answer text in a single completion, so the parser's
+            // native path is the source of truth in that case.
+            val finalAnswerText = extractFinalAnswer(assistantText)
+
+            // Standby marker takes precedence over tool-call parsing
+            // and over `afterNoAction` (Final Answer already wins
+            // over standby marker per [SharedStandbyExtractor]'s
+            // contract).  When the LLM ends its reply with
+            // "Enter standby mode." and did not emit a Final
+            // Answer, we exit the run() loop immediately with
+            // [StopReason.STANDBY].  The runtime translates that
+            // to `runtime_state=standby` for `lifecycle=standby`
+            // children and to `closed` for one-shot children, so
+            // a standby agent parks and waits for mailbox; a
+            // one-shot agent terminates normally.
+            if (finalAnswerText == null && SharedStandbyExtractor.endsWithMarker(assistantText)) {
+                logger.info(
+                    "[ReAct] Standby marker detected at end of assistant text; " +
+                        "exiting run() with StopReason.STANDBY (lifecycle=${ctx.lifecycle})."
+                )
+                ctx.updateSessionStatus("standby")
+                val result = ctx.stats.toResult(
+                    output = SharedStandbyExtractor.MARKER,
+                    stopReason = StopReason.STANDBY,
+                )
+                ctx.transcript?.writeSessionEnd(result)
+                return compactAndReturn(ctx, result)
+            }
+
+            val allToolCalls = when {
+                completion.toolCalls.isNotEmpty() ->
+                    ToolCallParser.parseAllFromCompletion(completion)
+                finalAnswerText != null ->
+                    // Final Answer marker present — skip text-based tool
+                    // call parsing to avoid false positives from JSON
+                    // snippets in the answer payload.
+                    emptyList()
+                else ->
+                    ToolCallParser.parseAllFromCompletion(completion).ifEmpty {
+                        ToolCallParser.parseAll(assistantText)
+                    }
             }
 
             if (allToolCalls.isNotEmpty()) {
+                val toolCallsDirective = ctx.harness.beforeToolCalls(ctx, allToolCalls)
+                ctx.applyHarnessDirective(toolCallsDirective, "harness.beforeToolCalls")
+                if (toolCallsDirective.blockCurrentAction) {
+                    logger.warn("[ReAct] Harness blocked current tool-call batch")
+                    continue
+                }
+
                 // Cap the batch size so a single response can't blow through the
                 // iteration budget or overwhelm downstream tools.
                 val batch = allToolCalls.take(MAX_BATCH_TOOL_CALLS)
@@ -353,7 +623,20 @@ class ReActStrategy : AgentStrategy {
                 for ((idx, toolCall) in batch.withIndex()) {
                     logger.info("[ReAct] Action ${idx + 1}/${batch.size}: " +
                         "${toolCall.name}(${toolCall.argumentsJson.take(200)})")
-                    val toolResult = ctx.executeToolWithDuration(toolCall)
+                    val beforeTool = ctx.harness.beforeToolExecution(ctx, toolCall)
+                    if (beforeTool.blockCurrentAction) {
+                        ctx.applyHarnessDirective(beforeTool, "harness.beforeToolExecution")
+                        logger.warn("[ReAct] Harness blocked tool call: ${toolCall.name}")
+                        continue
+                    }
+
+                    val toolResult = if (beforeTool.skipCurrentAction) {
+                        ctx.applyHarnessDirective(beforeTool, "harness.beforeToolExecution")
+                        val synthetic = beforeTool.userMessages.firstOrNull() ?: "[harness synthetic] handled: ${toolCall.name}"
+                        StrategyContext.ToolResult(synthetic, 0L)
+                    } else {
+                        ctx.executeToolWithDuration(toolCall)
+                    }
                     val observation = toolResult.output
                     val durationMs = toolResult.durationMs
                     val durationStr = if (durationMs > 0) ", duration=${durationMs}ms" else ""
@@ -369,6 +652,13 @@ class ReActStrategy : AgentStrategy {
                         args = toolCall.argumentsJson,
                         result = obsMessage
                     )
+                    if (!beforeTool.skipCurrentAction) {
+                        ctx.applyHarnessDirective(beforeTool, "harness.beforeToolExecution")
+                    }
+                    ctx.applyHarnessDirective(
+                        ctx.harness.afterToolExecution(ctx, toolCall, toolResult),
+                        "harness.afterToolExecution"
+                    )
 
                     logger.debug("[ReAct] Observation: ${observation.take(200)}...")
                 }
@@ -380,43 +670,36 @@ class ReActStrategy : AgentStrategy {
                     )
                 }
             } else {
-                // No tool call detected — check if LLM explicitly gave a Final Answer
-                val finalAnswer = extractFinalAnswer(assistantText)
+                // No tool call detected — `finalAnswerText` was computed
+                // earlier (it short-circuited the tool-call parser), so
+                // reuse it here instead of re-scanning `assistantText`.
+                val finalAnswer = finalAnswerText
 
                 if (finalAnswer != null) {
-                    // LLM explicitly signaled it's done
-                    ctx.updateSessionStatus("completed")
-                    val result = ctx.stats.toResult(
-                        output = finalAnswer,
-                        stopReason = StopReason.COMPLETED
-                    )
-                    ctx.transcript?.writeSessionEnd(result)
-                    return result
+                    val finalAnswerDirective = ctx.harness.validateFinalAnswer(ctx, assistantText, finalAnswer)
+                    ctx.applyHarnessDirective(finalAnswerDirective, "harness.validateFinalAnswer")
+                    if (!finalAnswerDirective.rejectFinalAnswer) {
+                        // LLM explicitly signaled it's done and harness accepted it.
+                        ctx.updateSessionStatus("closed")
+                        val result = ctx.stats.toResult(
+                            output = finalAnswer,
+                            stopReason = StopReason.COMPLETED
+                        )
+                        ctx.transcript?.writeSessionEnd(result)
+                        return compactAndReturn(ctx, result)
+                    }
+                    logger.warn("[ReAct] Harness rejected Final Answer; continuing loop")
+                    continue
                 }
 
-                // When finishReason is "length", the LLM output was cut off
-                // (e.g. a mid-reply JSON tool call was truncated), so we must
-                // NOT conclude — the agent should keep going.
-                if (completion.finishReason == "length") {
-                    logger.warn("[ReAct] LLM response truncated (finishReason=length). " +
-                        "Requesting continuation instead of ending loop.")
-                    val note = "Your previous response was truncated because it exceeded " +
-                        "the output length limit. Continue from where you left off. " +
-                        "If you had started a tool call, please repeat it now."
-                    ctx.memory.addUserMessage(note)
-                    ctx.transcript?.writeFormatReminder(note)
-                } else {
-                    // LLM did not provide a Final Answer or valid tool call.
-                    // Do NOT end the loop — instead inject a format reminder so the
-                    // LLM has a chance to correct its output in the next turn.
-                    logger.info("[ReAct] No tool call or final answer detected. " +
-                        "Sending format reminder. Text preview: ${assistantText.take(300)}")
-
-                    val toolNames = ctx.toolRegistry.names().joinToString(", ")
-                    val reminder = AgentPrompts.formatReminder(toolNames)
-                    ctx.memory.addUserMessage(reminder)
-                    ctx.transcript?.writeFormatReminder(reminder)
-                }
+                ctx.applyHarnessDirective(
+                    ctx.harness.afterNoAction(ctx, assistantText, completion),
+                    "harness.afterNoAction"
+                )
+                ctx.applyHarnessDirective(
+                    DefaultReActHarness.afterNoAction(ctx, assistantText, completion),
+                    "react.afterNoAction"
+                )
             }
         }
 
@@ -429,26 +712,69 @@ class ReActStrategy : AgentStrategy {
             stopReason = StopReason.MAX_ITERATIONS
         )
         ctx.transcript?.writeSessionEnd(result)
-        return result
+        return compactAndReturn(ctx, result)
     }
 
     /** Extract the Final Answer portion from a ReAct response. */
-    private fun extractFinalAnswer(text: String): String? {
-        val patterns = listOf(
-            Regex("""(?i)\*\*Final Answer:\*\*\s*(.*)""", RegexOption.DOT_MATCHES_ALL),
-            Regex("""(?i)Final Answer:\s*(.*)""", RegexOption.DOT_MATCHES_ALL),
-        )
-        for (pattern in patterns) {
-            val match = pattern.find(text) ?: continue
-            val answer = match.groupValues[1].trim()
-            if (answer.isNotBlank()) return answer
-        }
-        return null
-    }
+    private fun extractFinalAnswer(text: String): String? =
+        SharedFinalAnswerExtractor.extract(text)
 
     private fun extractLastAnswer(memory: ChatMemory): String? {
         return memory.messages().lastOrNull { it.role == "assistant" }?.content
     }
+}
+
+/**
+ * Compact-on-park helper for the default strategies.
+ *
+ * When the session is going to park (i.e. [StrategyContext.lifecycle]
+ * is [Lifecycle.STANDBY] and the run is producing a terminal
+ * result), call [StrategyContext.compactFn] to shrink the
+ * in-memory history into a single summary message + the
+ * trailing rounds.  The compact writes back to the persistent
+ * store (when `agentDbClient` is set), so the next
+ * `runtime.resumeStandby` runs against a small, summarisable
+ * context — cheaper to send and cheaper to reason over.
+ *
+ * Inactive when:
+ *  - lifecycle is ONE_SHOT (session is terminal; compacting is
+ *    wasted work and the persistent memory is not consulted
+ *    again),
+ *  - the strategy was constructed with `compactOnStandby=false`,
+ *  - `compactFn` is null,
+ *  - the underlying [AkibaAgent.compact] call returns false
+ *    (nothing to compact).
+ *
+ * Errors are caught and logged: a compact failure must not
+ * prevent the agent from returning its result and parking.
+ *
+ * Not a suspend function: the inner LLM call inside
+ * [AkibaAgent.compact] is synchronous from the strategy's
+ * point of view (the LLM client blocks on the HTTP exchange).
+ * The strategy's execute() therefore does not need to grow
+ * a `suspend` modifier.
+ */
+internal fun compactAndReturn(
+    ctx: StrategyContext,
+    result: AgentResult,
+): AgentResult {
+    val compactFn = ctx.compactFn ?: return result
+    if (ctx.lifecycle != Lifecycle.STANDBY) return result
+    try {
+        val did = compactFn()
+        if (did) {
+            ctx.logger.info(
+                "[strategy] compacted on park (lifecycle=STANDBY, " +
+                    "iterations=${ctx.stats.iterations}, toolCalls=${ctx.stats.toolCallsMade})"
+            )
+        }
+    } catch (e: Exception) {
+        ctx.logger.warn(
+            "[strategy] compact-on-park failed: ${e.javaClass.simpleName}: ${e.message}",
+            e,
+        )
+    }
+    return result
 }
 
 // ============================================================
@@ -521,6 +847,9 @@ class PlanExecuteStrategy(
         val logger = ctx.logger
         var replanCycle = 0
 
+        logger.info("[PlanExec] Harness: ${ctx.harness.name}")
+        ctx.applyHarnessDirective(ctx.harness.beforeRun(ctx), "harness.beforeRun")
+
         // Write system prompt to transcript at start
         ctx.transcript?.writeSystemPrompt(ctx.buildEffectiveSystemPrompt(PLANNING_INSTRUCTION))
 
@@ -536,13 +865,13 @@ class PlanExecuteStrategy(
 
             if (plan.isEmpty()) {
                 logger.warn("[PlanExec] Failed to create a plan, falling back to direct answer")
-                ctx.updateSessionStatus("completed")
+                ctx.updateSessionStatus("error")
                 val result = ctx.stats.toResult(
                     output = "Agent could not formulate a plan for this task.",
                     stopReason = StopReason.ERROR
                 )
                 ctx.transcript?.writeSessionEnd(result)
-                return result
+                return compactAndReturn(ctx, result)
             }
 
             // Store plan in memory
@@ -567,13 +896,13 @@ class PlanExecuteStrategy(
                 is ExecResult.Completed -> {
                     // ── Phase 3: Reflection ────────────────────────────
                     val finalAnswer = reflect(ctx)
-                    ctx.updateSessionStatus("completed")
+                    ctx.updateSessionStatus("closed")
                     val result = ctx.stats.toResult(
                         output = finalAnswer,
                         stopReason = StopReason.COMPLETED
                     )
                     ctx.transcript?.writeSessionEnd(result)
-                    return result
+                    return compactAndReturn(ctx, result)
                 }
                 is ExecResult.ReplanNeeded -> {
                     replanCycle++
@@ -588,16 +917,29 @@ class PlanExecuteStrategy(
                         stopReason = StopReason.MAX_ITERATIONS
                     )
                     ctx.transcript?.writeSessionEnd(result)
-                    return result
+                    return compactAndReturn(ctx, result)
                 }
                 is ExecResult.Error -> {
                     ctx.updateSessionStatus("error")
                     val result = ctx.stats.toResult(
-                        output = "Agent error: ${executionResult.message}",
+                        output = buildErrorOutput(
+                            errorLabel = "Agent error",
+                            errorDetail = executionResult.message,
+                            memory = ctx.memory,
+                        ),
                         stopReason = StopReason.ERROR
                     )
                     ctx.transcript?.writeSessionEnd(result)
-                    return result
+                    return compactAndReturn(ctx, result)
+                }
+                is ExecResult.StandbyRequested -> {
+                    ctx.updateSessionStatus("standby")
+                    val result = ctx.stats.toResult(
+                        output = SharedStandbyExtractor.MARKER,
+                        stopReason = StopReason.STANDBY,
+                    )
+                    ctx.transcript?.writeSessionEnd(result)
+                    return compactAndReturn(ctx, result)
                 }
             }
         }
@@ -605,13 +947,13 @@ class PlanExecuteStrategy(
         // Exceeded max replan cycles
         logger.warn("[PlanExec] Exceeded max replan cycles ($maxReplanCycles)")
         val finalAnswer = reflect(ctx)
-        ctx.updateSessionStatus("completed")
+        ctx.updateSessionStatus("closed")
         val result = ctx.stats.toResult(
             output = finalAnswer,
             stopReason = StopReason.COMPLETED
         )
         ctx.transcript?.writeSessionEnd(result)
-        return result
+        return compactAndReturn(ctx, result)
     }
 
     // ---- Phase 1: Planning ────────────────────────────────────────────
@@ -625,7 +967,11 @@ class PlanExecuteStrategy(
     }
 
     private fun requestPlan(ctx: StrategyContext, instruction: String): List<PlanStep> {
-        val systemPrompt = ctx.buildEffectiveSystemPrompt(instruction)
+        val beforeChat = ctx.harness.beforeChat(ctx)
+        ctx.applyHarnessDirective(beforeChat, "harness.beforeChat")
+        val systemPrompt = ctx.buildEffectiveSystemPrompt(
+            joinPromptParts(instruction, beforeChat.systemPromptAppend)
+        )
 
         val completion = ctx.callLLM(systemPrompt) ?: return emptyList()
         ctx.stats.iterations++
@@ -644,6 +990,10 @@ class PlanExecuteStrategy(
         ctx.transcript?.writeAssistantMessage(
             planText, ctx.stats.iterations,
             ctx.stats.totalInputTokens, ctx.stats.totalOutputTokens
+        )
+        ctx.applyHarnessDirective(
+            ctx.harness.afterAssistantMessage(ctx, planText, completion),
+            "harness.afterAssistantMessage"
         )
 
         return parsePlan(planText)
@@ -679,6 +1029,7 @@ class PlanExecuteStrategy(
         class ReplanNeeded(val reason: String) : ExecResult()
         object MaxIterations : ExecResult()
         class Error(val message: String) : ExecResult()
+        object StandbyRequested : ExecResult()
     }
 
     private fun executePlan(ctx: StrategyContext, plan: List<PlanStep>): ExecResult {
@@ -712,10 +1063,6 @@ class PlanExecuteStrategy(
                     (step.tool?.let { " (suggested tool: $it)" } ?: "")
             )
 
-            val systemPrompt = ctx.buildEffectiveSystemPrompt(
-                "$stepContext\n$execInstruction"
-            )
-
             // Execute this step (may need multiple LLM calls for one step)
             var stepIterations = 0
             val maxStepIterations = 3  // safety limit per step
@@ -724,7 +1071,15 @@ class PlanExecuteStrategy(
                 stepIterations++
                 ctx.stats.iterations++
 
-                val completion = ctx.callLLM(systemPrompt) ?: return ExecResult.Error(
+                val beforeIteration = ctx.harness.beforeIteration(ctx)
+                ctx.applyHarnessDirective(beforeIteration, "harness.beforeIteration")
+                val beforeChat = ctx.harness.beforeChat(ctx)
+                ctx.applyHarnessDirective(beforeChat, "harness.beforeChat")
+                val effectiveSystemPrompt = ctx.buildEffectiveSystemPrompt(
+                    joinPromptParts("$stepContext\n$execInstruction", beforeIteration.systemPromptAppend, beforeChat.systemPromptAppend)
+                )
+
+                val completion = ctx.callLLM(effectiveSystemPrompt) ?: return ExecResult.Error(
                     ctx.stats.lastError ?: "LLM call failed"
                 )
                 completion.tokenUsage?.let { usage ->
@@ -742,6 +1097,10 @@ class PlanExecuteStrategy(
                     assistantText, ctx.stats.iterations,
                     ctx.stats.totalInputTokens, ctx.stats.totalOutputTokens
                 )
+                ctx.applyHarnessDirective(
+                    ctx.harness.afterAssistantMessage(ctx, assistantText, completion),
+                    "harness.afterAssistantMessage"
+                )
 
                 // Check for replan request
                 if (assistantText.contains("Replan Needed:", ignoreCase = true)) {
@@ -749,26 +1108,95 @@ class PlanExecuteStrategy(
                     return ExecResult.ReplanNeeded(reason)
                 }
 
-                // Parse tool call (native first, then text-based fallback)
-                val toolCall = ToolCallParser.parseFromCompletion(completion)
-                    ?: ToolCallParser.parse(assistantText)
+                // Standby marker short-circuits the step loop.  See
+                // [SharedStandbyExtractor] for the precedence rule
+                // (Final Answer beats standby).  Returned as a
+                // dedicated [ExecResult.StandbyRequested] so the
+                // outer execute() function can map it to
+                // [StopReason.STANDBY].
+                if (SharedStandbyExtractor.endsWithMarker(assistantText)) {
+                    logger.info(
+                        "[PlanExec] Standby marker detected at end of step " +
+                            "${step.index} assistant text; exiting with " +
+                            "StopReason.STANDBY (lifecycle=${ctx.lifecycle})."
+                    )
+                    return ExecResult.StandbyRequested
+                }
+
+                // Parse tool call.  Final-Answer check MUST come first for the
+                // same reason as in [ReActStrategy]: the LLM's Final
+                // Answer payload is itself JSON and may contain nested
+                // objects with `name` / `tool` keys that would otherwise
+                // be misclassified as tool calls and put the agent into
+                // an infinite loop.
+                val stepFinalAnswer = extractFinalAnswer(assistantText)
+                val toolCall = when {
+                    completion.toolCalls.isNotEmpty() ->
+                        ToolCallParser.parseFromCompletion(completion)
+                    stepFinalAnswer != null ->
+                        // Final Answer marker present — skip text-based
+                        // tool-call parsing to avoid false positives.
+                        null
+                    else ->
+                        ToolCallParser.parseFromCompletion(completion)
+                            ?: ToolCallParser.parse(assistantText)
+                }
 
                 if (toolCall != null) {
+                    val toolCallsDirective = ctx.harness.beforeToolCalls(ctx, listOf(toolCall))
+                    ctx.applyHarnessDirective(toolCallsDirective, "harness.beforeToolCalls")
+                    if (toolCallsDirective.blockCurrentAction) {
+                        logger.warn("[PlanExec] Harness blocked tool-call action")
+                        continue
+                    }
+
                     logger.info("[PlanExec]   Tool: ${toolCall.name}(${toolCall.arguments})")
-                    val observation = ctx.executeTool(toolCall)
+                    val beforeTool = ctx.harness.beforeToolExecution(ctx, toolCall)
+                    if (beforeTool.blockCurrentAction) {
+                        ctx.applyHarnessDirective(beforeTool, "harness.beforeToolExecution")
+                        logger.warn("[PlanExec] Harness blocked tool call: ${toolCall.name}")
+                        continue
+                    }
+
+                    val toolResult = if (beforeTool.skipCurrentAction) {
+                        ctx.applyHarnessDirective(beforeTool, "harness.beforeToolExecution")
+                        val synthetic = beforeTool.userMessages.firstOrNull() ?: "[harness synthetic] handled: ${toolCall.name}"
+                        StrategyContext.ToolResult(synthetic, 0L)
+                    } else {
+                        ctx.executeToolWithDuration(toolCall)
+                    }
+                    val observation = toolResult.output
                     ctx.memory.addToolMessage(
                         toolCallId = toolCall.callId,
                         toolName = toolCall.name,
                         args = toolCall.argumentsJson,
                         result = "**Observation (Step ${step.index}):** $observation"
                     )
+                    if (!beforeTool.skipCurrentAction) {
+                        ctx.applyHarnessDirective(beforeTool, "harness.beforeToolExecution")
+                    }
+                    ctx.applyHarnessDirective(
+                        ctx.harness.afterToolExecution(ctx, toolCall, toolResult),
+                        "harness.afterToolExecution"
+                    )
                     // Continue loop to let the agent process the observation
                 } else {
-                    // No tool call — check for final answer
-                    val finalAnswer = extractFinalAnswer(assistantText)
+                    // No tool call — reuse the Final Answer already detected
+                    // during the tool-call parse step.
+                    val finalAnswer = stepFinalAnswer
                     if (finalAnswer != null) {
-                        return ExecResult.Completed
+                        val finalAnswerDirective = ctx.harness.validateFinalAnswer(ctx, assistantText, finalAnswer)
+                        ctx.applyHarnessDirective(finalAnswerDirective, "harness.validateFinalAnswer")
+                        if (!finalAnswerDirective.rejectFinalAnswer) {
+                            return ExecResult.Completed
+                        }
+                        logger.warn("[PlanExec] Harness rejected Final Answer; continuing step loop")
+                        continue
                     }
+                    ctx.applyHarnessDirective(
+                        ctx.harness.afterNoAction(ctx, assistantText, completion),
+                        "harness.afterNoAction"
+                    )
                     // Otherwise, the step is done without a tool call; move on
                     break
                 }
@@ -782,7 +1210,11 @@ class PlanExecuteStrategy(
     // ---- Phase 3: Reflection ──────────────────────────────────────────
 
     private fun reflect(ctx: StrategyContext): String {
-        val systemPrompt = ctx.buildEffectiveSystemPrompt(REFLECTION_INSTRUCTION)
+        val beforeChat = ctx.harness.beforeChat(ctx)
+        ctx.applyHarnessDirective(beforeChat, "harness.beforeChat")
+        val systemPrompt = ctx.buildEffectiveSystemPrompt(
+            joinPromptParts(REFLECTION_INSTRUCTION, beforeChat.systemPromptAppend)
+        )
         ctx.stats.iterations++
 
         val completion = ctx.callLLM(systemPrompt) ?: return extractLastAnswer(ctx.memory)
@@ -804,6 +1236,10 @@ class PlanExecuteStrategy(
             reflection, ctx.stats.iterations,
             ctx.stats.totalInputTokens, ctx.stats.totalOutputTokens
         )
+        ctx.applyHarnessDirective(
+            ctx.harness.afterAssistantMessage(ctx, reflection, completion),
+            "harness.afterAssistantMessage"
+        )
 
         // Store reflection as insight
         ctx.memoryManager?.remember(
@@ -814,17 +1250,68 @@ class PlanExecuteStrategy(
             importance = 0.9
         )
 
-        return extractFinalAnswer(reflection) ?: reflection
+        val finalAnswer = extractFinalAnswer(reflection)
+        if (finalAnswer != null) {
+            val finalAnswerDirective = ctx.harness.validateFinalAnswer(ctx, reflection, finalAnswer)
+            ctx.applyHarnessDirective(finalAnswerDirective, "harness.validateFinalAnswer")
+            if (finalAnswerDirective.rejectFinalAnswer) {
+                return "Final answer rejected by harness; additional analysis is required before completion."
+            }
+            return finalAnswer
+        }
+        return reflection
     }
 
     // ---- Helpers ──────────────────────────────────────────────────────
 
-    private fun extractFinalAnswer(text: String): String? {
-        val patterns = listOf(
-            Regex("""(?i)\*\*Final Answer:\*\*\s*(.*)""", RegexOption.DOT_MATCHES_ALL),
-            Regex("""(?i)Final Answer:\s*(.*)""", RegexOption.DOT_MATCHES_ALL),
-        )
-        for (pattern in patterns) {
+    private fun extractFinalAnswer(text: String): String? =
+        SharedFinalAnswerExtractor.extract(text)
+
+    private fun extractLastAnswer(memory: ChatMemory): String? {
+        return memory.messages().lastOrNull { it.role == "assistant" }?.content
+    }
+}
+
+/**
+ * Shared helper for Final-Answer detection. Used by both [ReActStrategy]
+ * and [PlanExecuteStrategy] so the two strategies agree on what counts
+ * as a Final Answer marker (and so the precedence fix in
+ * `parseToolCallsAfterFinalAnswerCheck` has a single source of truth).
+ *
+ * IMPORTANT: this is also the boundary used to STOP text-based tool
+ * call parsing.  When a Final Answer marker is detected, the strategies
+ * MUST NOT scan the text after the marker for tool calls — JSON
+ * snippets inside the answer payload (e.g. `{ "name": "process_packet",
+ * "address": "0x401234" }` inside a `suspiciousFunctions` array)
+ * otherwise get misclassified as actual tool calls, the agent thinks
+ * the LLM has not finished, and the loop runs until maxIterations.
+ */
+internal object SharedFinalAnswerExtractor {
+    /**
+     * Patterns that locate the START of a Final Answer marker (group 0
+     * is the marker text itself).  Order matters: the canonical
+     * `**Final Answer:**` form is checked first; the loose
+     * `Final Answer:` form (preceded only by non-alphanumeric chars,
+     * so `MyFinal Answer:` is excluded) is the fallback.
+     */
+    private val MARKER_PATTERNS: List<Regex> = listOf(
+        Regex("""(?i)\*\*Final Answer:\*\*"""),
+        Regex("""(?i)(?<![A-Za-z0-9])Final Answer:"""),
+    )
+
+    /**
+     * Patterns that extract the full Final Answer payload.  Group 1 is
+     * the answer body (everything after `Final Answer:`).  Same
+     * precedence as [MARKER_PATTERNS].
+     */
+    private val ANSWER_PATTERNS: List<Regex> = listOf(
+        Regex("""(?i)\*\*Final Answer:\*\*\s*(.*)""", RegexOption.DOT_MATCHES_ALL),
+        Regex("""(?i)(?<![A-Za-z0-9])Final Answer:\s*(.*)""", RegexOption.DOT_MATCHES_ALL),
+    )
+
+    /** Returns the Final Answer payload, or null if no marker is present. */
+    fun extract(text: String): String? {
+        for (pattern in ANSWER_PATTERNS) {
             val match = pattern.find(text) ?: continue
             val answer = match.groupValues[1].trim()
             if (answer.isNotBlank()) return answer
@@ -832,8 +1319,80 @@ class PlanExecuteStrategy(
         return null
     }
 
-    private fun extractLastAnswer(memory: ChatMemory): String? {
-        return memory.messages().lastOrNull { it.role == "assistant" }?.content
+    /**
+     * Returns the index of the first Final Answer marker in [text],
+     * or null if none.  Used by strategies to slice the assistant text
+     * into "before the marker" (where tool calls live) and "after the
+     * marker" (where the answer payload lives, which must not be
+     * parsed for tool calls).
+     */
+    fun markerIndex(text: String): Int? {
+        for (pattern in MARKER_PATTERNS) {
+            val match = pattern.find(text) ?: continue
+            return match.range.first
+        }
+        return null
+    }
+}
+
+// ============================================================
+//  SharedStandbyExtractor — recognise the "park to standby" signal
+// ============================================================
+//
+// Companion to [SharedFinalAnswerExtractor].  The two markers
+// share the same "marker → strategy exits" semantics; they differ
+// only in the resulting [StopReason] (FINAL_ANSWER → COMPLETED,
+// STANDBY_MARKER → STANDBY).  Detection precedence matters:
+//
+//   1. If a Final Answer marker is present, the agent has finished —
+//      the Final Answer wins and the standby marker is ignored
+//      (otherwise an LLM that accidentally writes both would flip
+//      the run into a STANDBY session even when it meant to wrap up).
+//   2. If only a standby marker is present at the END of the
+//      response, the strategy returns [StopReason.STANDBY] so the
+//      runtime parks the session to `runtime_state=standby`
+//      (lifecycle=standby) and the dispatcher can later wake it
+//      on a new mailbox message.
+//
+// The marker must be the LAST non-blank line of the assistant
+// message.  We do not require the entire response to be a single
+// line — the LLM can output reasoning, a `Tool decision: ...`
+// sentence, an `Action:` block, etc., and then a final
+// "Enter standby mode." line that signals "I'm done for now,
+// park me".  Matching against the last line keeps the marker
+// cheap to detect and avoids false positives on a stray "enter
+// standby mode" word inside a long Thought block.
+//
+// The canonical text is exactly `Enter standby mode.` (with the
+// trailing period and capital `E` / lowercase `s/m`); the
+// case-insensitive fallback accepts any casing and trims
+// surrounding whitespace.  The trailing period is REQUIRED in
+// the canonical form to make accidental matches on
+// "I will enter standby mode shortly" impossible.
+
+internal object SharedStandbyExtractor {
+    /** Canonical marker text.  Kept in one place so the agent
+     *  prompt and the extractor stay in sync. */
+    const val MARKER: String = "Enter standby mode."
+
+    /**
+     * True when [text] ends (after trimming) with the standby
+     * marker.  Used by the strategies to short-circuit the run()
+     * loop and return [StopReason.STANDBY] before the next
+     * iteration.
+     */
+    fun endsWithMarker(text: String): Boolean {
+        val trimmed = text.trimEnd()
+        // Canonical form first (case-sensitive), so "ENTER STANDBY MODE."
+        // does NOT match — the LLM is taught the exact lowercase form.
+        if (trimmed.endsWith(MARKER)) return true
+        // Case-insensitive fallback: trim the trailing line and
+        // accept any casing as long as the line equals the marker.
+        val lastLine = trimmed.lineSequence()
+            .lastOrNull { it.isNotBlank() }
+            ?.trim()
+            ?: return false
+        return lastLine.equals(MARKER, ignoreCase = true)
     }
 }
 
@@ -849,3 +1408,132 @@ private fun LoopStats.toResult(output: String, stopReason: StopReason): AgentRes
     totalOutputTokens = totalOutputTokens,
     stopReason = stopReason
 )
+
+// ============================================================
+//  Error envelopes — surface partial progress when the loop dies
+// ============================================================
+//
+// When the strategy loop is interrupted by an LLM error (model busy, network
+// timeout, rate limit, context overflow that the recovery hook couldn't fix,
+// etc.), the parent's downstream agent previously saw only a one-line error
+// string. That discarded whatever progress the child had already made —
+// burned tokens, burned tool calls, gone. The helpers below let the
+// strategies and the `spawn_sub_agent` tool compose a structured error
+// envelope that pairs the error with the child's last successful assistant
+// turn (and the tool observations that fed into it), so the parent can:
+//
+//   1. read the partial output and decide whether the work is salvageable,
+//   2. spawn a follow-up sub-agent for the un-finished portion without
+//      re-doing everything from scratch,
+//   3. cite the partial findings when reporting the dispatch failure.
+//
+// The snapshot is bounded by `maxChars`; the full conversation is still
+// available in the child's persistent memory / transcript for forensic
+// detail (use `read_history_tool_call` against `sessionId`).
+
+/**
+ * Build a single string suitable for [AgentResult.output] when the loop was
+ * interrupted by an LLM error. The envelope contains the error label and a
+ * bounded snapshot of the last successful assistant turn (paired with the
+ * most recent tool observations that fed into it).
+ *
+ * @param errorLabel short human-readable label (e.g. "Agent error",
+ *   "Child agent crashed").
+ * @param errorDetail the actual error message; falls back to a generic
+ *   placeholder if null/blank.
+ * @param memory the child's [ChatMemory] — the last assistant turn and any
+ *   preceding tool results are extracted from here.
+ * @param maxChars hard cap on the output size (default 8000, leaving room
+ *   for the surrounding envelope text and the parent's own context).
+ * @param stopReason the resulting [StopReason]; included for downstream
+ *   consumers that switch on it.
+ */
+internal fun buildErrorOutput(
+    errorLabel: String,
+    errorDetail: String?,
+    memory: ChatMemory,
+    maxChars: Int = 8_000,
+    stopReason: StopReason = StopReason.ERROR,
+): String {
+    val detail = errorDetail?.takeIf { it.isNotBlank() } ?: "LLM call failed (no detail)"
+    // Reserve ~600 chars for the envelope framing; the snapshot fills the rest.
+    val snapshotBudget = (maxChars - 600).coerceAtLeast(512)
+    val snapshot = lastAssistantSnapshot(memory, snapshotBudget)
+    val sessionHint = memory.sessionId?.let { " (child sessionId=$it; full transcript readable via read_history_tool_call)" }
+        ?: ""
+    return buildString {
+        appendLine("$errorLabel: $detail")
+        appendLine("stopReason: ${stopReason.name}")
+        if (sessionHint.isNotEmpty()) appendLine(sessionHint)
+        appendLine()
+        appendLine("Last successful assistant turn before the failure " +
+            "(so the parent can salvage partial progress):")
+        appendLine("--- begin last-turn snapshot ---")
+        if (snapshot == null) {
+            appendLine("<no assistant turn recorded before the failure — " +
+                "the child crashed before the first model response completed>")
+        } else {
+            appendLine(snapshot)
+        }
+        appendLine("--- end last-turn snapshot ---")
+    }
+}
+
+/**
+ * Extract a bounded snapshot of the child's most recent assistant turn and
+ * the tool observations that immediately preceded it. Returns null when no
+ * assistant turn has been recorded yet.
+ *
+ * The walk stops at the first non-tool message before the last assistant
+ * turn, so the snapshot contains exactly the observations the assistant was
+ * reacting to when it produced its last message — not the entire preceding
+ * conversation. That keeps the envelope small while preserving the chain
+ * of evidence the parent most likely needs.
+ */
+internal fun lastAssistantSnapshot(
+    memory: ChatMemory,
+    maxChars: Int = 8_000,
+): String? {
+    val msgs = try {
+        memory.messages()
+    } catch (_: Throwable) {
+        return null
+    }
+    if (msgs.isEmpty()) return null
+
+    val lastAssistantIdx = msgs.indexOfLast { it.role == "assistant" }
+    if (lastAssistantIdx < 0) return null
+    val lastAssistant = msgs[lastAssistantIdx].content
+
+    // Walk back from the last assistant message to gather the tool
+    // observations that fed into it. Stop at the previous user/assistant
+    // boundary so we capture only the most recent tool batch.
+    val preceding = mutableListOf<org.iotsplab.akiba.llm.memory.AgentChatMessage>()
+    for (i in (lastAssistantIdx - 1) downTo 0) {
+        val m = msgs[i]
+        if (m.role != "tool") break
+        preceding.add(0, m)
+    }
+
+    val snapshot = buildString {
+        if (preceding.isNotEmpty()) {
+            appendLine("Most recent observation(s) the child had processed:")
+            for (m in preceding) {
+                val toolName = m.toolName ?: "tool"
+                appendLine("- $toolName:")
+                appendLine(m.content)
+                appendLine()
+            }
+        }
+        appendLine("Last assistant turn before the failure:")
+        appendLine(lastAssistant)
+    }
+
+    return if (snapshot.length > maxChars) {
+        snapshot.substring(0, maxChars) +
+            "\n... (truncated; full text in child transcript" +
+            (memory.sessionId?.let { ", sessionId=$it" } ?: "") + ")"
+    } else {
+        snapshot
+    }
+}

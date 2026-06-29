@@ -16,7 +16,12 @@ import org.iotsplab.akiba.module.AkibaModule
  * `org.iotsplab.akiba.llm.tool` package:
  *
  * - [RunModuleTool] — delegate work to another [AkibaModule]
- * - [RunSubAgentTool] — spawn a child LLM agent
+ * - [SpawnSubAgentTool] — async fire-and-forget child LLM agent
+ *   (template path or freeform path)
+ * - [AwaitAgentTool] — wait for an async child to reach a target state
+ * - [AwaitMultipleChildrenTool] — batch-wait for N child agents in
+ *   one call (mode=any|all)
+ * - [AgentBuilderAlternativesTool] — describe available templates
  * - [QueryModuleDataTool] — query analysis results from the database
  * - [QuerySessionHistoryTool] — review past agent sessions
  * - [QueryMemoriesTool] — search the long-term memory store
@@ -54,7 +59,11 @@ object BuiltInTools {
      */
     fun all(parent: AgentModule, agentDbClient: AgentDatabaseClient, username: String? = null): List<Tool> = listOf(
         RunModuleTool(parent),
-        RunSubAgentTool(parent, agentDbClient),
+        SpawnSubAgentTool(parent, agentDbClient),
+        AwaitAgentTool(parent, agentDbClient),
+        AwaitMultipleChildrenTool(parent, agentDbClient),
+        GetAgentStatusTool(agentDbClient, parent.agentSessionId),
+        AgentBuilderAlternativesTool(parent),
         QueryModuleDataTool(parent),
         QuerySessionHistoryTool(agentDbClient),
         QueryMemoriesTool(agentDbClient),
@@ -74,6 +83,11 @@ object BuiltInTools {
      * ```kotlin
      * BuiltInTools.registerAll(registry, this, agentDbClient)
      * ```
+     *
+     * Note: the mailbox / artifact tools are NOT in this
+     * default set — opt in by appending
+     * `AgentMailboxTools(myMailboxService, parent.agentSessionId)` in
+     * [AgentModule.defineTools].
      */
     fun registerAll(registry: ToolRegistry, parent: AgentModule, agentDbClient: AgentDatabaseClient, username: String? = null) {
         registry.registerAll(all(parent, agentDbClient, username))

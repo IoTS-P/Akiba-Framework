@@ -321,7 +321,8 @@ Akiba provides a built-in LLM agent infrastructure for intelligent binary analys
 When using `AgentModule`, the following built-in tools are automatically available:
 
 - `run_module` — Delegate work to another AkibaModule
-- `run_sub_agent` — Spawn a child LLM agent
+- `spawn_sub_agent` — Async-spawn a child LLM agent (template or freeform)
+- `await_agent` — Wait for an async child to reach a target state
 - `query_module_data` — Query analysis results from the database
 - `query_session_history` — Review past agent sessions
 - `query_memories` — Search the long-term memory store

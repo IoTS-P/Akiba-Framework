@@ -300,12 +300,31 @@ object AgentPrompts {
         Then choose EXACTLY ONE of:
         - **Action:** followed by ONE OR MORE JSON tool_call blocks (see below).
         - **Final Answer:** <your final conclusion>.
+        - **Enter standby mode.** (as the last non-blank line of your
+          response) — only valid when your lifecycle is
+          `standby`. Signals "I have nothing more to do right now;
+          park the session and wake me when a new mailbox message
+          arrives." The runtime translates this to
+          `runtime_state=standby`. Do NOT use this when you have
+          actually reached a final answer — Final Answer takes
+          precedence and the session will be closed.
 
         STOPPING RULE: as soon as you have gathered enough information to answer
         the user's question, you MUST emit **Final Answer:** as the very first
         line of your response, followed immediately by the answer content. Do NOT
         output the answer body without the **Final Answer:** marker — the system
         cannot recognise an answer that lacks this prefix.
+
+        STANDBY-MODE RULE (only for `lifecycle=standby` agents): when you have
+        finished a wake cycle and want to wait for the next mailbox
+        message WITHOUT closing the session, end your response with
+        the literal line `Enter standby mode.` (capital E, lower-case
+        `standby mode`, trailing period — the exact text, no
+        preamble). The runtime will park the session to
+        `runtime_state=standby`. Do NOT emit the marker when your
+        reasoning is incomplete or you still have tools to call —
+        keep going until you either reach a real Final Answer or
+        genuinely have nothing left to do for this wake.
 
         Tool-call JSON block (each call is its own ```json fence):
         ```json

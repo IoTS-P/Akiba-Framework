@@ -417,7 +417,9 @@ When using `AgentModule`, the following built-in tools are automatically availab
 | Tool Name | Description | Parameters |
 |-----------|-------------|------------|
 | `run_module` | Run another AkibaModule on current or different binary | `className` (required), `targetId`, `configJson`, `timeout`, `skipDbWrite` |
-| `run_sub_agent` | Spawn a child LLM agent for sub-tasks | `systemPrompt` (required), `taskPrompt` (required), `toolNames`, `maxIterations` |
+| `spawn_sub_agent` | Async-spawn a child LLM agent (template or freeform path), returns a handle immediately | `templateId` or `systemPrompt`+`taskPrompt`, `inputs`, `overrides`, `toolNames`, `maxIterations` |
+| `await_agent` | Wait for a single child agent to reach a target state | `childId` (required), `until`, `timeoutMs`, `pollMs` |
+| `await_multiple_children` | Batch-wait for multiple child agents (any/all mode) | `childIds` (required), `mode` (any/all/any_idle/all_idle), `until`, `timeoutMs`, `pollMs` |
 | `query_module_data` | Query analysis results from the database | `tableName` (required), `columns` |
 | `query_session_history` | Review past agent sessions or get messages | `sessionId`, `binaryId`, `limit` |
 | `query_memories` | Search the long-term memory store | `sessionId`, `memoryType`, `key`, `minImportance`, `limit` |
@@ -440,9 +442,22 @@ Run another AkibaModule and return its result. The module must be a fully-qualif
 }
 ```
 
-#### run_sub_agent
+#### spawn_sub_agent
 
-Spawn a child agent with its own conversation history and tools.
+Async-spawn a child LLM agent and return a handle immediately (use
+`await_agent` to wait for a target state).
+
+Template path (recommended):
+
+```json
+{
+  "templateId": "binary_crypto_worker",
+  "inputs": { "addressRange": "0x401000-0x402000" },
+  "name": "crypto-sweep"
+}
+```
+
+Freeform path (no template needed):
 
 ```json
 {

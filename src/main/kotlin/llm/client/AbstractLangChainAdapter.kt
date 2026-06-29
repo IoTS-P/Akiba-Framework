@@ -17,12 +17,14 @@ import dev.langchain4j.model.chat.request.json.JsonIntegerSchema
 import dev.langchain4j.model.chat.request.json.JsonBooleanSchema
 import dev.langchain4j.model.chat.request.json.JsonEnumSchema
 import dev.langchain4j.model.chat.request.json.JsonSchemaElement
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.withTimeout
 import org.apache.logging.log4j.LogManager
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -41,6 +43,8 @@ import java.util.concurrent.atomic.AtomicReference
  * [AiMessage.toolExecutionRequests] which are surfaced as
  * [ChatCompletion.toolCalls].
  */
+class LLMTimeoutException(message: String) : RuntimeException(message)
+
 abstract class AbstractLangChainAdapter(
     override val config: LLMConfig
 ) : AkibaLLMClient {
@@ -55,6 +59,32 @@ abstract class AbstractLangChainAdapter(
     protected abstract val providerTag: String
 
     private val logger = LogManager.getLogger(this::class.java)
+
+    private fun <T> runWithHardTimeout(label: String, block: () -> T): T {
+        val timeoutSeconds = config.timeoutSeconds.coerceAtLeast(1)
+        val executor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "akiba-llm-$providerTag-$label-timeout").apply { isDaemon = true }
+        }
+        val future = executor.submit<T> { block() }
+        return try {
+            future.get(timeoutSeconds.toLong(), TimeUnit.SECONDS)
+        } catch (e: TimeoutException) {
+            future.cancel(true)
+            throw LLMTimeoutException(
+                "$providerTag $label timed out after ${timeoutSeconds}s " +
+                    "(model=${config.modelName})"
+            )
+        } catch (e: ExecutionException) {
+            val cause = e.cause ?: e
+            when (cause) {
+                is RuntimeException -> throw cause
+                is Error -> throw cause
+                else -> throw RuntimeException(cause)
+            }
+        } finally {
+            executor.shutdownNow()
+        }
+    }
 
     // ============================================================
     //  Chat (sync)
@@ -72,14 +102,16 @@ abstract class AbstractLangChainAdapter(
 
         val toolSpecs = tools?.mapNotNull { parseToolSpec(it) }
 
-        val response: ChatResponse = if (!toolSpecs.isNullOrEmpty() && supportsToolCalling()) {
-            val request = ChatRequest.builder()
-                .messages(lcMessages)
-                .toolSpecifications(toolSpecs)
-                .build()
-            chatModel.chat(request)
-        } else {
-            chatModel.chat(lcMessages)
+        val response: ChatResponse = runWithHardTimeout("chat") {
+            if (!toolSpecs.isNullOrEmpty() && supportsToolCalling()) {
+                val request = ChatRequest.builder()
+                    .messages(lcMessages)
+                    .toolSpecifications(toolSpecs)
+                    .build()
+                chatModel.chat(request)
+            } else {
+                chatModel.chat(lcMessages)
+            }
         }
 
         return toChatCompletion(response)
@@ -102,48 +134,52 @@ abstract class AbstractLangChainAdapter(
         val latch = CountDownLatch(1)
         var completionResponse: ChatResponse? = null
 
-        if (!toolSpecs.isNullOrEmpty() && supportsToolCalling()) {
-            val request = ChatRequest.builder()
-                .messages(lcMessages)
-                .toolSpecifications(toolSpecs)
-                .build()
-            streamingModel.chat(request, object : StreamingChatResponseHandler {
-                override fun onPartialResponse(partial: String) {
-                    synchronized(buffer) { buffer.append(partial) }
-                }
+        runWithHardTimeout("stream-start") {
+            if (!toolSpecs.isNullOrEmpty() && supportsToolCalling()) {
+                val request = ChatRequest.builder()
+                    .messages(lcMessages)
+                    .toolSpecifications(toolSpecs)
+                    .build()
+                streamingModel.chat(request, object : StreamingChatResponseHandler {
+                    override fun onPartialResponse(partial: String) {
+                        synchronized(buffer) { buffer.append(partial) }
+                    }
 
-                override fun onCompleteResponse(response: ChatResponse) {
-                    completionResponse = response
-                    latch.countDown()
-                }
+                    override fun onCompleteResponse(response: ChatResponse) {
+                        completionResponse = response
+                        latch.countDown()
+                    }
 
-                override fun onError(error: Throwable) {
-                    errorRef.set(error)
-                    latch.countDown()
-                }
-            })
-        } else {
-            streamingModel.chat(lcMessages, object : StreamingChatResponseHandler {
-                override fun onPartialResponse(partial: String) {
-                    synchronized(buffer) { buffer.append(partial) }
-                }
+                    override fun onError(error: Throwable) {
+                        errorRef.set(error)
+                        latch.countDown()
+                    }
+                })
+            } else {
+                streamingModel.chat(lcMessages, object : StreamingChatResponseHandler {
+                    override fun onPartialResponse(partial: String) {
+                        synchronized(buffer) { buffer.append(partial) }
+                    }
 
-                override fun onCompleteResponse(response: ChatResponse) {
-                    completionResponse = response
-                    latch.countDown()
-                }
+                    override fun onCompleteResponse(response: ChatResponse) {
+                        completionResponse = response
+                        latch.countDown()
+                    }
 
-                override fun onError(error: Throwable) {
-                    errorRef.set(error)
-                    latch.countDown()
-                }
-            })
+                    override fun onError(error: Throwable) {
+                        errorRef.set(error)
+                        latch.countDown()
+                    }
+                })
+            }
         }
 
-        withTimeout(config.timeoutSeconds.toLong() * 1000) {
-            while (latch.count > 0) {
-                delay(50)
-            }
+        val completed = latch.await(config.timeoutSeconds.coerceAtLeast(1).toLong(), TimeUnit.SECONDS)
+        if (!completed) {
+            throw LLMTimeoutException(
+                "$providerTag streaming chat timed out after ${config.timeoutSeconds.coerceAtLeast(1)}s " +
+                    "(model=${config.modelName})"
+            )
         }
 
         errorRef.get()?.let { throw RuntimeException("$providerTag streaming error", it) }

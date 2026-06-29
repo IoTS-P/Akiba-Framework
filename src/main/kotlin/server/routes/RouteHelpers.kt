@@ -71,9 +71,38 @@ fun ApplicationCall.currentUsernameOrDefault(): String {
     return UserDao.getUserById(session.userId)?.username ?: DAEMON_USER
 }
 
+/** Safely-mapped current username that is always safe to embed into a path segment. */
+fun ApplicationCall.currentSafeUsername(): String = safePathSegment(currentUsernameOrDefault())
+
+/**
+ * Absolute directory under `ghidra_projects/<username>/` that is the per-user
+ * Ghidra project root. This is independent of the global `projectConf.projectRoot`
+ * because each user gets an isolated directory tree for their projects.
+ */
+fun ApplicationCall.currentUserGhidraProjectsRoot(): Path {
+    val username = currentSafeUsername()
+    return Path.of("ghidra_projects", username).toAbsolutePath().normalize()
+}
+
+/** `~/.akiba/logs/<username>/` — fixed per-user logs directory. */
+fun ApplicationCall.currentUserLogsRoot(): Path {
+    val username = currentSafeUsername()
+    return Path.of(System.getProperty("user.home"), ".akiba", "logs", username)
+        .toAbsolutePath()
+        .normalize()
+}
+
+/** `~/.akiba/workspace/<username>/` — fixed per-user workspace directory. */
+fun ApplicationCall.currentUserWorkspaceRoot(): Path {
+    val username = currentSafeUsername()
+    return Path.of(System.getProperty("user.home"), ".akiba", "workspace", username)
+        .toAbsolutePath()
+        .normalize()
+}
+
 /** Directory name under the configured Ghidra project root for this request's user. */
 fun ApplicationCall.currentUserProjectDirectory(): Path =
-    Path.of(safePathSegment(currentUsernameOrDefault()))
+    Path.of(currentSafeUsername())
 
 private fun safePathSegment(value: String): String =
     value.replace(Regex("[^A-Za-z0-9._-]+"), "_")

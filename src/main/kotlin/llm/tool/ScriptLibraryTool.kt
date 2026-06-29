@@ -291,6 +291,37 @@ private fun searchScripts(agentDbClient: AgentDatabaseClient, keyword: String): 
     return sb.toString()
 }
 
+private fun kotlinLiteral(value: Any?): String = when (value) {
+    null -> "null"
+    is String -> buildString {
+        append('"')
+        for (ch in value) {
+            when (ch) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                '\b' -> append("\\b")
+                '\u000C' -> append("\\u000C")
+                '$' -> append("\\${'$'}")
+                else -> {
+                    if (ch.code < 0x20) append("\\u%04x".format(ch.code)) else append(ch)
+                }
+            }
+        }
+        append('"')
+    }
+    is Boolean -> value.toString()
+    is Number -> value.toString()
+    is Map<*, *> -> value.entries.joinToString(prefix = "mapOf(", postfix = ")") { (k, v) ->
+        "${kotlinLiteral(k?.toString() ?: "")} to ${kotlinLiteral(v)}"
+    }
+    is Iterable<*> -> value.joinToString(prefix = "listOf(", postfix = ")") { kotlinLiteral(it) }
+    is Array<*> -> value.joinToString(prefix = "listOf(", postfix = ")") { kotlinLiteral(it) }
+    else -> kotlinLiteral(value.toString())
+}
+
 private fun runLibraryScript(
     agentDbClient: AgentDatabaseClient,
     parent: AkibaModule,
@@ -305,19 +336,12 @@ private fun runLibraryScript(
     val sourceWithArgs = if (parameters.isNotEmpty()) {
         // Inject a scriptArgs map accessible within execute()
         val injection = buildString {
+            val paramsJson = mapper.writeValueAsString(parameters)
+            val paramsB64 = java.util.Base64.getEncoder()
+                .encodeToString(paramsJson.toByteArray(Charsets.UTF_8))
             appendLine("// Auto-injected scriptArgs")
-            appendLine("val scriptArgs: Map<String, Any?> = mapOf(")
-            parameters.entries.forEachIndexed { i, (k, v) ->
-                val valueStr = when (v) {
-                    is String -> "\"${v.replace("\"", "\\\"")}\""
-                    null -> "null"
-                    else -> v.toString()
-                }
-                append("    \"$k\" to $valueStr")
-                if (i < parameters.size - 1) append(",")
-                appendLine()
-            }
-            appendLine(")")
+            appendLine("private val __akibaScriptArgsJson = String(java.util.Base64.getDecoder().decode(${kotlinLiteral(paramsB64)}), Charsets.UTF_8)")
+            appendLine("val scriptArgs: Map<String, Any?> = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper().readValue(__akibaScriptArgsJson, object : com.fasterxml.jackson.core.type.TypeReference<Map<String, Any?>>() {})")
         }
         // Insert the injection after the imports, before the class definition
         val classIdx = script.source.indexOf("class ${script.className}")

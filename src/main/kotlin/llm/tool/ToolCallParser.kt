@@ -195,6 +195,27 @@ object ToolCallParser {
             else -> inferExpandedToolCall(parsed) ?: return null
         }
 
+        // Defensive fix: if the candidate carries the signature of
+        // `spawn_sub_agent` (templateId + inputs), it is almost certainly
+        // an LLM that emitted the tool's arguments WITHOUT the outer
+        // `{"tool_call": {...}}` wrapper. In that case the top-level
+        // `name` field is the *child session display name* (a parameter),
+        // not the tool name — and using it as the tool name produces
+        // "Unknown tool: <child-session-name>" in the parent registry.
+        // Force the tool name to `spawn_sub_agent` and keep the rest of
+        // the fields as arguments (where `name` correctly belongs). The
+        // wrapped form is unaffected because templateId / inputs live
+        // one level deeper, inside `arguments`.
+        if (candidate["templateId"] is String && candidate["inputs"] != null) {
+            val args = candidate.toMutableMap()
+            return ParsedToolCall(
+                callId = "tc_${System.nanoTime()}",
+                name = "spawn_sub_agent",
+                arguments = args,
+                argumentsJson = mapper.writeValueAsString(args)
+            )
+        }
+
         val nameKeys = listOf("name", "tool", "tool_name", "toolName", "type")
         val argKeys = listOf("arguments", "args", "parameters", "input", "params")
         val name = firstString(candidate, listOf("name", "tool", "tool_name", "toolName")) ?: return null

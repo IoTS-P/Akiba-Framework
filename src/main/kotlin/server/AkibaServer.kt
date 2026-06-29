@@ -35,6 +35,7 @@ import org.iotsplab.akiba.server.routes.queryRoutes
 import org.iotsplab.akiba.server.routes.agentRoutes
 import org.iotsplab.akiba.server.routes.llmConfigRoutes
 import org.iotsplab.akiba.server.routes.runtimeConfigRoutes
+import org.iotsplab.akiba.server.routes.projectRoutes
 import org.iotsplab.akiba.server.routes.skillRoutes
 
 object AkibaServer {
@@ -91,6 +92,7 @@ object AkibaServer {
                     queryRoutes(config.daemonHost, config.daemonPort)
                     agentRoutes(config.daemonHost, config.daemonPort)
                     skillRoutes()
+                    projectRoutes(config.daemonHost, config.daemonPort)
                     llmConfigRoutes()
                     runtimeConfigRoutes()
                 }

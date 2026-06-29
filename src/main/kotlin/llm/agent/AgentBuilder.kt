@@ -185,6 +185,7 @@ class AgentBuilder {
     private var sessionId: String? = null
     private var binaryId: Int? = null
     private var agentDbClient: AgentDatabaseClient? = null
+    private var transcript: AgentTranscriptWriter? = null
 
     /** Set the [AgentDatabaseClient] for session persistence and audit. */
     fun agentDbClient(client: AgentDatabaseClient) {
@@ -216,6 +217,23 @@ class AgentBuilder {
         memoryManager = mgr
     }
 
+    /**
+     * Provide a pre-built [AgentTranscriptWriter] for this agent.
+     *
+     * When set, the strategy will write every LLM interaction, tool call
+     * and tool result to the writer (typically a writer targeting the
+     * agent's session row in the database). The Markdown rendered there
+     * powers the per-session export endpoint and the agent-tree view.
+     *
+     * Sub-agent factories built via [akibaAgent] should pass the
+     * transcript writer from [SubAgentFactoryContext.transcript] here
+     * so child sessions get the same export / front-end visibility
+     * as top-level sessions.
+     */
+    fun transcript(writer: AgentTranscriptWriter?) {
+        transcript = writer
+    }
+
     // ---- Tools -----------------------------------------------------------
 
     private val toolRegistry = ToolRegistry()
@@ -242,6 +260,22 @@ class AgentBuilder {
     private var audit: Boolean = true
     private var agentStrategy: AgentStrategy = ReActStrategy()
     private var duplicateDetector: ToolResultDuplicateDetector? = null
+    private var harness: AgentHarness = DefaultAgentHarness
+
+    /**
+     * Install a custom domain [AgentHarness] (workflow gates, tool-call
+     * redirects, final-answer validation) for this agent. By default the
+     * builder installs [DefaultAgentHarness], which is a no-op.
+     *
+     * Sub-agent factories built via [akibaAgent] typically pass a custom
+     * harness here so child agents enforce the same workflow rules the
+     * parent enforces (e.g. VulnDetector sub-agent harnesses for
+     * `linear_checker` / `recursive_checker` enforce the comment-after-
+     * disassembly rule and the canonical comment format).
+     */
+    fun harness(h: AgentHarness) {
+        harness = h
+    }
 
     /** Set the maximum iteration limit. */
     fun maxIterations(n: Int) {
@@ -300,6 +334,96 @@ class AgentBuilder {
         agentStrategy = PlanExecuteStrategy(maxReplanCycles = maxReplanCycles)
     }
 
+    // ---- Sub-agents ------------------------------------------------------
+
+    private val subAgents = mutableListOf<ProgrammaticSubAgentSpec>()
+
+    /**
+     * Declare a child agent to be pre-created at startup.  The block
+     * receives a [ProgrammaticSubAgentBuilder] for `depth` /
+     * `lifecycle` / `taskPrompt` / `buildAgent { handle -> ... }`.
+     * Each entry is materialised as a [ProgrammaticSubAgentSpec] in
+     * [AkibaAgent.subAgents]; [AgentModule.spawnConfiguredSubAgents]
+     * iterates that list and spawns each child via
+     * [spawnChildFromAgentProgrammatically] before the parent's
+     * first turn.
+     *
+     * ```kotlin
+     * akibaAgent {
+     *     client(...)
+     *     system("...")
+     *     subAgent("batch_linear_planner") {
+     *         depth = 1
+     *         lifecycle(Lifecycle.STANDBY)
+     *         taskPrompt = "Read your inbox on every wake."
+     *         buildAgent { handle ->
+     *             AkibaAgent(client = ..., sessionId = handle.sessionId, ...)
+     *         }
+     *     }
+     * }
+     * ```
+     */
+    fun subAgent(name: String, configure: ProgrammaticSubAgentBuilder.() -> Unit) {
+        subAgents += ProgrammaticSubAgentBuilder(name).apply(configure).build()
+    }
+
+    // ---- Lifecycle / mailbox / runtime / logger / compaction ------------
+
+    private var lifecycleValue: Lifecycle = Lifecycle.ONE_SHOT
+    private var mailboxServiceValue: AgentMailboxService? = null
+    private var loggerValue: org.apache.logging.log4j.Logger? = null
+    private var runtimeHandleValue: JobHandle? = null
+    private var autoCompactValue: Boolean = true
+    private var compactOnStandbyValue: Boolean = true
+    private var compactThresholdValue: Double = 0.75
+    private var compactKeepRoundsValue: Int = 2
+    private var errorRecoverySafetyFactorValue: Double = 0.85
+
+    /** Set the [Lifecycle] the agent runs with. Default [Lifecycle.ONE_SHOT]. */
+    fun lifecycle(value: Lifecycle) {
+        lifecycleValue = value
+    }
+
+    /** Provide a mailbox service for inter-agent communication. */
+    fun mailboxService(value: AgentMailboxService?) {
+        mailboxServiceValue = value
+    }
+
+    /** Provide a custom logger (defaults to a class-level logger). */
+    fun logger(value: org.apache.logging.log4j.Logger) {
+        loggerValue = value
+    }
+
+    /** Provide a runtime handle (used by the [AgentRuntime] for cancellation). */
+    fun runtimeHandle(value: JobHandle?) {
+        runtimeHandleValue = value
+    }
+
+    /** Whether to auto-compact the conversation before each `run()`. */
+    fun autoCompact(value: Boolean) {
+        autoCompactValue = value
+    }
+
+    /** Whether to compact just before parking a STANDBY session. */
+    fun compactOnStandby(value: Boolean) {
+        compactOnStandbyValue = value
+    }
+
+    /** Fraction of [AkibaAgent.contextLength] that triggers compaction. */
+    fun compactThreshold(value: Double) {
+        compactThresholdValue = value
+    }
+
+    /** Number of recent rounds to retain during compaction. */
+    fun compactKeepRounds(value: Int) {
+        compactKeepRoundsValue = value
+    }
+
+    /** Safety factor applied when adjusting the effective context cap after a recovery. */
+    fun errorRecoverySafetyFactor(value: Double) {
+        errorRecoverySafetyFactorValue = value
+    }
+
     // ---- Build -----------------------------------------------------------
 
     /**
@@ -337,7 +461,19 @@ class AgentBuilder {
             strategy = agentStrategy,
             contextLength = contextLength,
             agentDbClient = agentDbClient,
-            toolResultDuplicateDetector = duplicateDetector
+            toolResultDuplicateDetector = duplicateDetector,
+            agentHarness = harness,
+            transcript = transcript,
+            autoCompact = autoCompactValue,
+            compactOnStandby = compactOnStandbyValue,
+            compactThreshold = compactThresholdValue,
+            compactKeepRounds = compactKeepRoundsValue,
+            errorRecoverySafetyFactor = errorRecoverySafetyFactorValue,
+            lifecycle = lifecycleValue,
+            mailboxService = mailboxServiceValue,
+            logger = loggerValue ?: org.apache.logging.log4j.LogManager.getLogger(AkibaAgent::class.java),
+            runtimeHandle = runtimeHandleValue,
+            subAgents = subAgents.toList(),
         )
     }
 }

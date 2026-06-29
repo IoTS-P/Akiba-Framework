@@ -1,5 +1,6 @@
 package org.iotsplab.akiba.data.database
 
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import io.ktor.http.HttpStatusCode
@@ -43,7 +44,11 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         val updatedAt: String?,
         val resumedAt: String?,
         val completedAt: String?,
-        val transcript: String? = null
+        val transcript: String? = null,
+        val parentSessionId: String? = null,
+        val lifecycle: String? = null,
+        val runtimeState: String? = null,
+        val closingReason: String? = null,
     )
 
     /**
@@ -56,15 +61,22 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         binaryId: Int? = null,
         moduleName: String? = null,
         modelName: String? = null,
-        projectName: String? = null
+        projectName: String? = null,
+        /**
+         * Optional parent session id. Set when spawning a child agent
+         * (e.g. via `spawn_sub_agent`) so the frontend can group them
+         * into a parent/child tree.
+         */
+        parentSessionId: String? = null
     ): String = runBlocking {
-        val body = mapOf(
+        val body = mutableMapOf<String, Any?>(
             "sessionName" to sessionName,
             "binaryId" to binaryId,
             "moduleName" to moduleName,
             "modelName" to modelName,
             "projectName" to projectName
         )
+        if (parentSessionId != null) body["parentSessionId"] = parentSessionId
         val response = dbClient.post("/agent/session/create", body)
         if (response.first == HttpStatusCode.OK)
             response.second.removeSurrounding("\"")  // UUID string
@@ -86,6 +98,13 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
 
     /**
      * List sessions with optional filters.
+     *
+     * @param parentSessionId
+     *   - `null` (default): only top-level sessions (parent_session_id IS NULL).
+     *     Sub-agents spawned by `spawn_sub_agent` are hidden by default.
+     *   - a specific UUID: only direct children of that parent.
+     *   - the literal string "ALL" (or any non-UUID string): return every
+     *     session regardless of parent (used by advanced views / debugging).
      */
     @Throws(DatabaseClient.DatabaseDaemonException::class)
     fun listSessions(
@@ -93,16 +112,32 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         binaryId: Int? = null,
         moduleName: String? = null,
         limit: Int = 50,
-        offset: Int = 0
+        offset: Int = 0,
+        parentSessionId: String? = null
     ): List<SessionInfo> = runBlocking {
-        val body = mapOf(
+        val body = mutableMapOf<String, Any?>(
             "status" to status,
             "binaryId" to binaryId,
             "moduleName" to moduleName,
             "limit" to limit,
             "offset" to offset
         )
+        if (parentSessionId != null) body["parentSessionId"] = parentSessionId
         val response = dbClient.post("/agent/session/list", body)
+        if (response.first == HttpStatusCode.OK)
+            mapper.readValue<List<SessionInfo>>(response.second)
+        else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    /**
+     * List direct children of [parentSessionId] in chronological order.
+     * Used by the frontend to walk the parent → child tree.
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun getSessionChildren(parentSessionId: String): List<SessionInfo> = runBlocking {
+        val body = mapOf("parentSessionId" to parentSessionId)
+        val response = dbClient.post("/agent/session/children", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<List<SessionInfo>>(response.second)
         else
@@ -349,6 +384,620 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
     fun appendTranscript(sessionId: String, content: String) = runBlocking {
         val body = mapOf("sessionId" to sessionId, "content" to content)
         val response = dbClient.post("/agent/transcript/append", body)
+        if (response.first != HttpStatusCode.OK)
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    // ============================================================
+    //  Session Lifecycle
+    // ============================================================
+
+    /**
+     * Update a session's `lifecycle` field. The orchestrator decides
+     * when a session becomes standby (typically after its one-shot
+     * task completes).
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun setSessionLifecycle(sessionId: String, lifecycle: String) = runBlocking {
+        require(lifecycle in setOf("one_shot", "standby")) {
+            "lifecycle must be one_shot or standby, got '$lifecycle'"
+        }
+        val body = mapOf("sessionId" to sessionId, "lifecycle" to lifecycle)
+        val response = dbClient.post("/agent/session/set_lifecycle", body)
+        if (response.first != HttpStatusCode.OK)
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    // ============================================================
+    //  Runtime State
+    // ============================================================
+
+    /**
+     * Snapshot of a session's runtime state. The [runtimeState] field
+     * is one of `running / standby / msghandle / cancelling / closed`;
+     * the daemon returns the raw string and the caller is expected to
+     * map it through [org.iotsplab.akiba.llm.agent.RuntimeState.fromWire].
+     */
+    data class RuntimeStateInfo(
+        val sessionId: String,
+        val runtimeState: String,
+        val closingReason: String?,
+        val lifecycle: String?,
+        val status: String?,
+        val parentSessionId: String? = null,
+    )
+
+    /**
+     * Update the session's `runtime_state` and optional `closing_reason`.
+     * Caller is responsible for ensuring the transition is legal
+     * (see [org.iotsplab.akiba.llm.agent.RuntimeState.canTransition]);
+     * the daemon merely mirrors the new value.
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun setRuntimeState(
+        sessionId: String,
+        runtimeState: String,
+        closingReason: String? = null,
+    ) = runBlocking {
+        require(runtimeState in setOf("running", "standby", "msghandle", "cancelling", "closed", "error")) {
+            "runtimeState must be one of running|standby|msghandle|cancelling|closed|error, got '$runtimeState'"
+        }
+        val body = mutableMapOf<String, Any?>(
+            "sessionId" to sessionId,
+            "runtimeState" to runtimeState,
+        )
+        if (closingReason != null) body["closingReason"] = closingReason
+        val response = dbClient.post("/agent/session/set_runtime_state", body)
+        if (response.first != HttpStatusCode.OK)
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    /**
+     * Fetch the current `runtime_state` and `closing_reason`. Returns
+     * null when the session does not exist. Used by the dispatcher
+     * pre-flight and by JobHandle.await to seed the local state cache.
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun getRuntimeState(sessionId: String): RuntimeStateInfo? = runBlocking {
+        val response = dbClient.post(
+            "/agent/session/get_runtime_state",
+            mapOf("sessionId" to sessionId),
+        )
+        when {
+            response.first == HttpStatusCode.OK ->
+                mapper.readValue<RuntimeStateInfo>(response.second)
+            response.first == HttpStatusCode.NotFound -> null
+            else -> throw DatabaseClient.DatabaseDaemonException(
+                response.first, response.first.description
+            )
+        }
+    }
+
+    /**
+     * Walk the descendant tree of [rootSessionId] and return every
+     * session that is still live (`runtime_state != 'closed'`).
+     * One SQL round-trip via a recursive CTE. Used by cascade
+     * cancel and OrphanReaper.
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun listLiveSubtree(rootSessionId: String, includeClosed: Boolean = false): List<RuntimeStateInfo> =
+        runBlocking {
+            val body = mapOf(
+                "rootSessionId" to rootSessionId,
+                "includeClosed" to includeClosed,
+            )
+            val response = dbClient.post("/agent/session/list_live_subtree", body)
+            if (response.first == HttpStatusCode.OK)
+                mapper.readValue<List<RuntimeStateInfo>>(response.second)
+            else
+                throw DatabaseClient.DatabaseDaemonException(
+                    response.first, response.first.description
+                )
+        }
+
+    // ============================================================
+    //  Agent status snapshot (used by get_agent_status tool)
+    // ============================================================
+
+    /**
+     * Relationship between the calling session and the target
+     * session.  Auto-detected by the daemon from
+     * `parent_session_id` so the caller never has to declare
+     * it.  See
+     * [org.iotsplab.akiba.dbDaemon.operations.AgentOps.GetAgentStatus]
+     * for the detection rules.
+     *
+     * The current default policy admits [SELF] and [DIRECT_CHILD]
+     * only; [DIRECT_PARENT] / [SIBLING] / [OTHER] are detected
+     * (so the LLM can see WHY access was denied) but currently
+     * rejected.  Adding more admitted relationships will
+     * require an explicit permission model.
+     */
+    enum class AgentRelationship {
+        /** target == caller. */
+        SELF,
+        /** target.parent_session_id == caller. */
+        DIRECT_CHILD,
+        /** caller.parent_session_id == target. */
+        DIRECT_PARENT,
+        /** target.parent_session_id == caller.parent_session_id (and not self). */
+        SIBLING,
+        /** Any other relationship (grandchild, uncle, unrelated, ...). */
+        OTHER,
+        ;
+
+        /** Wire value used in the request / response. */
+        fun wire(): String = name.lowercase()
+
+        companion object {
+            fun fromWire(raw: String?): AgentRelationship? = when (raw?.lowercase()) {
+                "self" -> SELF
+                "direct_child" -> DIRECT_CHILD
+                "direct_parent" -> DIRECT_PARENT
+                "sibling" -> SIBLING
+                "other" -> OTHER
+                else -> null
+            }
+        }
+    }
+
+    /**
+     * Structured response of a `getAgentStatus` call.  The
+     * `directChildren` list is the list of `agent_sessions` rows
+     * whose `parent_session_id` equals the target's `session_id`,
+     * capped by [childLimit] (default 64, hard max 256); when the
+     * cap is hit [directChildrenTruncated] is true.
+     */
+    data class AgentStatusInfo(
+        val targetSessionId: String,
+        val targetRuntimeState: String,
+        val targetLifecycle: String?,
+        val targetParentSessionId: String?,
+        val targetBinaryId: Int?,
+        val targetModuleName: String?,
+        val targetModelName: String?,
+        val targetClosingReason: String?,
+        val targetCreatedAt: String?,
+        val targetUpdatedAt: String?,
+        val targetCompletedAt: String?,
+        val lastMessageAt: String?,
+        val totalInputTokens: Long,
+        val totalOutputTokens: Long,
+        val totalToolCalls: Long,
+        val childCount: Long,
+        val runningChildCount: Long,
+        val directChildren: List<ChildSummary>,
+        val directChildrenTruncated: Boolean,
+        /** Auto-detected relationship between caller and target. */
+        val relationship: AgentRelationship,
+    )
+
+    /**
+     * Slim child-session row returned inside
+     * [AgentStatusInfo.directChildren].  Mirrors the columns
+     * the daemon returns in its `directChildren` array; kept as
+     * its own data class so the tool response stays narrow.
+     */
+    data class ChildSummary(
+        val sessionId: String,
+        val sessionName: String?,
+        val runtimeState: String,
+        val lifecycle: String?,
+        val parentSessionId: String?,
+        val binaryId: Int?,
+        val moduleName: String?,
+        val modelName: String?,
+        val createdAt: String?,
+        val updatedAt: String?,
+    )
+
+    /**
+     * Snapshot of a single agent session's runtime state plus the
+     * aggregated counters the calling agent needs.  See
+     * [org.iotsplab.akiba.dbDaemon.operations.AgentOps.GetAgentStatus]
+     * for the wire format.
+     *
+     * The relationship between [callerSessionId] and
+     * [targetSessionId] is auto-detected server-side from
+     * `parent_session_id`; the framework's [getAgentStatus] client
+     * does not expose a `scope` knob.  The default policy admits
+     * `self` and `direct_child` reads only; the daemon returns
+     * a structured `forbidden` payload (wrapped in
+     * [AgentStatusResult.AccessDenied]) for every other
+     * relationship, and [AgentStatusResult.Ok.relationship] tells
+     * the caller WHY the response was admitted (so the LLM can
+     * tell "this is my own status" from "this is my direct
+     * child's status" without parsing the UUID).
+     *
+     * @param callerSessionId the session id of the agent performing the query.
+     * @param targetSessionId the session id of the agent to inspect.
+     * @param childLimit      hard cap on the number of direct children
+     *                        included in the response (default 64, max 256).
+     * @return parsed snapshot; callers should switch on the
+     *         [AgentStatusResult] sealed-class branches to pick
+     *         the right LLM-facing wording.
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun getAgentStatus(
+        callerSessionId: String,
+        targetSessionId: String,
+        childLimit: Int = 64,
+    ): AgentStatusResult = runBlocking {
+        val body = mapOf(
+            "callerSessionId" to callerSessionId,
+            "targetSessionId" to targetSessionId,
+            "childLimit" to childLimit.coerceIn(1, 256),
+        )
+        val response = dbClient.post("/agent/session/agent_status", body)
+        when (response.first) {
+            HttpStatusCode.OK -> {
+                val node = mapper.readTree(response.second)
+                val status = node["status"]?.asText()
+                if (status != "ok") {
+                    // Should not happen — daemon only returns 200 for
+                    // "ok", but be defensive.
+                    return@runBlocking AgentStatusResult.NotFound(
+                        "Daemon returned 200 but status='$status'",
+                    )
+                }
+                val target = node["target"]
+                val childrenNode = node["directChildren"]
+                val children = if (childrenNode != null && childrenNode.isArray) {
+                    childrenNode.map { c ->
+                        ChildSummary(
+                            sessionId = c["sessionId"]?.asText() ?: "",
+                            sessionName = c["sessionName"]?.takeIf { !it.isNull }?.asText(),
+                            runtimeState = c["runtimeState"]?.asText() ?: "unknown",
+                            lifecycle = c["lifecycle"]?.takeIf { !it.isNull }?.asText(),
+                            parentSessionId = c["parentSessionId"]?.takeIf { !it.isNull }?.asText(),
+                            binaryId = c["binaryId"]?.takeIf { !it.isNull }?.asInt(),
+                            moduleName = c["moduleName"]?.takeIf { !it.isNull }?.asText(),
+                            modelName = c["modelName"]?.takeIf { !it.isNull }?.asText(),
+                            createdAt = c["createdAt"]?.takeIf { !it.isNull }?.asText(),
+                            updatedAt = c["updatedAt"]?.takeIf { !it.isNull }?.asText(),
+                        )
+                    }
+                } else emptyList()
+                val relationship = AgentRelationship.fromWire(
+                    node["relationship"]?.asText()
+                ) ?: AgentRelationship.OTHER
+                AgentStatusResult.Ok(
+                    AgentStatusInfo(
+                        targetSessionId = target["sessionId"]?.asText() ?: targetSessionId,
+                        targetRuntimeState = target["runtimeState"]?.asText() ?: "unknown",
+                        targetLifecycle = target["lifecycle"]?.takeIf { !it.isNull }?.asText(),
+                        targetParentSessionId = target["parentSessionId"]?.takeIf { !it.isNull }?.asText(),
+                        targetBinaryId = target["binaryId"]?.takeIf { !it.isNull }?.asInt(),
+                        targetModuleName = target["moduleName"]?.takeIf { !it.isNull }?.asText(),
+                        targetModelName = target["modelName"]?.takeIf { !it.isNull }?.asText(),
+                        targetClosingReason = target["closingReason"]?.takeIf { !it.isNull }?.asText(),
+                        targetCreatedAt = target["createdAt"]?.takeIf { !it.isNull }?.asText(),
+                        targetUpdatedAt = target["updatedAt"]?.takeIf { !it.isNull }?.asText(),
+                        targetCompletedAt = target["completedAt"]?.takeIf { !it.isNull }?.asText(),
+                        lastMessageAt = target["lastMessageAt"]?.takeIf { !it.isNull }?.asText(),
+                        totalInputTokens = target["totalInputTokens"]?.asLong() ?: 0L,
+                        totalOutputTokens = target["totalOutputTokens"]?.asLong() ?: 0L,
+                        totalToolCalls = target["totalToolCalls"]?.asLong() ?: 0L,
+                        childCount = target["childCount"]?.asLong() ?: 0L,
+                        runningChildCount = target["runningChildCount"]?.asLong() ?: 0L,
+                        directChildren = children,
+                        directChildrenTruncated = node["directChildrenTruncated"]?.asBoolean() ?: false,
+                        relationship = relationship,
+                    )
+                )
+            }
+            HttpStatusCode.NotFound -> AgentStatusResult.NotFound(
+                response.second.take(500),
+            )
+            HttpStatusCode.Forbidden -> {
+                val node = mapper.readTree(response.second)
+                AgentStatusResult.AccessDenied(
+                    error = node["error"]?.asText() ?: "forbidden",
+                    relationship = AgentRelationship.fromWire(
+                        node["relationship"]?.asText()
+                    ) ?: AgentRelationship.OTHER,
+                    hint = node["hint"]?.asText(),
+                )
+            }
+            HttpStatusCode.BadRequest -> {
+                val node = mapper.readTree(response.second)
+                AgentStatusResult.BadRequest(
+                    error = node["error"]?.asText() ?: response.second,
+                )
+            }
+            else -> throw DatabaseClient.DatabaseDaemonException(
+                response.first, response.first.description
+            )
+        }
+    }
+
+    /**
+     * Tagged union returned by [getAgentStatus].  The
+     * `get_agent_status` tool branches on this to pick the
+     * right LLM-facing wording:
+     *
+     *   * [Ok]            — return the snapshot.
+     *   * [NotFound]      — surface as a structured "not found" error.
+     *   * [AccessDenied]  — surface the daemon's hint so the LLM
+     *                        knows the relationship was detected
+     *                        but access is not granted yet.
+     *   * [BadRequest]    — surface as a validation error.
+     */
+    sealed class AgentStatusResult {
+        data class Ok(val info: AgentStatusInfo) : AgentStatusResult()
+        data class NotFound(val detail: String) : AgentStatusResult()
+        data class AccessDenied(
+            val error: String,
+            val relationship: AgentRelationship,
+            val hint: String?,
+        ) : AgentStatusResult()
+        data class BadRequest(val error: String) : AgentStatusResult()
+    }
+
+    // ============================================================
+    //  Mailbox
+    // ============================================================
+
+    data class MailboxMessageInfo(
+        val messageId: Long,
+        val senderSessionId: String,
+        val recipientSessionId: String,
+        val kind: String,
+        val subject: String?,
+        val body: String,
+        val relatedArtifactId: Long?,
+        val inReplyToMessageId: Long?,
+        val priority: Int,
+        val readAt: String?,
+        val ackedAt: String?,
+        val createdAt: String?,
+    )
+
+    private fun mapMailbox(node: JsonNode): MailboxMessageInfo = MailboxMessageInfo(
+        messageId = node["messageId"].asLong(),
+        senderSessionId = node["senderSessionId"].asText(),
+        recipientSessionId = node["recipientSessionId"].asText(),
+        kind = node["kind"].asText(),
+        subject = node["subject"]?.takeIf { !it.isNull }?.asText(),
+        body = node["body"].asText(),
+        relatedArtifactId = node["relatedArtifactId"]?.takeIf { !it.isNull }?.asLong(),
+        inReplyToMessageId = node["inReplyToMessageId"]?.takeIf { !it.isNull }?.asLong(),
+        priority = node["priority"].asInt(),
+        readAt = node["readAt"]?.takeIf { !it.isNull }?.asText(),
+        ackedAt = node["ackedAt"]?.takeIf { !it.isNull }?.asText(),
+        createdAt = node["createdAt"]?.takeIf { !it.isNull }?.asText(),
+    )
+
+    /**
+     * Send a mailbox message. The framework-layer access policy
+     * (`InteractionPolicy` + lifecycle rules) MUST be enforced before
+     * calling; the daemon route re-checks the lifecycle invariant as
+     * defense-in-depth. @return the new message id.
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun sendMailboxMessage(
+        senderSessionId: String,
+        recipientSessionId: String,
+        kind: String = "note",
+        subject: String? = null,
+        body: String,
+        relatedArtifactId: Long? = null,
+        inReplyToMessageId: Long? = null,
+        priority: Int = 0,
+    ): Long = runBlocking {
+        val body = mapOf(
+            "senderSessionId" to senderSessionId,
+            "recipientSessionId" to recipientSessionId,
+            "kind" to kind,
+            "subject" to subject,
+            "body" to body,
+            "relatedArtifactId" to relatedArtifactId,
+            "inReplyToMessageId" to inReplyToMessageId,
+            "priority" to priority,
+        )
+        val response = dbClient.post("/agent/mailbox/send", body)
+        if (response.first == HttpStatusCode.OK)
+            mapper.readValue<Long>(response.second)
+        else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    /** Peek incoming messages without marking them read. */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun listMailboxMessages(
+        sessionId: String,
+        limit: Int = 50,
+        includeRead: Boolean = false,
+    ): List<MailboxMessageInfo> = runBlocking {
+        val body = mapOf(
+            "sessionId" to sessionId,
+            "limit" to limit,
+            "includeRead" to includeRead,
+        )
+        val response = dbClient.post("/agent/mailbox/list", body)
+        if (response.first == HttpStatusCode.OK) {
+            val arr = mapper.readTree(response.second)
+            arr.map { mapMailbox(it) }
+        } else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    /**
+     * Atomically read and mark a batch of incoming messages as
+     * `read_at = now()`. The SQL `FOR UPDATE SKIP LOCKED` clause keeps
+     * concurrent drains from double-delivering the same message.
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun drainMailboxMessages(
+        sessionId: String,
+        limit: Int = 50,
+    ): List<MailboxMessageInfo> = runBlocking {
+        val body = mapOf("sessionId" to sessionId, "limit" to limit)
+        val response = dbClient.post("/agent/mailbox/drain", body)
+        if (response.first == HttpStatusCode.OK) {
+            val node = mapper.readTree(response.second)
+            val msgs = node["messages"] ?: return@runBlocking emptyList()
+            msgs.map { mapMailbox(it) }
+        } else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun ackMailboxMessage(sessionId: String, messageId: Long) = runBlocking {
+        val body = mapOf("sessionId" to sessionId, "messageId" to messageId)
+        val response = dbClient.post("/agent/mailbox/ack", body)
+        if (response.first != HttpStatusCode.OK)
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    /** Cheap unread-count check (zero unread short-circuits the drain). */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun countUnreadMailbox(sessionId: String): Int = runBlocking {
+        val body = mapOf("sessionId" to sessionId)
+        val response = dbClient.post("/agent/mailbox/count_unread", body)
+        if (response.first == HttpStatusCode.OK) {
+            val node = mapper.readTree(response.second)
+            node["unread"]?.asInt() ?: 0
+        } else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    /**
+     * Fetch a single message by id, scoped to sender OR recipient
+     * session. Used by the LLM to follow up on a thread it is part of
+     * (typically via `in_reply_to_message_id`).
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun getMailboxMessage(sessionId: String, messageId: Long): MailboxMessageInfo? = runBlocking {
+        val body = mapOf("sessionId" to sessionId, "messageId" to messageId)
+        val response = dbClient.post("/agent/mailbox/get", body)
+        if (response.first == HttpStatusCode.OK) {
+            val node = mapper.readTree(response.second)
+            if (node.isObject && node.has("messageId")) mapMailbox(node) else null
+        } else if (response.first == HttpStatusCode.NotFound)
+            null
+        else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    // ============================================================
+    //  Artifacts
+    // ============================================================
+
+    data class ArtifactInfo(
+        val artifactId: Long,
+        val ownerSessionId: String,
+        val name: String,
+        val version: Int,
+        val kind: String,
+        val content: String,
+        val summary: String?,
+        val metadata: String?,
+        val isPublic: Boolean,
+        val supersededBy: Long?,
+        val createdAt: String?,
+    )
+
+    private fun mapArtifact(node: JsonNode): ArtifactInfo = ArtifactInfo(
+        artifactId = node["artifactId"].asLong(),
+        ownerSessionId = node["ownerSessionId"].asText(),
+        name = node["name"].asText(),
+        version = node["version"].asInt(),
+        kind = node["kind"].asText(),
+        content = node["content"].asText(),
+        summary = node["summary"]?.takeIf { !it.isNull }?.asText(),
+        metadata = node["metadata"]?.takeIf { !it.isNull }?.asText(),
+        isPublic = node["isPublic"].asBoolean(),
+        supersededBy = node["supersededBy"]?.takeIf { !it.isNull }?.asLong(),
+        createdAt = node["createdAt"]?.takeIf { !it.isNull }?.asText(),
+    )
+
+    /** Upsert an artifact keyed by `(owner_session_id, name, version)`. */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun publishArtifact(
+        ownerSessionId: String,
+        name: String,
+        kind: String = "data",
+        content: String,
+        summary: String? = null,
+        metadata: String? = null,
+        isPublic: Boolean = false,
+        version: Int = 1,
+    ): Long = runBlocking {
+        val body = mapOf(
+            "ownerSessionId" to ownerSessionId,
+            "name" to name,
+            "kind" to kind,
+            "content" to content,
+            "summary" to summary,
+            "metadata" to metadata,
+            "isPublic" to isPublic,
+            "version" to version,
+        )
+        val response = dbClient.post("/agent/artifact/publish", body)
+        if (response.first == HttpStatusCode.OK) {
+            val node = mapper.readTree(response.second)
+            node["artifactId"].asLong()
+        } else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    /**
+     * Read a single artifact. Pass the caller's session id so the route
+     * can enforce the `is_public` / same-binary visibility rule;
+     * passing null disables that check (tests only).
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun getArtifact(
+        callerSessionId: String?,
+        artifactId: Long? = null,
+        ownerSessionId: String? = null,
+        name: String? = null,
+        version: Int? = null,
+    ): ArtifactInfo? = runBlocking {
+        val body = mutableMapOf<String, Any?>("sessionId" to callerSessionId)
+        if (artifactId != null) body["artifactId"] = artifactId
+        if (ownerSessionId != null) body["ownerSessionId"] = ownerSessionId
+        if (name != null) body["name"] = name
+        if (version != null) body["version"] = version
+        val response = dbClient.post("/agent/artifact/get", body)
+        if (response.first == HttpStatusCode.OK) {
+            val node = mapper.readTree(response.second)
+            if (node.isObject && node.has("artifactId")) mapArtifact(node) else null
+        } else if (response.first == HttpStatusCode.NotFound)
+            null
+        else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    /** List artifacts owned by `ownerSessionId` (or the caller's own). */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun listArtifacts(
+        callerSessionId: String,
+        ownerSessionId: String? = null,
+        name: String? = null,
+        includePublic: Boolean = true,
+        limit: Int = 50,
+    ): List<ArtifactInfo> = runBlocking {
+        val body = mutableMapOf<String, Any?>(
+            "sessionId" to callerSessionId,
+            "includePublic" to includePublic,
+            "limit" to limit,
+        )
+        if (ownerSessionId != null) body["ownerSessionId"] = ownerSessionId
+        if (name != null) body["name"] = name
+        val response = dbClient.post("/agent/artifact/list", body)
+        if (response.first == HttpStatusCode.OK) {
+            val arr = mapper.readTree(response.second)
+            arr.map { mapArtifact(it) }
+        } else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun deleteArtifact(callerSessionId: String, artifactId: Long) = runBlocking {
+        val body = mapOf("sessionId" to callerSessionId, "artifactId" to artifactId)
+        val response = dbClient.post("/agent/artifact/delete", body)
         if (response.first != HttpStatusCode.OK)
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }
