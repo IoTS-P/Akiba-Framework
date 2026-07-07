@@ -305,9 +305,14 @@ object AgentPrompts {
           `standby`. Signals "I have nothing more to do right now;
           park the session and wake me when a new mailbox message
           arrives." The runtime translates this to
-          `runtime_state=standby`. Do NOT use this when you have
-          actually reached a final answer — Final Answer takes
-          precedence and the session will be closed.
+          `runtime_state=standby`.
+
+        CRITICAL — THE TWO MARKERS ARE MUTUALLY EXCLUSIVE:
+        **Final Answer:** and **Enter standby mode.** MUST NOT appear
+        in the same response.  They are detected in order: Final Answer
+        takes precedence, so if you write both, the standby marker is
+        IGNORED and the session will be CLOSED (not parked).  Use one
+        or the other, never both.
 
         STOPPING RULE: as soon as you have gathered enough information to answer
         the user's question, you MUST emit **Final Answer:** as the very first
@@ -324,7 +329,9 @@ object AgentPrompts {
         `runtime_state=standby`. Do NOT emit the marker when your
         reasoning is incomplete or you still have tools to call —
         keep going until you either reach a real Final Answer or
-        genuinely have nothing left to do for this wake.
+        genuinely have nothing left to do for this wake.  Do NOT
+        combine the standby marker with **Final Answer:** — they are
+        mutually exclusive (see rule above).
 
         Tool-call JSON block (each call is its own ```json fence):
         ```json

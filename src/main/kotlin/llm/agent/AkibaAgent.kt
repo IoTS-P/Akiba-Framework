@@ -10,10 +10,87 @@ import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.agent.AgentPrompts.COMPRESSION_PROMPT
 import org.iotsplab.akiba.llm.memory.AgentChatMessage
 import org.iotsplab.akiba.llm.tool.ToolRegistry
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 
 // ============================================================
 //  Agent result types
 // ============================================================
+
+/**
+ * Why the agent's enclosing [AgentModule.startProcess] `finally` block
+ * fired [AkibaAgent.processCompletionLatch].
+ *
+ * Used as the type parameter of the [AkibaAgent.processCompletionLatch]
+ * `CompletableDeferred`, so any coroutine awaiting on it learns not just
+ * "the run is over" but **how** it ended — important for module
+ * orchestrators that have to decide what to do next (start a follow-up
+ * agent vs. give up vs. escalate).
+ *
+ *  - [CLOSED]         — Final Answer with [FinalAnswerAction.EXIT]
+ *                       (default for `lifecycle=ONE_SHOT`); the run
+ *                       completed normally and every cleanup step
+ *                       (cascade-cancel, template unregister, transcript
+ *                       close, LLM client close) ran to completion.
+ *  - [ERROR]          — Agent stopped with [StopReason.ERROR] or
+ *                       [StopReason.MAX_ITERATIONS]; session status is
+ *                       `"error"`.  Cleanup ran to completion; the
+ *                       run itself just didn't finish cleanly.
+ *  - [PARKED]         — `lifecycle=STANDBY` + [FinalAnswerAction.PARK]
+ *                       (default for `lifecycle=STANDBY`); the agent
+ *                       is alive and waiting for mailbox messages.
+ *                       No cleanup was performed.  Callers of
+ *                       [AgentModule.startProcess] in PARK mode
+ *                       should NOT treat this as "done" — the agent
+ *                       is still consuming resources, just
+ *                       intentionally.
+ *  - [CLEANUP_FAILED] — The run reached a truly-terminated state, but
+ *                       at least one cleanup step (cascade-cancel,
+ *                       template unregister, transcript close, or
+ *                       LLM client close) threw.  The process is
+ *                       still considered terminated (the
+ *                       [OrphanReaper] is the backstop for any
+ *                       children that didn't get cancelled), but
+ *                       operators should look at the warning logs
+ *                       for the root cause.
+ */
+enum class ProcessExitReason { CLOSED, ERROR, PARKED, CLEANUP_FAILED }
+
+/**
+ * What the agent should do when the LLM emits the canonical "Final Answer:"
+ * marker (the strategy's signal that the model has finished answering).
+ *
+ * The two modes distinguish between "I answered, but the session stays alive
+ * for follow-up work" and "I answered, the session is over, release all
+ * resources".  This distinction matters because the parent's
+ * [AgentModule.startProcess] `finally` block uses [EXIT] vs [PARK] to decide
+ * whether to release the LLM client + transcript (a STANDBY-parked agent
+ * must keep them open for the next resume).
+ *
+ *  - [PARK]  — Final Answer parks the agent. For `lifecycle=STANDBY` the
+ *    runtime_state transitions to STANDBY (the session keeps accepting
+ *    mailbox messages); for `lifecycle=ONE_SHOT` it transitions to CLOSED.
+ *    Either way the parent's `startProcess` `finally` block runs full
+ *    resource cleanup because the run is over.  This is the default for
+ *    `lifecycle=STANDBY` — a parked child that has finished its primary
+ *    task but stays alive for follow-up mail.
+ *
+ *  - [EXIT]  — Final Answer truly terminates the agent. The runtime_state
+ *    transitions to CLOSED regardless of `lifecycle`, and the parent's
+ *    `startProcess` `finally` block runs full resource cleanup. The
+ *    session will NOT be resumed on a later mailbox message (any future
+ *    mail lands on a CLOSED session and bounces). This is the default for
+ *    `lifecycle=ONE_SHOT` and is what the root agent of a manual chat
+ *    session uses — it answers once and the process exits.
+ *
+ * Override the default when you have a STANDBY agent that should truly
+ * exit on Final Answer (e.g. an interactive STANDBY root that has reached
+ * the end of its conversational arc) — set `onFinalAnswer = EXIT` on the
+ * agent and the framework will close the session on Final Answer instead
+ * of parking it.
+ */
+enum class FinalAnswerAction { PARK, EXIT }
 
 /** The outcome of an agent run. */
 data class AgentResult(
@@ -188,6 +265,35 @@ class AkibaAgent(
     val lifecycle: Lifecycle = Lifecycle.ONE_SHOT,
 
     /**
+     * Behaviour when the LLM emits the "Final Answer:" marker.
+     *
+     * Defaults to a sane policy derived from [lifecycle]:
+     *  - `lifecycle=STANDBY` → [FinalAnswerAction.PARK] (the agent
+     *    stays alive and accepts follow-up mailbox messages).
+     *  - `lifecycle=ONE_SHOT` → [FinalAnswerAction.EXIT] (the agent
+     *    terminates and the parent's `startProcess` `finally` block
+     *    releases resources).
+     *
+     * Override to flip the default — for example, an interactive
+     * STANDBY root that should truly close on Final Answer instead of
+     * parking, or a ONE_SHOT batch worker that should park to free up
+     * the process slot before tearing down.
+     *
+     * This value is read by:
+     *  - The strategies ([ReActStrategy], [PlanExecuteStrategy]) to
+     *    decide which `status` to write to the session row when they
+     *    detect Final Answer (`"standby"` vs `"closed"`).
+     *  - [AgentRuntime.runChildJob] to decide the next runtime_state
+     *    after a COMPLETED result (a STANDBY parent in PARK mode stays
+     *    STANDBY; in EXIT mode it goes CLOSED).
+     *  - [AgentModule.startProcess] `finally` block to decide whether
+     *    to release the LLM client and transcript (kept open for
+     *    resume when the agent parks; released on true exit).
+     */
+    val onFinalAnswer: FinalAnswerAction = if (lifecycle == Lifecycle.STANDBY)
+        FinalAnswerAction.PARK else FinalAnswerAction.EXIT,
+
+    /**
      * Mailbox service used by the default [AgentHarness.beforeIteration]
      * to drain incoming messages before each LLM call. Null disables
      * the drain.
@@ -197,6 +303,134 @@ class AkibaAgent(
     /** Runtime handle for sub-agents. Set by [AgentRuntime] so the strategy
      * can stop before the next LLM call after cooperative cancellation. */
     @Volatile var runtimeHandle: JobHandle? = null,
+
+    /**
+     * Cumulative token usage across ALL wake cycles for this agent.
+     *
+     * [LoopStats] is recreated fresh (zeroed) on every `executeWithStrategy()`
+     * call because a new [StrategyContext] is built each time.  Without
+     * carrying the cumulative count forward, the transcript's
+     * "Token Usage (cumulative)" line resets to the current wake's tokens
+     * only, which is misleading — the user sees a small number instead of
+     * the true session total.
+     *
+     * These fields are initialised from the DB on the first run and
+     * updated after each run.  Before the strategy executes, they are
+     * copied into [LoopStats] so the transcript shows the true cumulative
+     * total.  After the strategy returns, the final values are written
+     * back here for the next wake.
+     */
+    @Volatile private var cumulativeInputTokens: Int = 0,
+    @Volatile private var cumulativeOutputTokens: Int = 0,
+
+    /**
+     * Single-shot latch that fires when the parent
+     * [AgentModule.startProcess] `finally` block has finished every
+     * cleanup step (cascade-cancel of one_shot children, template
+     * unregister, transcript close, LLM client close).
+     *
+     * This is the synchronisation point that makes the
+     * "startProcess returned ⇒ the root agent is fully torn down"
+     * contract enforceable.  In the previous design the cascade
+     * cancel ran inside `GlobalScope.launch`, which was fire-and-
+     * forget — startProcess would return while the children were
+     * still being torn down in the background, breaking module
+     * seriality (the next module's startProcess could observe a
+     * half-cancelled child tree, or a still-open LLM client).
+     *
+     * Behaviour:
+     *  - For [FinalAnswerAction.EXIT] agents, [AgentModule.startProcess]
+     *    awaits this latch before returning, so the
+     *    "startProcess returned ⇒ process is fully torn down" contract
+     *    holds unconditionally.
+     *  - For [FinalAnswerAction.PARK] agents, the latch fires with
+     *    [ProcessExitReason.PARKED] inside the (no-op) cleanup, but
+     *    startProcess does NOT await it — the agent is alive and
+     *    waiting for mailbox messages, and the caller should be
+     *    able to move on.
+     *
+     * A fresh `AkibaAgent` is built on every [AgentModule.startProcess]
+     * call (see `AgentModule.startProcess`'s `buildAgent(...)` line),
+     * so a new agent = a new latch.  This latch is meant to fire
+     * exactly once per [AgentModule.startProcess] invocation.
+     */
+    val processCompletionLatch: CompletableDeferred<ProcessExitReason> =
+        CompletableDeferred(),
+
+    /**
+     * Termination hook — invoked once per [runWithTermination]
+     * invocation whose underlying [run] produced a "truly
+     * terminating" outcome (lifecycle=ONE_SHOT, lifecycle=STANDBY
+     * with [onFinalAnswer]=EXIT, or [StopReason.ERROR] /
+     * [StopReason.MAX_ITERATIONS]).  Skipped for STANDBY + PARK
+     * runs so the session can resume on a later mailbox
+     * message.
+     *
+     * The hook is the single chokepoint where every agent —
+     * whether it is the root (started by [AgentModule.startProcess])
+     * or a child (started by [AgentRuntime.runChildJob]) — runs
+     * its cascade-cancel + resource-release + runtime_state
+     * transition.  Lifting the cleanup from [AgentModule] into
+     * the agent itself is what makes grandchildren cascade
+     * correct: a sub-agent that itself has sub-agents now has
+     * a real path to cancel them on its own termination, not
+     * just relying on the [OrphanReaper] 60s scan-tick backstop.
+     *
+     * **Default behaviour.**  When this field is `null` after
+     * construction (which is the case unless the caller
+     * explicitly assigned one), the constructor's `init` block
+     * installs a hook that calls [defaultTerminate] — i.e. it
+     * runs [cascadeCancel] followed by [close].  In other words
+     * the framework's default for *every* agent is "cancel my
+     * own children, then release my own LLM client + transcript"
+     * with no caller action required.
+     *
+     * **Overriding the default.**  Two supported entry points:
+     *  1. The [akibaAgent] DSL's `onTermination { ... }` block
+     *     (see [AgentBuilder.onTermination]) — the block runs
+     *     with the built agent as receiver, so it can call
+     *     [cascadeCancel] / [close] / [defaultTerminate] inline
+     *     and add extra steps before/after.
+     *  2. Direct programmatic assignment, e.g. in
+     *     [AgentModule.startProcess] where the root needs
+     *     extra cleanup (template-unregister, status flip)
+     *     layered on top of the default.
+     *
+     * Suspend because the cleanup may include
+     * `suspend` cascade-cancel calls which need to
+     * `await` the children's terminal state with a
+     * `graceMs` cap.
+     */
+    @Volatile var terminationHook: (suspend () -> Unit)? = null,
+
+    /**
+     * Optional cascade-canceller installed by whichever
+     * orchestrator knows how to walk this agent's children.
+     * [cascadeCancel] invokes it; the agent itself has no
+     * knowledge of [AgentRuntime] or per-binary id resolution.
+     *
+     * Signature: `(sessionId, reason, graceMs) -> cancelledCount`.
+     * The agent passes its own [sessionId] plus the
+     * `reason` / `graceMs` it was called with.  The canceller's
+     * caller is the runtime (for child agents) or the module
+     * (for the root) — see [AgentRuntime.runChildJob] and
+     * [AgentModule.startProcess].
+     *
+     * Keeping the canceller as a callback (rather than a hard
+     * reference to an [AgentRuntime]) means the agent module
+     * stays decoupled from the runtime's lookup mechanism —
+     * tests, replay harnesses, and future orchestrators can
+     * install their own canceller without dragging in the
+     * per-binary registry.
+     *
+     * `null` is the safe default: [cascadeCancel] becomes a
+     * no-op (returns 0) when no canceller is installed, so an
+     * agent that was never wired up to a runtime still
+     * terminates cleanly (just without cancelling any
+     * children, which is the right behaviour for standalone
+     * test fixtures).
+     */
+    @Volatile var cascadeCanceller: (suspend (String, String, Long) -> Int)? = null,
 
     /**
      * Declarative list of child agents to spawn at startup.  Empty
@@ -210,7 +444,40 @@ class AkibaAgent(
      * is involved.
      */
     val subAgents: List<ProgrammaticSubAgentSpec> = emptyList(),
+
+    /**
+     * Per-conversation scratchpad registry.  Auto-created for
+     * every agent — agents without [mailboxService] get a dummy
+     * registry that never has any scratchpads.
+     *
+     * The registry provides **context isolation**: each conversation
+     * gets its own message buffer, and the [ScratchpadRegistry]
+     * serialises which conversation is "active" for the current
+     * LLM turn.  This prevents cross-conversation context pollution
+     * and supports preemption (urgent messages interrupt the
+     * current conversation, then the previous one is restored with
+     * a resume hint).
+     *
+     * The [applyMailboxDrain] helper writes drained messages into
+     * the registry; the strategy reads the active conversation's
+     * messages via [ScratchpadRegistry.activeConversationMessages]
+     * to build the LLM context.
+     */
+    val scratchpadRegistry: ScratchpadRegistry = ScratchpadRegistry(),
 ) {
+
+    init {
+        // Install the default termination hook when the caller did
+        // not supply one.  The default is "cascade-cancel my own
+        // subtree, then close my LLM client + transcript" — see
+        // [defaultTerminate] for the full sequence.  This is the
+        // chokepoint that makes "every agent cleans up after itself"
+        // work for both root and child agents without forcing every
+        // factory to remember the pattern.
+        if (terminationHook == null) {
+            terminationHook = { defaultTerminate() }
+        }
+    }
 
     // ---- Public API ------------------------------------------------------
 
@@ -248,6 +515,305 @@ class AkibaAgent(
         return run(userInput)
     }
 
+    /**
+     * Like [run], but additionally invokes [terminationHook] when
+     * (and only when) the run produced a "truly terminating"
+     * outcome — i.e. the agent is not going to receive more
+     * mailbox messages.  This is the path the [AgentModule] and
+     * the [AgentRuntime] use so that cascade-cancel +
+     * resource-release run for every agent, not just the root.
+     *
+     * Behaviour matrix (the [terminationHook] fires iff the cell
+     * is `true`):
+     *
+     * | lifecycle | onFinalAnswer | stopReason        | fires |
+     * |-----------|---------------|-------------------|-------|
+     * | ONE_SHOT  | *             | COMPLETED         | true  |
+     * | ONE_SHOT  | *             | ERROR/MAX_ITERS   | true  |
+     * | STANDBY   | EXIT          | COMPLETED         | true  |
+     * | STANDBY   | EXIT          | ERROR/MAX_ITERS   | true  |
+     * | STANDBY   | PARK          | COMPLETED         | false |
+     * | STANDBY   | PARK          | STANDBY marker    | false |
+     * | STANDBY   | PARK          | ERROR/MAX_ITERS   | true  |
+     *
+     * The hook itself is `suspend` and is invoked under
+     * [NonCancellable] so that a parent-side cancellation
+     * cannot interrupt the cascade mid-flight (e.g. leaving
+     * some grandchildren cancelled and others not).
+     *
+     * Errors thrown by the hook are caught and logged — they
+     * must never propagate back into the run loop and corrupt
+     * the [AgentResult] the strategy produced.
+     */
+    /**
+     * Like [run], but additionally fires the
+     * [processCompletionLatch] **after** [terminationHook]
+     * returns — and only on a "truly terminating" outcome
+     * ([isTerminatingRun] is true).  STANDBY + PARK runs leave
+     * the latch open so the enclosing
+     * [AgentModule.startProcess]'s `await()` keeps blocking
+     * until the agent is woken by a later mailbox message and
+     * eventually runs a terminating turn.
+     *
+     * Latch-timing rationale: the hook is the single chokepoint
+     * where every agent runs its cascade-cancel + resource
+     * release.  Firing the latch *after* the hook returns (not
+     * before) gives [startProcess]'s awaiter the guarantee
+     * "startProcess returned ⇒ root fully torn down" — without
+     * a half-cancelled child tree or a still-open LLM client.
+     * Lifting the latch-fire from [AgentModule] into the agent
+     * itself also makes grandchildren cascade correct: a
+     * sub-agent that has its own sub-agents now has a real path
+     * to signal its own "I am done" to its caller, not just
+     * rely on the [OrphanReaper] 60s scan-tick backstop.
+     *
+     * Behaviour matrix (the [terminationHook] fires iff the
+     * cell is `true`; the latch fires in the same cells):
+     *
+     * | lifecycle | onFinalAnswer | stopReason        | fires |
+     * |-----------|---------------|-------------------|-------|
+     * | ONE_SHOT  | *             | COMPLETED         | true  |
+     * | ONE_SHOT  | *             | ERROR/MAX_ITERS   | true  |
+     * | STANDBY   | EXIT          | COMPLETED         | true  |
+     * | STANDBY   | EXIT          | ERROR/MAX_ITERS   | true  |
+     * | STANDBY   | PARK          | COMPLETED         | false |
+     * | STANDBY   | PARK          | STANDBY marker    | false |
+     * | STANDBY   | PARK          | ERROR/MAX_ITERS   | true  |
+     *
+     * The hook itself is `suspend` and is invoked under
+     * [NonCancellable] so that a parent-side cancellation
+     * cannot interrupt the cascade mid-flight (e.g. leaving
+     * some grandchildren cancelled and others not).
+     *
+     * Errors thrown by the hook are caught and logged — they
+     * must never propagate back into the run loop and corrupt
+     * the [AgentResult] the strategy produced.  The latch
+     * STILL fires on hook error so [startProcess] can return
+     * (the orphan reaper + a warning log are the
+     * observability channels for the failed cleanup step).
+     */
+    suspend fun runWithTermination(userInput: String): AgentResult {
+        val result = run(userInput)
+        val hook = terminationHook
+        if (hook != null && isTerminatingRun(result.stopReason)) {
+            try {
+                withContext(NonCancellable) { hook() }
+            } catch (e: Exception) {
+                logger.error(
+                    "Termination hook for agent (session=$sessionId) threw: ${e.message}",
+                    e
+                )
+            }
+            // Fire the latch AFTER the hook returns (or after it
+            // throws — the caller still gets to return, the hook
+            // failure is logged above).  See the matrix on the
+            // method doc for which stopReasons / lifecycles
+            // reach this point.
+            withContext(NonCancellable) {
+                processCompletionLatch.complete(deriveExitReason(result))
+            }
+        }
+        return result
+    }
+
+    /**
+     * Map an [AgentResult] + this agent's [lifecycle] / [onFinalAnswer]
+     * policy onto a [ProcessExitReason] for the
+     * [processCompletionLatch].  Only invoked from
+     * [runWithTermination] for truly-terminating runs (i.e. when
+     * [isTerminatingRun] has already returned true), so the
+     * STANDBY + PARK + COMPLETED cell of the truth table is not
+     * reachable here.
+     */
+    private fun deriveExitReason(result: AgentResult): ProcessExitReason = when {
+        result.stopReason == StopReason.ERROR ||
+            result.stopReason == StopReason.MAX_ITERATIONS -> ProcessExitReason.ERROR
+        else -> ProcessExitReason.CLOSED
+    }
+
+    /**
+     * Per-agent resource release — close the LLM client and
+     * the transcript writer.  This is the part of the
+     * termination flow that belongs to the *agent* (it
+     * touches fields only the agent owns); the cascade-cancel
+     * and `runtime_state` transition belong to whoever
+     * installed the [terminationHook].
+     *
+     * Wrapped in [NonCancellable] so a parent-side cancellation
+     * cannot strand the LLM client open.
+     */
+    suspend fun close() {
+        withContext(NonCancellable) {
+            try {
+                transcript?.close()
+            } catch (e: Exception) {
+                logger.warn("Transcript close on $sessionId failed: ${e.message}")
+            }
+            try {
+                client.close()
+            } catch (e: Exception) {
+                logger.warn("LLM client close on $sessionId failed: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Cascade-cancel every non-STANDBY descendant of this agent
+     * by delegating to the installed [cascadeCanceller].  STANDBY
+     * children are deliberately left in place by the canceller
+     * — they become orphans and the [OrphanReaper] picks them up
+     * on its next scan tick.
+     *
+     * This is the single chokepoint that the default
+     * [terminationHook] uses for the "cancel my own subtree"
+     * step.  Callers that install a custom hook can call
+     * [cascadeCancel] inline (alongside [close] and any extra
+     * steps they need) instead of duplicating the walk-then-
+     * cancel loop.
+     *
+     * Returns the number of children that were actually
+     * cancelled.  Zero is a legitimate result — it means either
+     * the agent had no live ONE_SHOT descendants (the common
+     * case for ONE_SHOT roots that finished without spawning)
+     * or no [cascadeCanceller] was installed (standalone test
+     * fixtures, agents never wired up to an [AgentRuntime]).
+     *
+     * No-op (returns 0) when [cascadeCanceller] is null or
+     * [sessionId] is blank.  The agent has no fallback to find
+     * the runtime on its own — by design, to keep the
+     * `AkibaAgent` class decoupled from the per-binary
+     * [AgentRuntime] registry.
+     */
+    suspend fun cascadeCancel(
+        reason: String = "parent_terminated",
+        graceMs: Long = 30_000L,
+    ): Int {
+        val canceller = cascadeCanceller ?: return 0
+        val sid = sessionId
+        if (sid.isNullOrBlank()) return 0
+        return try {
+            canceller(sid, reason, graceMs)
+        } catch (e: Exception) {
+            logger.warn(
+                "cascadeCancel(session=$sid) failed: ${e.message}",
+                e
+            )
+            0
+        }
+    }
+
+    /**
+     * Default termination sequence — what the constructor's
+     * `init` block installs as the [terminationHook] when the
+     * caller did not supply one.  Equivalent to "first
+     * [cascadeCancel], then [close]".  Each step is wrapped in
+     * its own try/catch so a cascade failure cannot strand the
+     * LLM client open (and vice versa).
+     *
+     * Override-friendly: callers that want a custom hook can
+     * call [defaultTerminate] first to get the standard
+     * cascade + close, then layer their own cleanup on top:
+     *
+     * ```kotlin
+     * agent.terminationHook = {
+     *     agent.defaultTerminate()          // cascade + close
+     *     unregisterMyTemplates()           // module-specific
+     *     setSessionStatus("closed")        // module-specific
+     * }
+     * ```
+     *
+     * Equivalently, the [akibaAgent] DSL's `onTermination` block
+     * runs with the agent as receiver, so the same effect is
+     * available in a fluent form:
+     *
+     * ```kotlin
+     * akibaAgent {
+     *     onTermination {
+     *         defaultTerminate()             // cascade + close
+     *         // ... extra steps ...
+     *     }
+     * }
+     * ```
+     */
+    suspend fun defaultTerminate() {
+        try {
+            cascadeCancel()
+        } catch (e: Exception) {
+            logger.warn("defaultTerminate: cascadeCancel failed: ${e.message}", e)
+        }
+        try {
+            close()
+        } catch (e: Exception) {
+            logger.warn("defaultTerminate: close failed: ${e.message}", e)
+        }
+    }
+
+    /**
+     * Whether the [runWithTermination] caller should fire its
+     * [terminationHook] for the given [stopReason].  See the
+     * matrix on [runWithTermination] for the full truth table.
+     */
+    private fun isTerminatingRun(stopReason: StopReason): Boolean = when {
+        stopReason == StopReason.ERROR || stopReason == StopReason.MAX_ITERATIONS ->
+            // Any lifecycle: hard error is a true exit.  Even a
+            // STANDBY+PARK agent that hit max-iterations is
+            // effectively dead — the framework cannot guarantee
+            // a clean resume after a tool-failure storm.
+            true
+        onFinalAnswer == FinalAnswerAction.EXIT ->
+            // Explicit exit policy: hook fires regardless of
+            // whether lifecycle is ONE_SHOT (default EXIT) or
+            // STANDBY+EXIT.
+            true
+        onFinalAnswer == FinalAnswerAction.PARK ->
+            // PARK policy: only fire if the underlying lifecycle
+            // is terminal (ONE_SHOT); STANDBY+PARK agents park
+            // and stay alive.
+            lifecycle == Lifecycle.ONE_SHOT
+        else ->
+            // Defensive default — should not be reachable since
+            // [onFinalAnswer] always defaults to PARK-or-EXIT in
+            // the AkibaAgent constructor.
+            lifecycle == Lifecycle.ONE_SHOT
+    }
+
+    // ---- Process lifecycle hooks ----------------------------------------
+
+    /**
+     * Suspend until [AgentModule.startProcess]'s `finally` block
+     * finishes every cleanup step and the agent's process is fully
+     * terminated.  Returns the [ProcessExitReason] indicating how
+     * the run ended.
+     *
+     * Semantics:
+     *  - For [FinalAnswerAction.EXIT] agents this returns as soon as
+     *    cascade-cancel / unregister / transcript close / LLM
+     *    client close have all run to completion.  Awaiting it is
+     *    the way to assert "the process is truly done".
+     *  - For [FinalAnswerAction.PARK] agents, [AgentModule.startProcess]
+     *    fires the latch with [ProcessExitReason.PARKED] from the
+     *    (no-op) cleanup.  Awaiting it is fine but returns quickly;
+     *    what you actually want is to NOT call this and instead
+     *    listen on the mailbox dispatcher.
+     *
+     * Note: this method is a thin wrapper over
+     * [processCompletionLatch]; if you also need to wait for some
+     * other coroutine (e.g. a follower module), prefer awaiting
+     * the latch directly via `agent.processCompletionLatch.await()`
+     * and combining with `coroutineScope` etc.
+     */
+    suspend fun awaitProcessExit(): ProcessExitReason =
+        processCompletionLatch.await()
+
+    /**
+     * Non-blocking check — `true` when the agent's enclosing
+     * [AgentModule.startProcess] has finished its `finally` block
+     * and the process is fully torn down (or parked).  Useful for
+     * orchestrators that want to poll instead of suspending.
+     */
+    fun isProcessTerminated(): Boolean =
+        processCompletionLatch.isCompleted
+
     // ---- Internal --------------------------------------------------------
 
     private fun executeWithStrategy(): AgentResult {
@@ -269,13 +835,61 @@ class AkibaAgent(
             lastUserContent.startsWith(AgentRuntime.STANDBY_RESUME_PROMPT_PREFIX) &&
             lastUserContent.endsWith(AgentRuntime.STANDBY_RESUME_PROMPT_SUFFIX)
         if (isResumed) {
-            // Strip the synthetic marker; the real input is
-            // the mailbox messages that the harness will
-            // inject on the first beforeIteration tick.
-            memory.clear()
-            msgs.forEachIndexed { i, m ->
-                if (i != lastUserIdx) memory.add(m.role, m.content)
+            // Strip the synthetic resume marker from memory WITHOUT
+            // clearing the entire conversation history.  The previous
+            // implementation called memory.clear() + re-add, which
+            // deleted all rows from agent_messages and re-inserted
+            // them with only role+content — losing tool_call_id,
+            // tool_name, tool_call_args, tool_result, and all other
+            // metadata.  This made previous wakes' messages invisible
+            // after a page refresh.
+            //
+            // The resume marker is the last message added by
+            // agent.run(userInput), so removeLast() targets exactly
+            // that row.  All prior messages stay in the DB with their
+            // full metadata intact.
+            memory.removeLast()
+
+            // ---- Persist a wake-event marker so the frontend ----
+            // ---- can render a separator between wake cycles  ----
+            //
+            // We insert a lightweight "user" message with a
+            // recognisable prefix.  This survives into the DB
+            // (memory.clear() + re-add has already completed)
+            // and is visible via GET /agent/sessions/{id}/messages.
+            // The frontend matches the prefix and renders a
+            // divider instead of a normal chat bubble.
+            //
+            // We try to include *who* triggered the wake by
+            // peeking at the unread mailbox messages.  If the
+            // mailbox service is unavailable or the query fails,
+            // we still write the marker with a generic label.
+            val wakeSenders = try {
+                val mb = mailboxService
+                if (mb != null && sessionId != null) {
+                    val unread = mb.peek(sessionId, limit = 10, includeRead = false)
+                    if (unread.isNotEmpty()) {
+                        unread
+                    } else null
+                } else null
+            } catch (_: Exception) { null }
+
+            val wakeLabel = if (wakeSenders != null && wakeSenders.isNotEmpty()) {
+                // Build a concise label: "system" for system-sent
+                // messages (sender = 00000000-…), "conv#<id>" for
+                // messages from other agents.  The conversation ID
+                // is derived from inReplyTo ?: messageId, matching
+                // the wake board's conv#<N> convention.
+                val SYSTEM_UUID = "00000000-0000-0000-0000-000000000000"
+                val parts = wakeSenders.map { msg ->
+                    val convId = msg.inReplyToMessageId ?: msg.messageId
+                    if (msg.senderSessionId == SYSTEM_UUID) "system" else "conv#$convId"
+                }.distinct().take(5)
+                "Woken by ${parts.joinToString(", ")}"
+            } else {
+                "Woken by standby resume"
             }
+            memory.addUserMessage("[[AKIBA_WAKE_EVENT]] $wakeLabel")
         }
 
         val ctx = StrategyContext(
@@ -293,6 +907,8 @@ class AkibaAgent(
             beforeChatHook = {
                 if (autoCompact) maybeCompact()
             },
+            finalAnswerAction = onFinalAnswer,
+            lifecycle = lifecycle,
             onLLMErrorHook = { info ->
                 // Keep the previous single-recovery semantics: only react to the
                 // first error in a run. Subsequent errors propagate as normal
@@ -315,7 +931,6 @@ class AkibaAgent(
             harness = agentHarness,
             mailboxService = mailboxService,
             resumedFromStandby = isResumed,
-            lifecycle = lifecycle,
             compactFn = if (compactOnStandby) {
                 { compact() }
             } else null,
@@ -325,7 +940,24 @@ class AkibaAgent(
                     ?: runtimeHandle?.takeIf { it.cancelRequested }?.let { "cancelled" }
             },
         )
-        return strategy.execute(ctx)
+        // Initialise the fresh LoopStats with cumulative token counts
+        // from previous wake cycles so the transcript's "Token Usage
+        // (cumulative)" line reflects the true session total, not just
+        // the current wake's tokens.
+        ctx.stats.totalInputTokens = cumulativeInputTokens
+        ctx.stats.totalOutputTokens = cumulativeOutputTokens
+
+        // Wrap the strategy execution with the scratchpad
+        // registry on the thread-local so [applyMailboxDrain]
+        // can route messages to per-conversation scratchpads
+        // and the scheduler can serialise / preempt conversations.
+        return withScratchpadRegistry(scratchpadRegistry) {
+            val result = strategy.execute(ctx)
+            // Persist cumulative counts for the next wake cycle.
+            cumulativeInputTokens = ctx.stats.totalInputTokens
+            cumulativeOutputTokens = ctx.stats.totalOutputTokens
+            result
+        }
     }
 
     // ---- Context compaction ----------------------------------------------

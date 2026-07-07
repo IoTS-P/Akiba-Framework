@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.data.database.AgentDatabaseClient.SessionInfo
 import org.iotsplab.akiba.data.database.DatabaseClient
+import org.iotsplab.akiba.llm.agent.AgentMailboxService
 import org.iotsplab.akiba.llm.agent.AgentPrompts
 import org.iotsplab.akiba.llm.agent.ModelContextLengthService
 import org.iotsplab.akiba.llm.agent.akibaAgent
@@ -63,7 +64,29 @@ data class AgentSessionResponse(
     val updatedAt: String?,
     val parentSessionId: String? = null,
     val totalInputTokens: Int = 0,
-    val totalOutputTokens: Int = 0
+    val totalOutputTokens: Int = 0,
+    /**
+     * Lifecycle policy declared at spawn time (`one_shot` or `standby`).
+     * Exposed so the frontend can render a dedicated "standby-capable"
+     * badge for STANDBY children without round-tripping to the daemon.
+     */
+    val lifecycle: String? = null,
+    /**
+     * The session's `runtime_state` column value (mirrors `status` for
+     * the current enum but kept distinct so future divergence is non-
+     * breaking on the wire).  Optional for callers that only want the
+     * legacy `status` view.
+     */
+    val runtimeState: String? = null,
+    /**
+     * Human-readable reason captured when the session entered a
+     * terminal/error state.  The frontend should surface this when
+     * `runtimeState == "error"` so users can see which child failed
+     * and why without opening logs.
+     */
+    val closingReason: String? = null,
+    /** Convenience alias for error displays. */
+    val errorMessage: String? = null,
 )
 
 data class AgentMessageResponse(
@@ -141,6 +164,39 @@ private object ManualAgentProcessRegistry {
 private val agentRouteLogger = LogManager.getLogger("AgentRoutes")
 private val agentRouteMapper = jacksonObjectMapper()
 private const val MANUAL_AGENT_TIMEOUT_MINUTES: Long = 10
+private const val AGENT_MESSAGES_PAGE_SIZE = 500
+private const val AGENT_MESSAGES_MAX_RETURN = 20_000
+
+/**
+ * Fetch a complete session transcript from the daemon despite the daemon's
+ * `/agent/message/get` hard cap of 500 rows per request.
+ *
+ * The frontend wake selector needs all `[[AKIBA_WAKE_EVENT]]` markers and the
+ * messages between them.  Fetching only the first page can make later wake
+ * cycles unselectable or make a selected wake appear to have missing messages
+ * once a long multi-wake agent session grows beyond 500 rows.
+ */
+private fun fetchAllAgentMessages(
+    agentDbClient: AgentDatabaseClient,
+    sessionId: String,
+    fromIndex: Int = 0,
+    maxMessages: Int = AGENT_MESSAGES_MAX_RETURN,
+): List<AgentDatabaseClient.MessageInfo> {
+    val out = mutableListOf<AgentDatabaseClient.MessageInfo>()
+    var nextIndex = fromIndex
+    while (out.size < maxMessages) {
+        val page = agentDbClient.getMessages(
+            sessionId = sessionId,
+            fromIndex = nextIndex,
+            limit = minOf(AGENT_MESSAGES_PAGE_SIZE, maxMessages - out.size),
+        )
+        if (page.isEmpty()) break
+        out += page
+        nextIndex = (page.maxOfOrNull { it.messageIndex } ?: nextIndex) + 1
+        if (page.size < AGENT_MESSAGES_PAGE_SIZE) break
+    }
+    return out
+}
 
 data class ChatResponse(
     val sessionId: String,
@@ -257,6 +313,41 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         }
     }
 
+    // ------ Get a single session by id ---------------------------------------
+    //
+    // Lightweight endpoint used by the frontend to poll the active
+    // session's status without re-downloading the full session list.
+    // The poll is what keeps the status pill in the chat header and
+    // the status badge in the session list in sync with the DB after
+    // the agent transitions to STANDBY (the chat endpoint is the
+    // only thing that flips the state, and it can happen long after
+    // the original `listSessions` returned).
+    get("/agent/sessions/{id}") {
+        val instance = call.requireInstanceHeader() ?: return@get
+        val id = call.parameters["id"].orEmpty()
+        if (id.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@get
+        }
+        try {
+            val info = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                AgentDatabaseClient(dbClient).getSession(id)
+            }
+            call.respond(info.toResponse())
+        } catch (e: DatabaseClient.DatabaseDaemonException) {
+            // 404 from the daemon (session not found) — surface as 404
+            if (e.statusCode == HttpStatusCode.NotFound) {
+                call.respond(HttpStatusCode.NotFound, mapOf("error" to "Session not found"))
+            } else {
+                val (status, body) = errorPayload(e)
+                call.respond(status, body)
+            }
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
     // ------ Create session ----------------------------------------------------
     post("/agent/sessions") {
         val instance = call.requireInstanceHeader() ?: return@post
@@ -300,8 +391,8 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
             return@get
         }
-        val fromIndex = call.parameters["fromIndex"]?.toIntOrNull() ?: 0
-        val limit = call.parameters["limit"]?.toIntOrNull() ?: 500
+        val fromIndex = call.request.queryParameters["fromIndex"]?.toIntOrNull() ?: 0
+        val limitParam = call.request.queryParameters["limit"]?.toIntOrNull()
 
         try {
             val (sessionInfo, msgs) = withDaemonSession(
@@ -309,7 +400,16 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             ) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
                 val info = agentDbClient.getSession(id)
-                val messages = agentDbClient.getMessages(id, fromIndex, limit)
+                val messages = if (limitParam != null) {
+                    // Preserve explicit pagination callers, but still obey the
+                    // daemon-side page cap by asking for at most one page.
+                    agentDbClient.getMessages(id, fromIndex, limitParam)
+                } else {
+                    // Frontend default path: return the full transcript so wake
+                    // selectors can segment all wake cycles, not just the first
+                    // daemon page (500 rows).
+                    fetchAllAgentMessages(agentDbClient, id, fromIndex)
+                }
                 info to messages
             }
             val filtered = msgs.filter { it.role != "system" }
@@ -319,7 +419,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 daemonHost, daemonPort, instance, serialize = false
             ) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
-                agentDbClient.getMessages(id, 0, 5000)
+                fetchAllAgentMessages(agentDbClient, id)
             }
             var totalInput = 0L
             var totalOutput = 0L
@@ -346,6 +446,123 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 "totalOutputTokens" to totalOutput,
                 "lastInputTokens" to lastInputTokens,
                 "contextLength" to contextLength
+            ))
+        } catch (e: DatabaseClient.DatabaseDaemonException) {
+            if (e.statusCode == HttpStatusCode.NotFound) {
+                call.respond(HttpStatusCode.NotFound, mapOf("error" to "Session not found"))
+            } else {
+                val (status, body) = errorPayload(e)
+                call.respond(status, body)
+            }
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    // ------ List conversations (mailbox) for a session -----------------------
+    // Returns a JSON array of conversations the session is a
+    // participant in, derived from mailbox messages.  Each entry
+    // has conversationId, status, messageCount, unhandledCount,
+    // lastMessagePreview, participants, etc.  Used by the frontend's
+    // right-side conversation panel.
+    //
+    // The summary derivation lives in
+    // [org.iotsplab.akiba.llm.agent.AgentMailboxService.listConversations]
+    // so the LLM `query_conversations` tool and this HTTP route
+    // always return the same data.
+    get("/agent/sessions/{id}/conversations") {
+        val instance = call.requireInstanceHeader() ?: return@get
+        val id = call.parameters["id"].orEmpty()
+        if (id.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@get
+        }
+        val statusFilter = (call.parameters["status"] ?: "all").lowercase()
+        try {
+            val summaries = withDaemonSession(
+                daemonHost, daemonPort, instance, serialize = false
+            ) { dbClient ->
+                AgentMailboxService(AgentDatabaseClient(dbClient))
+                    .listConversations(id, statusFilter = statusFilter, limit = 50)
+            }
+            call.respond(mapOf(
+                "sessionId" to id,
+                "totalConversations" to summaries.size,
+                "returned" to summaries.size,
+                "conversations" to summaries.map { s ->
+                    mapOf(
+                        "conversationId" to s.conversationId,
+                        "status" to s.status,
+                        "participants" to s.participants,
+                        "messageCount" to s.messageCount,
+                        "unhandledCount" to s.unhandledCount,
+                        "lastMessagePreview" to s.lastMessagePreview,
+                        "lastMessageKind" to s.lastMessageKind,
+                        "lastMessageAt" to s.lastMessageAt,
+                        "lastMessageSubject" to s.lastMessageSubject,
+                    )
+                },
+            ))
+        } catch (e: DatabaseClient.DatabaseDaemonException) {
+            if (e.statusCode == HttpStatusCode.NotFound) {
+                call.respond(HttpStatusCode.NotFound, mapOf("error" to "Session not found"))
+            } else {
+                val (status, body) = errorPayload(e)
+                call.respond(status, body)
+            }
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    // ------ Get full message history of a conversation -----------------------
+    // Returns all mailbox messages belonging to conversation
+    // convId, with full body, sender/recipient, kind, priority,
+    // timestamps, and ack status.  Used by the frontend when the
+    // user expands a conversation in the side panel.
+    //
+    // The chain-walking / participation filter lives in
+    // [org.iotsplab.akiba.llm.agent.AgentMailboxService.getConversationMessages]
+    // so the LLM `query_conversation` tool and this HTTP route
+    // always return the same data.
+    get("/agent/sessions/{id}/conversations/{convId}") {
+        val instance = call.requireInstanceHeader() ?: return@get
+        val id = call.parameters["id"].orEmpty()
+        val convIdStr = call.parameters["convId"].orEmpty()
+        if (id.isBlank() || convIdStr.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id or conversation id"))
+            return@get
+        }
+        val convId = convIdStr.toLongOrNull()
+            ?: run {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "conversationId must be numeric"))
+                return@get
+            }
+        try {
+            val messages = withDaemonSession(
+                daemonHost, daemonPort, instance, serialize = false
+            ) { dbClient ->
+                AgentMailboxService(AgentDatabaseClient(dbClient))
+                    .getConversationMessages(id, convId)
+            }
+            call.respond(mapOf(
+                "conversationId" to convId,
+                "messageCount" to messages.size,
+                "messages" to messages.map { m ->
+                    mapOf(
+                        "messageId" to m.messageId,
+                        "senderSessionId" to m.senderSessionId,
+                        "recipientSessionId" to m.recipientSessionId,
+                        "kind" to m.kind,
+                        "subject" to m.subject,
+                        "body" to m.body,
+                        "priority" to m.priority,
+                        "acked" to (m.ackedAt != null),
+                        "createdAt" to m.createdAt,
+                    )
+                },
             ))
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             if (e.statusCode == HttpStatusCode.NotFound) {
@@ -1043,7 +1260,11 @@ private fun SessionInfo.toResponse() = AgentSessionResponse(
     moduleName = moduleName,
     createdAt = createdAt,
     updatedAt = updatedAt,
-    parentSessionId = parentSessionId
+    parentSessionId = parentSessionId,
+    lifecycle = lifecycle,
+    runtimeState = runtimeState,
+    closingReason = closingReason,
+    errorMessage = if (runtimeState == "error" || status == "error") closingReason else null,
     // token totals omitted here for performance; use GET /agent/sessions/{id}/messages
 )
 

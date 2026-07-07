@@ -95,9 +95,17 @@ object WorkspaceManager: Closeable {
     val isProjectInitialized: Boolean
         get() = proj != null
     lateinit var projectName: String
+    /**
+     * True when [proj] currently represents a usable handle to the project
+     * named in [projectName]. We can't clear a `lateinit` once it has been
+     * set, so the flag is what makes [activeProjectName] return `null` after
+     * [releaseActiveProject] runs (and what stops callers from picking up a
+     * stale `projectName` from a previously closed project).
+     */
+    private var projectLoaded: Boolean = false
     private var activeProjectDirectory: Path? = null
     val activeProjectName: String?
-        get() = if (::projectName.isInitialized) projectName else null
+        get() = if (projectLoaded) projectName else null
     // Global language provider, we only need one
     lateinit var languageProvider: LanguageProvider
 
@@ -439,8 +447,52 @@ object WorkspaceManager: Closeable {
             }
         }
         projectName = name
+        projectLoaded = true
         activeProjectDirectory = root
         return proj!!
+    }
+
+    /**
+     * Release the singleton [GhidraProject] handle.
+     *
+     * This is the inverse of [openOrCreateInteractiveProject] / [initializeGhidraProject].
+     * It exists because akiba_server runs as a long-lived JVM process and
+     * task execution happens in **child processes**. Each child process opens
+     * its own `GhidraProject` against the same on-disk `<name>.rep/`; if the
+     * main JVM kept the project loaded indefinitely, Ghidra's `.ulock` file
+     * would block every child from acquiring the project, and every workflow
+     * would fail with `FileInUseException`.
+     *
+     * Export endpoints (and any other short-lived read against a project) must
+     * call this in their `finally` block when they were the one who opened the
+     * project, so subsequent child-process invocations are not starved.
+     *
+     * Safe to call when nothing is loaded — returns `false` and is a no-op.
+     * Never throws: any close-time error is logged at WARN and the state is
+     * still reset, so the caller can move on to a fresh open.
+     */
+    fun releaseActiveProject(): Boolean {
+        val current = proj ?: run {
+            projectLoaded = false
+            activeProjectDirectory = null
+            return false
+        }
+        return try {
+            current.close()
+            proj = null
+            projectLoaded = false
+            activeProjectDirectory = null
+            globalLogger.info("Released active Ghidra project '${projectName}' (was holding .ulock)")
+            true
+        } catch (e: Exception) {
+            // Reset the loaded flag regardless of close outcome so a stale
+            // broken handle doesn't keep blocking child-process workflows.
+            proj = null
+            projectLoaded = false
+            activeProjectDirectory = null
+            globalLogger.warn("releaseActiveProject: close() threw for project '${projectName}': ${e.message}", e)
+            false
+        }
     }
 
     fun ensureProgramForBinary(dbClient: DatabaseClient, binaryId: Int): ghidra.program.model.listing.Program? {
@@ -578,6 +630,11 @@ object WorkspaceManager: Closeable {
                     return false
                 }
             }
+            // Mirror openOrCreateInteractiveProject: mark the singleton as
+            // loaded so `activeProjectName` reports the project we just opened
+            // (and so the release path will be a no-op until a future caller
+            // explicitly tears it down).
+            projectLoaded = true
         } catch (e: IOException) {
             globalLogger.error("Failed to init Ghidra project: ${e.message}")
             return false

@@ -1,7 +1,9 @@
 package org.iotsplab.akiba.llm.agent
 
 import ghidra.program.model.listing.Program
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.llm.client.AkibaLLMClient
@@ -407,9 +409,14 @@ abstract class AgentModule(
      * `publish_agent_artifact` / `read_agent_artifact` tools become
      * available if the module also adds them via [defineTools] (see
      * [org.iotsplab.akiba.llm.tool.AgentMailboxTools]). Default null
-     * keeps the legacy tool surface unchanged.
+     * Default is a non-null [AgentMailboxService] backed by this
+     * module's [agentDbClient] — all agents should have mailbox
+     * access for unified management, including ONE_SHOT agents
+     * (which won't park but may still need to send/receive
+     * messages during their single run).
      */
-    protected open fun agentMailboxService(): AgentMailboxService? = null
+    protected open fun agentMailboxService(): AgentMailboxService? =
+        AgentMailboxService(agentDbClient)
 
     // ---- Bundled-skill installation ---------------------------------------
 
@@ -923,12 +930,19 @@ abstract class AgentModule(
                     rootSessionId = rootSessionId,
                     depth = spec.depth,
                     lifecycle = spec.lifecycle,
+                    coldStart = spec.coldStart,
+                    // Forward the spec-level override; null here
+                    // means "derive from lifecycle" (STANDBY →
+                    // PARK, ONE_SHOT → EXIT) inside
+                    // `spawnChildFromAgentProgrammatically`.
+                    onFinalAnswer = spec.onFinalAnswer,
                     taskPrompt = spec.taskPrompt,
                     name = spec.name,
                 )
                 logger.info(
                     "AgentModule sub-agent startup: spawned ${spec.name} " +
-                        "(lifecycle=${spec.lifecycle}, depth=${spec.depth})"
+                        "(lifecycle=${spec.lifecycle}, depth=${spec.depth}, " +
+                        "onFinalAnswer=${spec.onFinalAnswer ?: "default"})"
                 )
             } catch (e: Exception) {
                 logger.error(
@@ -940,6 +954,50 @@ abstract class AgentModule(
 
     override suspend fun startProcess() {
         logger.info("AgentModule starting: ${this.javaClass.simpleName}")
+
+        // 0. Start background async services for this binary (dispatcher,
+        //     orphan reaper, watchdog).  Idempotent per-binary via
+        //     AsyncAgentServices.forBinary.  Must run BEFORE sub-agent
+        //     spawning or mailbox writes, otherwise a STANDBY child that
+        //     receives a mailbox message will never be woken from standby
+        //     because the dispatcher is not polling yet.
+        val asyncServices = try {
+            AsyncAgentServices.forBinary(id, agentDbClient).also { it.startBackground() }
+        } catch (e: Exception) {
+            logger.warn("Failed to start AsyncAgentServices: ${e.message}")
+            null
+        }
+
+        // 0-pre. Reconcile any session rows left in a non-terminal state
+        //        by a previous (possibly crashed) process.  Without this
+        //        step, the frontend's status pill stays on "Running" /
+        //        "Cancelling" forever when the akiba server / CLI module
+        //        was taken down by SIGKILL, OOM, or container restart —
+        //        the [AgentModule]'s `terminationHook` never ran, so the
+        //        DB still shows the pre-kill state.  See
+        //        [AgentSessionReconciler] for the full design.
+        //
+        //        Safe to call here even when the same JVM already ran
+        //        the reconciler at server startup: the in-process guard
+        //        in the reconciler makes the second call a no-op.
+        //        Errors are caught inside the reconciler; we log
+        //        additionally to keep the per-module record straight.
+        try {
+            val report = asyncServices?.reconcileOnStartup()
+                ?: AgentSessionReconciler(
+                    agentDbClient = agentDbClient,
+                    reasonTag = "module_startup_fallback",
+                ).reconcile()
+            if (report.reconciled > 0) {
+                logger.info(
+                    "AgentModule startup reconciliation: closed " +
+                        "${report.reconciled} stale session(s) for binary=$id " +
+                        "(scanned=${report.scanned}, failed=${report.failed})"
+                )
+            }
+        } catch (e: Exception) {
+            logger.warn("AgentModule startup reconciliation threw: ${e.message}")
+        }
 
         // 0. Install any skills bundled with this module. Subclasses that
         //    override startProcess can either call super.startProcess() or
@@ -1033,6 +1091,103 @@ abstract class AgentModule(
             sessionId = sessionId,
         )
         this.agent = agent
+        val rootRuntime = AgentRuntime.forBinary(id, agentDbClient)
+
+        // Install the root agent's termination hook.  The hook
+        // is the single chokepoint where module-specific cleanup
+        // (template-unregister + the final runtime_state flip
+        // from "cancelling" to "closed") runs on the root's exit.
+        // The cascade-cancel + resource-release steps come from
+        // [AkibaAgent.defaultTerminate] which the agent's `init`
+        // block installs as the baseline — calling it from the
+        // hook keeps the same default semantics for root and
+        // child agents.
+        //
+        // The hook is invoked by [AkibaAgent.runWithTermination]
+        // when (and only when) the run is "truly terminating" —
+        // see the truth table on [runWithTermination].  STANDBY +
+        // PARK runs leave the hook untouched so the session can
+        // resume on a later mailbox message.
+        //
+        // We also install a [AkibaAgent.cascadeCanceller] so the
+        // framework's default cascade step (called by
+        // [AkibaAgent.defaultTerminate]) has a way to reach the
+        // per-binary [AgentRuntime] without the agent itself
+        // needing to know its binary id.  The runtime installs
+        // the same kind of canceller for child agents — see
+        // [AgentRuntime.runChildJob].
+        agent.cascadeCanceller = { sid, reason, graceMs ->
+            rootRuntime.cascadeCancelChildren(sid, reason, graceMs)
+        }
+        agent.terminationHook = hook@{
+            val sid = agent.sessionId
+            if (sid.isNullOrBlank()) return@hook
+
+            // 1. framework default: cascade-cancel children (ONE_SHOT
+            //    descendants; STANDBY descendants become orphans for
+            //    the OrphanReaper) + close the LLM client + transcript.
+            try {
+                agent.defaultTerminate()
+            } catch (e: Exception) {
+                logger.warn(
+                    "Root $sid termination hook: defaultTerminate failed: ${e.message}",
+                    e
+                )
+            }
+
+            // 2. unregister every agent template this module
+            //    contributed to the registry, so re-runs of the
+            //    same module don't see stale entries.
+            try {
+                unregisterContributedTemplates()
+            } catch (e: Exception) {
+                logger.warn("Root $sid termination hook: template unregister failed: ${e.message}")
+            }
+
+            // 3. transition the root's runtime_state + status to
+            //    "closed" so the frontend's status pill stops on
+            //    the final frame.  The strategy already wrote
+            //    "cancelling" earlier; this is the second half
+            //    of the two-step transition.  Skipped when the
+            //    status is "error" — the framework does not lie
+            //    about cause by overwriting an error.
+            val alreadyError = runCatching { agentDbClient.getSession(sid) }
+                .getOrNull()?.status == "error"
+            if (!alreadyError) {
+                try {
+                    agentDbClient.setRuntimeState(
+                        sid,
+                        "closed",
+                        closingReason = "root:parent_closing",
+                    )
+                } catch (e: Exception) {
+                    logger.warn(
+                        "Root $sid termination hook: setRuntimeState failed: ${e.message}"
+                    )
+                }
+                try {
+                    agentDbClient.updateSession(sid, status = "closed")
+                } catch (e: Exception) {
+                    logger.warn(
+                        "Root $sid termination hook: updateSession status=closed failed: ${e.message}"
+                    )
+                }
+            }
+        }
+
+        if (sessionId != null && agent.lifecycle == Lifecycle.STANDBY) {
+            try {
+                rootRuntime.registerRootStandbySession(
+                    sessionId = sessionId,
+                    lifecycle = agent.lifecycle,
+                    onFinalAnswer = agent.onFinalAnswer,
+                    taskPrompt = "<root-direct-run>",
+                ) { _ -> agent }
+                logger.info("Registered root standby session $sessionId with AgentRuntime for mailbox resume")
+            } catch (e: Exception) {
+                logger.warn("Failed to register root standby session $sessionId: ${e.message}")
+            }
+        }
 
         // Write session start to transcript
         transcript.writeSessionStart(
@@ -1069,101 +1224,161 @@ abstract class AgentModule(
         //      `subAgent { ... }` block.
         onBeforeFirstRun()
 
-        // 7. Run agent
+        // 7. Run agent.
+        //
+        // We call [AkibaAgent.runWithTermination] (not
+        // [AkibaAgent.run]) so the root agent's [terminationHook]
+        // — cascade-cancel + template-unregister + LLM/transcript
+        // close + the final "cancelling" → "closed" flip — fires
+        // when (and only when) the run is "truly terminating".
+        // STANDBY + PARK runs leave the hook untouched so the
+        // session can resume on a later mailbox message.
+        //
+        // The strategy writes the session status itself for every
+        // code path (Final Answer, STANDBY, MAX_ITERATIONS, ERROR,
+        // LLM failure) — see [AgentStrategy.updateSessionStatus]
+        // call sites.  startProcess therefore no longer mirrors
+        // that mapping: the only lifecycle contribution it makes
+        // is firing the [processCompletionLatch] (so callers can
+        // await "the root is fully torn down") and, in EXIT mode,
+        // awaiting that latch synchronously before returning.
         val prompt = taskPrompt()
         logger.info("Agent task: ${prompt.take(200)}")
         transcript.writeUserMessage(prompt)
 
-        try {
-            val result = agent.run(prompt)
-            agentResult = result
-            logger.info("Agent completed: ${result.stopReason}, ${result.iterations} iterations, ${result.toolCallsMade} tool calls")
-            if (result.stopReason == StopReason.ERROR)
-                logger.error("Error message: ${agentResult?.output}")
-
-            // 8. Process result
-            processResult(result)
-
-            // 9. Update session status. A successful run parks the
-            //    session as `standby` for STANDBY lifecycle (still
-            //    accepting mailbox messages) or terminates it as
-            //    `closed`; error / max-iteration paths always
-            //    terminate.
-            if (sessionId != null) {
-                try {
-                    val status = when (result.stopReason) {
-                        StopReason.COMPLETED ->
-                            if (agent.lifecycle == Lifecycle.STANDBY) "standby" else "closed"
-                        StopReason.STANDBY ->
-                            if (agent.lifecycle == Lifecycle.STANDBY) "standby" else "closed"
-                        StopReason.MAX_ITERATIONS -> "error"
-                        StopReason.ERROR -> "error"
-                    }
-                    agentDbClient.updateSession(sessionId, status = status)
-                    if (status == "standby") {
-                        logger.info(
-                            "Session $sessionId is in standby (lifecycle=standby); " +
-                                "will continue to accept mailbox messages."
-                        )
-                    }
-                } catch (_: Exception) {}
-            }
+        val result: AgentResult? = try {
+            agent.runWithTermination(prompt)
         } catch (e: Exception) {
+            // The strategy writes session status itself for any
+            // error it catches internally.  An exception that
+            // escapes here is a strategy bug or a transport
+            // failure the strategy's internal try/catch did not
+            // anticipate; we mark the module as failed and fire
+            // the [processCompletionLatch] with [ProcessExitReason.ERROR]
+            // so the [agent.processCompletionLatch.await()] at
+            // the end of [startProcess] returns instead of
+            // blocking forever.  The [OrphanReaper] picks up any
+            // children that did not get cascade-cancelled.
             logger.error("Agent run failed: ${e.message}")
             failureSign = FAILED
-
+            // Surface the failure on the session row so the
+            // frontend's error banner can show *why* the agent
+            // died instead of leaving the status pill on
+            // "running" forever.  The strategy's own
+            // [updateSessionStatus] would have already written
+            // an `error` row for errors it caught internally; an
+            // exception that reaches this catch is one it did
+            // NOT catch, so this is the only chance to flip the
+            // state.
             if (sessionId != null) {
+                val errorReason = "uncaught_exception: ${e.javaClass.simpleName}: ${e.message?.take(400)}"
                 try {
                     agentDbClient.updateSession(sessionId, status = "error")
                 } catch (_: Exception) {}
-            }
-        } finally {
-            // Cascade-cancel any live sub-agents before we tear down.
-            // Runs in a background coroutine so a slow cancel does not
-            // block the parent's cleanup; on a process kill the OrphanReaper
-            // will eventually pick this up.
-            if (sessionId != null) {
                 try {
-                    val runtime = AgentRuntime.forBinary(id, agentDbClient)
-                    kotlinx.coroutines.GlobalScope.launch {
-                        try {
-                            // The parent is closing.  Cascade-cancel
-                            // its live descendants.  We pass
-                            // callerSessionId = null because the
-                            // parent is the source-of-truth
-                            // authority, but the runtime has to
-                            // walk each child individually; system
-                            // privilege (null) lets the cleanup
-                            // proceed regardless of any
-                            // canBeCancelledBy=NONE policies the
-                            // child templates declared.
-                            val count = runtime.cancelSubtree(
-                                rootSessionId = sessionId,
-                                callerSessionId = null,
-                                reason = "parent_closing",
-                                graceMs = 30_000L,
-                            )
-                            if (count > 0) {
-                                logger.info(
-                                    "Cascade-cancelled $count live sub-agent(s) under " +
-                                        "session $sessionId on parent close"
-                                )
-                            }
-                        } catch (e: Exception) {
-                            logger.warn("Cascade cancel on $sessionId failed: ${e.message}", e)
-                        }
-                    }
-                } catch (e: Exception) {
-                    logger.warn("Failed to start cascade cancel: ${e.message}")
-                }
+                    agentDbClient.setRuntimeState(
+                        sessionId,
+                        RuntimeState.ERROR.wire(),
+                        closingReason = errorReason,
+                    )
+                } catch (_: Exception) {}
             }
-
-            // Always unregister any templates this module contributed, even
-            // on failure, to prevent leaks across reruns on the same binary.
-            unregisterContributedTemplates()
-            transcript.close()
-            llmClient.close()
+            withContext(NonCancellable) {
+                agent.processCompletionLatch.complete(ProcessExitReason.ERROR)
+            }
+            null
         }
+
+        if (result != null) {
+            agentResult = result
+            logger.info(
+                "Agent completed: ${result.stopReason}, ${result.iterations} iterations, " +
+                    "${result.toolCallsMade} tool calls"
+            )
+            if (result.stopReason == StopReason.ERROR) {
+                logger.error("Error message: ${result.output}")
+            }
+            processResult(result)
+            val rootParked = agent.lifecycle == Lifecycle.STANDBY &&
+                agent.onFinalAnswer == FinalAnswerAction.PARK &&
+                (result.stopReason == StopReason.STANDBY || result.stopReason == StopReason.COMPLETED)
+            if (rootParked && sessionId != null) {
+                rootRuntime.markRegisteredSessionStandby(
+                    sessionId = sessionId,
+                    reason = "root_parked:${result.stopReason.name.lowercase()}",
+                )
+            }
+        }
+
+        // Diagnostic log for the "still alive in STANDBY"
+        // case — operators watching the log benefit from a
+        // single line that summarises the await outcome.  The
+        // exit reason itself is derived inside
+        // [AkibaAgent.runWithTermination] and used to fire
+        // the latch, so we no longer need to derive it here.
+        if (result != null &&
+            result.stopReason != StopReason.ERROR &&
+            result.stopReason != StopReason.MAX_ITERATIONS &&
+            agent.onFinalAnswer == FinalAnswerAction.PARK &&
+            agent.lifecycle == Lifecycle.STANDBY
+        ) {
+            logger.info(
+                "Session ${agent.sessionId} is in standby (lifecycle=${agent.lifecycle}, " +
+                    "onFinalAnswer=${agent.onFinalAnswer}); the latch stays open — " +
+                    "startProcess will block until the agent is woken from standby and " +
+                    "runs a terminating turn, or until the caller cancels the agent."
+            )
+        }
+
+        // In BOTH EXIT and PARK modes, startProcess must NOT
+        // return until the root agent has reached a
+        // "truly-terminating" state.
+        //
+        // The [processCompletionLatch] is fired inside
+        // [AkibaAgent.runWithTermination] AFTER the agent's
+        // [terminationHook] returns.  The hook fires only on
+        // truly-terminating runs (see the truth table on
+        // [runWithTermination]):
+        //  - ONE_SHOT (any onFinalAnswer) + COMPLETED/ERROR/MAX_ITERS
+        //  - STANDBY + EXIT + COMPLETED/ERROR/MAX_ITERS
+        //  - STANDBY + PARK + ERROR/MAX_ITERS  (PARK + COMPLETED
+        //    does NOT fire — the agent is alive awaiting mailbox)
+        //
+        // The exit reason the latch carries is derived by
+        // [AkibaAgent.deriveExitReason] from `result` + the
+        // agent's policy; this block no longer needs to
+        // duplicate that mapping.
+        //
+        // Why "always await" rather than "await only in EXIT":
+        // the previous design fired the latch in PARK mode with
+        // [ProcessExitReason.PARKED] and skipped the await.  The
+        // problem is that an external caller (e.g. a test
+        // harness, an integration script) that wraps
+        // `startProcess` in `runBlocking` and then calls
+        // `awaitProcessExit()` would see the latch already
+        // complete and conclude "all work is done" — while the
+        // root agent is still alive in STANDBY awaiting mailbox,
+        // and the layer-1 sub-agents may be in a half-cancelled
+        // state because the cascade-cancel only ran for them in
+        // the EXIT path.  Awaiting unconditionally ensures the
+        // caller stays blocked until the agent is really done.
+        //
+        // The expected use is for the caller to either:
+        //  (a) `runBlocking { module.startProcess() }` — blocks
+        //      until the root agent's terminating turn (which is
+        //      an EXIT-mode turn, by definition, in this
+        //      scenario).  A STANDBY + PARK root that never
+        //      receives an exit signal will block here
+        //      indefinitely, which is the right semantics for
+        //      "I want the work to finish before I return".
+        //  (b) `launch { module.startProcess() }` and
+        //      `module.awaitProcessExit().join()` — same as
+        //      (a) but on a background scope, so the foreground
+        //      can do other work.
+        //  (c) `launch { module.startProcess() }` with no await
+        //      — fire-and-forget; the agent runs in the
+        //      background, mailbox-driven.
+        agent.processCompletionLatch.await()
     }
 
     /**
@@ -1196,6 +1411,45 @@ abstract class AgentModule(
         }
         super.close()
     }
+
+    // ---- Process-lifecycle bridges ----------------------------------------
+
+    /**
+     * Suspend until this module's [startProcess] `finally` block
+     * has finished every cleanup step (cascade-cancel, template
+     * unregister, transcript close, LLM client close) and the
+     * agent's process is fully terminated (or parked).
+     *
+     * This is the module-level mirror of
+     * [AkibaAgent.awaitProcessExit]; for an orchestrator that
+     * holds the [AgentModule] reference but not the [AkibaAgent]
+     * itself, this is the cleaner call site:
+     *
+     * ```kotlin
+     * runBlocking {
+     *     module.startProcess()         // returns immediately for PARK,
+     *     module.awaitProcessExit()      // or after full teardown for EXIT
+     * }
+     * ```
+     *
+     * Returns `null` if [startProcess] has not been called yet
+     * (no agent instance to await on).
+     *
+     * See [AkibaAgent.processCompletionLatch] for the underlying
+     * mechanism and [ProcessExitReason] for the possible return
+     * values.
+     */
+    suspend fun awaitProcessExit(): ProcessExitReason? =
+        agent?.processCompletionLatch?.await()
+
+    /**
+     * Non-blocking check — `true` when the module's [startProcess]
+     * has finished its `finally` block and the underlying agent
+     * has reached a terminal or parked state.  Useful for
+     * orchestrators that want to poll instead of suspending.
+     */
+    fun isProcessTerminated(): Boolean =
+        agent?.processCompletionLatch?.isCompleted == true
 
     // ---- Resolution helpers ----------------------------------------------
 

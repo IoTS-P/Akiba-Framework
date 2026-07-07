@@ -15,13 +15,29 @@ import org.iotsplab.akiba.data.database.AgentDatabaseClient
  * @param toolCallId For tool-result messages, the ID of the corresponding tool call.
  * @param toolName For tool-result messages, the name of the tool that was invoked.
  */
+/**
+ * A single message in an agent conversation.
+ *
+ * @param role One of "user", "assistant", "tool", "system".
+ * @param content The textual content of the message.
+ * @param toolCallId For tool-result messages, the ID of the corresponding tool call.
+ * @param toolName For tool-result messages, the name of the tool that was invoked.
+ * @param messageIndex Per-session monotonically increasing row index in
+ *        `agent_messages`.  Populated by [PersistentChatMemory] so that
+ *        operations such as [ChatMemory.removeLast] can target the exact
+ *        DB row by its index even when the local buffer is a sub-range
+ *        of the full DB transcript (e.g. after a compaction).  `null`
+ *        means the index is not known to the buffer (the row was added
+ *        outside [PersistentChatMemory] or has not been persisted yet).
+ */
 data class AgentChatMessage(
     val role: String,
     val content: String,
     val toolCallId: String? = null,
     val toolName: String? = null,
     val tokenCount: Int? = null,
-    val inputTokenCount: Int? = null
+    val inputTokenCount: Int? = null,
+    val messageIndex: Int? = null,
 )
 
 /**
@@ -83,6 +99,16 @@ interface ChatMemory : AutoCloseable {
     /** Clear all messages. */
     fun clear()
 
+    /**
+     * Remove and return the last message, or null if empty.
+     *
+     * Used by [AkibaAgent.executeWithStrategy] to strip the synthetic
+     * STANDBY-resume marker from memory WITHOUT clearing the entire
+     * conversation history (which would lose tool-call metadata and
+     * all previous messages from the DB).
+     */
+    fun removeLast(): AgentChatMessage? = null
+
     override fun close() {}
 }
 
@@ -123,10 +149,10 @@ class InMemoryChatMemory(
     override fun clear() {
         buffer.clear()
     }
-}
 
-// ============================================================
-//  PersistentChatMemory
+    override fun removeLast(): AgentChatMessage? =
+        if (buffer.isEmpty()) null else buffer.removeLast()
+}
 // ============================================================
 
 /**
@@ -161,6 +187,20 @@ class PersistentChatMemory(
 
     private val buffer: MutableList<AgentChatMessage> = mutableListOf()
 
+    /**
+     * The next `message_index` value the daemon will assign to our next
+     * `appendMessages` call.  We track this locally so each buffered
+     * [AgentChatMessage] knows its real DB row index — that index is the
+     * only reliable handle for [removeLast] once the local buffer has
+     * been compacted into a summary and no longer maps 1:1 to DB rows.
+     *
+     * It is initialised from `MAX(messageIndex) + 1` after a full DB scan
+     * (see [loadFromDatabase]).  [clear] does NOT reset it, because the
+     * DB rows we skipped during a compaction still exist and continue to
+     * occupy their original indices.
+     */
+    private var nextMessageIndex: Int = 1
+
     init {
         // Load existing messages from DB
         loadFromDatabase()
@@ -168,29 +208,60 @@ class PersistentChatMemory(
 
     private fun loadFromDatabase() {
         try {
+            // Phase 1: load ALL messages from DB into a temporary list so we
+            // can scan for the latest compaction boundary and the highest
+            // message_index we have already consumed.
+            val all = mutableListOf<AgentDatabaseClient.MessageInfo>()
             var offset = 0
             val batchSize = 200
             while (true) {
                 val batch = agentDbClient.getMessages(sessionId, offset, batchSize)
                 if (batch.isEmpty()) break
-                for (msg in batch) {
-                    val content = when (msg.role) {
-                        "tool" -> msg.toolResult ?: msg.content ?: ""
-                        else -> msg.content ?: ""
-                    }
-                    buffer.add(
-                        AgentChatMessage(
-                            role = msg.role,
-                            content = content,
-                            toolCallId = msg.toolCallId,
-                            toolName = msg.toolName
-                        )
-                    )
-                }
+                all.addAll(batch)
                 offset += batch.size
                 if (batch.size < batchSize) break
             }
-            logger.debug("Loaded ${buffer.size} messages from DB for session $sessionId")
+
+            // Phase 2: find the last <previous_summary> system message — this
+            // is the compaction boundary.  Only messages from that point
+            // onward belong in the LLM context buffer.  Messages before the
+            // boundary remain in the DB for frontend display but are NOT
+            // sent to the LLM, keeping the context window small after a
+            // compaction without losing history.
+            val summaryIdx = all.indexOfLast { msg ->
+                msg.role == "system" && (msg.content ?: "").contains("<previous_summary>")
+            }
+            val startIdx = if (summaryIdx >= 0) summaryIdx else 0
+            val compactedCount = if (summaryIdx >= 0) summaryIdx else 0
+
+            for (i in startIdx until all.size) {
+                val msg = all[i]
+                val content = when (msg.role) {
+                    "tool" -> msg.toolResult ?: msg.content ?: ""
+                    else -> msg.content ?: ""
+                }
+                buffer.add(
+                    AgentChatMessage(
+                        role = msg.role,
+                        content = content,
+                        toolCallId = msg.toolCallId,
+                        toolName = msg.toolName,
+                        messageIndex = msg.messageIndex,
+                    )
+                )
+            }
+
+            // Phase 3: figure out the next index the daemon will assign.
+            // We pick MAX over the full DB scan (not just the buffer) so
+            // that rows skipped during compaction still count.
+            val maxIndex = all.maxOfOrNull { it.messageIndex } ?: 0
+            nextMessageIndex = maxIndex + 1
+
+            logger.debug(
+                "Loaded ${buffer.size} messages from DB for session $sessionId" +
+                    (if (compactedCount > 0) " (skipped $compactedCount compacted messages before <previous_summary>)" else "") +
+                    "; nextMessageIndex=$nextMessageIndex"
+            )
         } catch (e: Exception) {
             logger.warn("Failed to load messages for session $sessionId: ${e.message}")
         }
@@ -210,8 +281,10 @@ class PersistentChatMemory(
             throw e
         }
 
-        // Update local buffer
-        buffer.add(AgentChatMessage(role, content))
+        // Update local buffer, recording the message_index the daemon just
+        // assigned to this row so that removeLast() can target it later.
+        buffer.add(AgentChatMessage(role, content, messageIndex = nextMessageIndex))
+        nextMessageIndex += 1
 
         // Apply eviction
         evictIfNeeded()
@@ -254,7 +327,13 @@ class PersistentChatMemory(
             }
         }
 
-        buffer.add(message)
+        // Stamp the assigned DB index on the buffered copy and advance
+        // the local counter for the next append.  We always overwrite
+        // whatever the caller passed in: PersistentChatMemory is the
+        // single owner of message_index assignment for this session.
+        val indexed = message.copy(messageIndex = nextMessageIndex)
+        nextMessageIndex += 1
+        buffer.add(indexed)
         evictIfNeeded()
     }
 
@@ -283,7 +362,16 @@ class PersistentChatMemory(
             throw e
         }
 
-        buffer.add(AgentChatMessage(role = "tool", content = result ?: "", toolCallId = toolCallId, toolName = toolName))
+        buffer.add(
+            AgentChatMessage(
+                role = "tool",
+                content = result ?: "",
+                toolCallId = toolCallId,
+                toolName = toolName,
+                messageIndex = nextMessageIndex,
+            )
+        )
+        nextMessageIndex += 1
         evictIfNeeded()
     }
 
@@ -309,28 +397,59 @@ class PersistentChatMemory(
         }
 
         if (evictCount > 0) {
-            // Remove from local buffer
+            // Remove from local buffer only.  Do NOT delete from the
+            // database — the frontend reads agent_messages directly and
+            // deleting rows would make evicted messages disappear from
+            // the UI.  The local buffer is the LLM's context window;
+            // the DB is the permanent transcript.
             repeat(evictCount) { buffer.removeAt(0) }
-
-            // Remove from database
-            try {
-                agentDbClient.deleteMessagesFrom(sessionId, 0)
-                logger.debug("Evicted $evictCount messages from local buffer")
-            } catch (e: Exception) {
-                logger.warn("Failed to evict messages from DB: ${e.message}")
-            }
+            logger.debug("Evicted $evictCount messages from local buffer (DB rows retained)")
         }
     }
 
     override fun messages(): List<AgentChatMessage> = buffer.toList()
 
     override fun clear() {
+        // IMPORTANT: do NOT delete messages from the database here.
+        //
+        // [AkibaAgent.compact] calls clear() and then re-adds the system
+        // prompt + <previous_summary> + kept rounds.  If we deleted the
+        // old rows, the frontend (which reads agent_messages directly)
+        // would lose all pre-compaction history — every previous user /
+        // assistant / tool message would vanish from the UI.
+        //
+        // Instead, we only clear the in-memory buffer.  The summary
+        // message that compact() writes next carries a <previous_summary>
+        // marker; loadFromDatabase() uses that marker as a compaction
+        // boundary so the LLM only sees post-compaction messages, while
+        // the DB retains the full history for frontend display.
         buffer.clear()
-        try {
-            agentDbClient.deleteMessagesFrom(sessionId, 0)
-        } catch (e: Exception) {
-            logger.warn("Failed to clear messages from DB: ${e.message}")
+    }
+
+    override fun removeLast(): AgentChatMessage? {
+        if (buffer.isEmpty()) return null
+        val last = buffer.removeAt(buffer.size - 1)
+        // Delete only the very last DB row, identified by its real
+        // message_index.  Using `buffer.size` here would be wrong after
+        // a compaction: the buffer then holds only a post-summary tail
+        // (e.g. 5 messages) while the DB still has the full transcript
+        // (e.g. 50 messages), so `buffer.size` no longer maps to the
+        // row we want to drop — passing it as `fromIndex` would wipe
+        // out legitimate transcript history.
+        val lastIndex = last.messageIndex
+        if (lastIndex == null) {
+            logger.warn(
+                "removeLast: last buffered message has no messageIndex for session $sessionId; " +
+                    "skipping DB delete to avoid wiping history."
+            )
+            return last
         }
+        try {
+            agentDbClient.deleteMessagesFrom(sessionId, lastIndex)
+        } catch (e: Exception) {
+            logger.warn("Failed to delete last message from DB: ${e.message}")
+        }
+        return last
     }
 }
 

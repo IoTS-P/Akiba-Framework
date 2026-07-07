@@ -370,6 +370,7 @@ class AgentBuilder {
     // ---- Lifecycle / mailbox / runtime / logger / compaction ------------
 
     private var lifecycleValue: Lifecycle = Lifecycle.ONE_SHOT
+    private var onFinalAnswerValue: FinalAnswerAction? = null
     private var mailboxServiceValue: AgentMailboxService? = null
     private var loggerValue: org.apache.logging.log4j.Logger? = null
     private var runtimeHandleValue: JobHandle? = null
@@ -378,10 +379,28 @@ class AgentBuilder {
     private var compactThresholdValue: Double = 0.75
     private var compactKeepRoundsValue: Int = 2
     private var errorRecoverySafetyFactorValue: Double = 0.85
+    private var terminationHookOverride: (suspend AkibaAgent.() -> Unit)? = null
 
     /** Set the [Lifecycle] the agent runs with. Default [Lifecycle.ONE_SHOT]. */
     fun lifecycle(value: Lifecycle) {
         lifecycleValue = value
+    }
+
+    /**
+     * Set the [FinalAnswerAction] the agent uses when the LLM
+     * emits "Final Answer:".  When unset (default), the
+     * [AkibaAgent.onFinalAnswer] default applies: STANDBY
+     * lifecycle → PARK, ONE_SHOT lifecycle → EXIT.
+     *
+     * Most callers will not need this — the default is the
+     * right answer for the common cases.  The override is for
+     * the unusual "STANDBY root agent that should truly exit on
+     * Final Answer" case: e.g. a long-lived interactive STANDBY
+     * root that has reached the end of its conversational arc
+     * and must close so the process can exit.
+     */
+    fun onFinalAnswer(value: FinalAnswerAction) {
+        onFinalAnswerValue = value
     }
 
     /** Provide a mailbox service for inter-agent communication. */
@@ -424,6 +443,49 @@ class AgentBuilder {
         errorRecoverySafetyFactorValue = value
     }
 
+    // ---- Termination -----------------------------------------------------
+
+    /**
+     * Override the [AkibaAgent.terminationHook] for this agent.
+     *
+     * The default hook (installed automatically by the
+     * [AkibaAgent] constructor's `init` block when no override
+     * is provided) runs two steps in order:
+     *  1. [AkibaAgent.cascadeCancel] — cancel every non-STANDBY
+     *     descendant of this agent via the per-binary
+     *     [AgentRuntime].
+     *  2. [AkibaAgent.close] — close the LLM client + transcript.
+     *
+     * The block you pass runs with the freshly-built
+     * [AkibaAgent] as its receiver, so it has direct access to
+     * [AkibaAgent.cascadeCancel], [AkibaAgent.close], and
+     * [AkibaAgent.defaultTerminate] (which composes both).  The
+     * block **replaces** the default — to extend it, call
+     * [AkibaAgent.defaultTerminate] first and add your own
+     * steps around it:
+     *
+     * ```kotlin
+     * val agent = akibaAgent {
+     *     client(...)
+     *     system("...")
+     *     onTermination {
+     *         defaultTerminate()              // cascade + close
+     *         unregisterMyTemplates()         // module-specific
+     *         setSessionStatus("closed")      // module-specific
+     *     }
+     * }
+     * ```
+     *
+     * A typical reason to override is that the surrounding
+     * [AgentModule] wants to do per-module bookkeeping (template
+     * unregistration, `runtime_state` flip, status update) that
+     * belongs at the end of the agent's run.  See
+     * [AgentModule.startProcess] for the canonical example.
+     */
+    fun onTermination(block: suspend AkibaAgent.() -> Unit) {
+        terminationHookOverride = block
+    }
+
     // ---- Build -----------------------------------------------------------
 
     /**
@@ -448,7 +510,7 @@ class AgentBuilder {
             resolvedClient.config.modelName
         )
 
-        return AkibaAgent(
+        val agent = AkibaAgent(
             client = resolvedClient,
             systemPrompt = systemPrompt,
             memory = resolvedMemory,
@@ -470,11 +532,23 @@ class AgentBuilder {
             compactKeepRounds = compactKeepRoundsValue,
             errorRecoverySafetyFactor = errorRecoverySafetyFactorValue,
             lifecycle = lifecycleValue,
+            onFinalAnswer = onFinalAnswerValue
+                ?: if (lifecycleValue == Lifecycle.STANDBY) FinalAnswerAction.PARK else FinalAnswerAction.EXIT,
             mailboxService = mailboxServiceValue,
             logger = loggerValue ?: org.apache.logging.log4j.LogManager.getLogger(AkibaAgent::class.java),
             runtimeHandle = runtimeHandleValue,
             subAgents = subAgents.toList(),
         )
+        // If the caller supplied a custom termination hook via
+        // the `onTermination { ... }` DSL, install it on the
+        // agent.  The default installed by AkibaAgent.init
+        // (cascade + close) is replaced by the override; the
+        // override can still call `defaultTerminate()` to keep
+        // the standard cleanup and add extra steps around it.
+        terminationHookOverride?.let { block ->
+            agent.terminationHook = { block(agent) }
+        }
+        return agent
     }
 }
 

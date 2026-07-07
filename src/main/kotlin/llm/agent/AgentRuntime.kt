@@ -43,7 +43,6 @@ import java.util.concurrent.atomic.AtomicLong
  * result to the DB.
  */
 class AgentRuntime(
-    val binaryId: Int,
     val agentDbClient: AgentDatabaseClient,
     val config: SchedulerConfig = SchedulerConfig(),
     /**
@@ -62,7 +61,7 @@ class AgentRuntime(
 ) {
     private val logger = LogManager.getLogger(AgentRuntime::class.java)
 
-    val scheduler = JobScheduler(binaryId, config, scope)
+    val scheduler = JobScheduler(config, scope)
 
     // sessionId -> JobHandle (admitted + queued; only present while
     // the Job is registered with the scheduler)
@@ -91,6 +90,18 @@ class AgentRuntime(
         val lifecycle: Lifecycle,
         val initialTaskPrompt: String,
         val factory: suspend (JobHandle) -> AkibaAgent,
+        /**
+         * Final-Answer policy declared at spawn time.  Mirrors
+         * [AkibaAgent.onFinalAnswer] for the agent built by
+         * [factory] so [runChildJob] can decide the post-Final
+         * runtime_state without having to construct the agent
+         * (the agent doesn't exist yet at spawn time).
+         *
+         * A STANDBY child in PARK mode stays in STANDBY after
+         * Final Answer; a STANDBY child in EXIT mode (or any
+         * ONE_SHOT child) goes to CLOSED.
+         */
+        val onFinalAnswer: FinalAnswerAction,
     )
 
     private val spawnEntries = ConcurrentHashMap<String, SpawnEntry>()
@@ -124,10 +135,11 @@ class AgentRuntime(
      * clean exit) or [RuntimeState.CLOSED] (one-shot, clean exit)
      * when [factory] returns.
      *
-     * The factory is responsible for constructing the [AkibaAgent]
-     * and returning it; the runtime wraps the resulting agent's
-     * `run(taskPrompt)` call so the state machine observes its
-     * outcome.
+     * @param coldStart  When true and [initialLifecycle] is STANDBY,
+     *                   the child skips its initial `agent.run()` and
+     *                   parks directly to `runtime_state=standby`.
+     *                   Only meaningful for STANDBY lifecycle;
+     *                   ignored for ONE_SHOT.  Default true.
      */
     fun spawn(
         parentSessionId: String,
@@ -148,13 +160,40 @@ class AgentRuntime(
         templateId: String?,
         depth: Int,
         initialLifecycle: Lifecycle,
+        /**
+         * When true and [initialLifecycle] is STANDBY, skip the
+         * child's first LLM call and park directly.  Ignored for
+         * ONE_SHOT.  Default true.
+         */
+        coldStart: Boolean = true,
+        /**
+         * Final-Answer policy for the child.  See
+         * [FinalAnswerAction].  The default (EXIT) matches
+         * [AkibaAgent]'s default for `lifecycle=ONE_SHOT`; STANDBY
+         * callers should pass `PARK` explicitly so a parked child
+         * stays STANDBY after Final Answer instead of going CLOSED.
+         */
+        onFinalAnswer: FinalAnswerAction = FinalAnswerAction.EXIT,
         taskPrompt: String,
         factory: suspend (JobHandle) -> AkibaAgent,
+        forceCompactBeforeRun: Boolean = false,
     ): JobHandle {
         require(childSessionId.isNotBlank()) { "childSessionId must not be blank" }
         require(rootSessionId.isNotBlank()) { "rootSessionId must not be blank" }
         val job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
-            runChildJob(childSessionId, taskPrompt, factory)
+            // First time the Job runs is the spawn-time "cold
+            // start": a STANDBY child with `coldStart=true` parks
+            // immediately and waits for mailbox messages.  The
+            // resumeStandby path creates a fresh Job that calls
+            // runChildJob with `coldStart=false` so the child
+            // actually runs the LLM loop.
+            runChildJob(
+                childSessionId,
+                taskPrompt,
+                factory,
+                coldStart = coldStart,
+                forceCompactBeforeRun = forceCompactBeforeRun,
+            )
         }
         val handle = JobHandle(
             sessionId = childSessionId,
@@ -187,6 +226,7 @@ class AgentRuntime(
             lifecycle = initialLifecycle,
             initialTaskPrompt = taskPrompt,
             factory = factory,
+            onFinalAnswer = onFinalAnswer,
         )
 
         scheduler.register(handle) { admitted ->
@@ -203,11 +243,126 @@ class AgentRuntime(
         } catch (e: Exception) {
             logger.warn("Failed to set runtime_state=running for $childSessionId: ${e.message}")
         }
+        try {
+            agentDbClient.updateSession(childSessionId, status = RuntimeState.RUNNING.wire())
+        } catch (e: Exception) {
+            logger.warn("Failed to set status=running for $childSessionId: ${e.message}")
+        }
+        // Mirror the requested lifecycle onto the DB row.  Without
+        // this the child row keeps its SQL DEFAULT 'one_shot', and
+        // downstream consumers that filter by `lifecycle='standby'`
+        // (notably [AgentMailboxDispatcher.findStandbyWithUnread]
+        // and the per-sender access policy in the mailbox send
+        // route) silently skip the child — STANDBY children would
+        // never be woken from standby.
+        //
+        // Idempotent: if the value is already what we want, the
+        // UPDATE is a no-op.  Both `one_shot` and `standby` are
+        // legal values for the column's CHECK constraint.
+        try {
+            agentDbClient.setSessionLifecycle(
+                childSessionId,
+                initialLifecycle.name.lowercase(),
+            )
+        } catch (e: Exception) {
+            logger.warn(
+                "Failed to set lifecycle=${initialLifecycle.name.lowercase()} " +
+                    "for $childSessionId: ${e.message}"
+            )
+        }
         return handle
     }
 
     /**
+     * Register a top-level module agent with the runtime so the
+     * normal mailbox dispatcher can resume it after it parks in
+     * STANDBY. Root agents are initially run by [AgentModule]
+     * directly (not through [spawn]), so without this adoption step
+     * [AgentMailboxDispatcher] would see `standby + unread` in the
+     * DB but [canResume] would return false and skip the wake.
+     */
+    fun registerRootStandbySession(
+        sessionId: String,
+        lifecycle: Lifecycle,
+        onFinalAnswer: FinalAnswerAction,
+        taskPrompt: String,
+        factory: suspend (JobHandle) -> AkibaAgent,
+    ): JobHandle {
+        require(sessionId.isNotBlank()) { "sessionId must not be blank" }
+        val existing = spawnEntries[sessionId]
+        if (existing != null) return existing.handle
+
+        val placeholderJob = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) { }
+        val handle = JobHandle(
+            sessionId = sessionId,
+            templateId = null,
+            parentSessionId = sessionId,
+            rootSessionId = sessionId,
+            depth = 0,
+            initialState = RuntimeState.RUNNING,
+            job = placeholderJob,
+        )
+        handles[sessionId] = handle
+        sessionPolicy[sessionId] = CancellationPolicy.ANCESTOR_ONLY
+        spawnEntries[sessionId] = SpawnEntry(
+            handle = handle,
+            lifecycle = lifecycle,
+            initialTaskPrompt = taskPrompt,
+            factory = factory,
+            onFinalAnswer = onFinalAnswer,
+        )
+        try {
+            agentDbClient.setRuntimeState(sessionId, RuntimeState.RUNNING.wire())
+        } catch (e: Exception) {
+            logger.warn("Failed to set runtime_state=running for root $sessionId: ${e.message}")
+        }
+        try {
+            agentDbClient.setSessionLifecycle(sessionId, lifecycle.name.lowercase())
+        } catch (e: Exception) {
+            logger.warn("Failed to set lifecycle=${lifecycle.name.lowercase()} for root $sessionId: ${e.message}")
+        }
+        return handle
+    }
+
+    /**
+     * Mirror a directly-run root agent's PARK result into the
+     * runtime handle. The root's strategy already wrote the DB row;
+     * this keeps the in-process handle at STANDBY so the dispatcher
+     * can later call [resumeStandby].
+     */
+    fun markRegisteredSessionStandby(
+        sessionId: String,
+        reason: String = "root_parked",
+    ): Boolean {
+        val handle = spawnEntries[sessionId]?.handle ?: return false
+        if (handle.state.value == RuntimeState.STANDBY) return true
+        if (handle.state.value != RuntimeState.RUNNING && handle.state.value != RuntimeState.MSGHANDLE) {
+            logger.warn(
+                "markRegisteredSessionStandby($sessionId) ignored: current=${handle.state.value}"
+            )
+            return false
+        }
+        transition(
+            handle = handle,
+            next = RuntimeState.STANDBY,
+            reason = reason,
+            requesterSessionId = null,
+        )
+        return handle.state.value == RuntimeState.STANDBY
+    }
+
+    /**
      * Body of the child Job. Runs the factory, then `agent.run(taskPrompt)`.
+     *
+     * @param coldStart when true (spawn path only), STANDBY
+     *                  children skip their first `agent.run()` and
+     *                  park directly into `runtime_state=standby`.
+     *                  The [resumeStandby] path passes `false` so
+     *                  the woken child actually runs the LLM loop on
+     *                  the freshly-injected mailbox messages.  See
+     *                  the cold-start STANDBY comment block below
+     *                  for the full rationale.
+     *
      * Lifecycle-to-state mapping:
      *  - lifecycle=one_shot + COMPLETED  → `closed`
      *  - lifecycle=standby  + COMPLETED  → `standby` (awaiting mailbox)
@@ -217,6 +372,8 @@ class AgentRuntime(
         sessionId: String,
         taskPrompt: String,
         factory: suspend (JobHandle) -> AkibaAgent,
+        coldStart: Boolean = false,
+        forceCompactBeforeRun: Boolean = false,
     ) {
         val handle = handles[sessionId] ?: run {
             logger.error("runChildJob($sessionId) called without a handle")
@@ -230,17 +387,125 @@ class AgentRuntime(
                 Lifecycle.ONE_SHOT
             }
 
-            val result = agent.run(taskPrompt)
+            // No per-child termination-hook installation needed.
+            // [AkibaAgent]'s constructor `init` block installs a
+            // default hook of `{ defaultTerminate() }` which runs
+            // [AkibaAgent.cascadeCancel] (the same cascade-walk this
+            // block used to inline — now delegated to the agent so
+            // grandchildren get cancelled by the child's own hook,
+            // not just by the root's) and [AkibaAgent.close] (the
+            // LLM client + transcript release).  A custom hook from
+            // the factory's `akibaAgent { onTermination { ... } }`
+            // DSL — when present — wins, since it overwrites the
+            // field right after construction.
+            //
+            // The runtime's own [transition] call below is what
+            // flips `runtime_state`; the default hook deliberately
+            // does NOT re-write that column to avoid a race with
+            // the runtime's hook-aware writer.
+            //
+            // What the runtime DOES need to install is the
+            // [AkibaAgent.cascadeCanceller] callback — that's the
+            // piece of glue between the agent's
+            // "cancel my own subtree" default step and the
+            // per-binary [AgentRuntime] that knows how to walk the
+            // DB.  Without it the child agent's `defaultTerminate`
+            // would silently no-op the cascade step, leaving
+            // grandchildren to the [OrphanReaper] 60s backstop.
+            // We capture the canceller as a closure over `this`
+            // (the runtime) so the agent has no hard reference
+            // back to the runtime — decoupling the two.
+            agent.cascadeCanceller = { sid, reason, graceMs ->
+                cascadeCancelChildren(sid, reason, graceMs)
+            }
 
+            // ── Cold-start STANDBY: park immediately, do not LLM ───────
+            //
+            // When the lifecycle is STANDBY and `coldStart` is true
+            // (the default for ProgrammaticSubAgentSpec), there are no
+            // mailbox messages on first spawn and running agent.run()
+            // would produce a pointless format reminder.  We skip the
+            // LLM entirely and transition directly to STANDBY.
+            // The mailbox dispatcher will wake the agent via
+            // resumeStandby() once a message arrives.
+            //
+            // The resume path passes `coldStart=false` so the woken
+            // child actually runs the LLM loop on the freshly-injected
+            // mailbox messages.  Without this distinction the resume
+            // path would re-enter the cold-start branch and immediately
+            // re-park, leaving the agent to never see its messages.
+            //
+            // When `coldStart` is false on initial spawn, the child
+            // runs its initial taskPrompt even in STANDBY mode —
+            // useful for agents that need to perform one-shot setup
+            // (e.g. loading state from the database) before entering
+            // standby.
+            if (lifecycle == Lifecycle.STANDBY && coldStart) {
+                logger.info(
+                    "[runChildJob] STANDBY child $sessionId spawned; " +
+                        "coldStart=true, parking directly to standby"
+                )
+                transition(
+                    handle = handle,
+                    next = RuntimeState.STANDBY,
+                    reason = "cold_start_park",
+                    requesterSessionId = null,
+                )
+                return
+            }
+
+            if (forceCompactBeforeRun) {
+                try {
+                    val compacted = agent.compact()
+                    logger.info(
+                        "[runChildJob] forceCompactBeforeRun for $sessionId completed: compacted=$compacted"
+                    )
+                } catch (e: Throwable) {
+                    logger.warn(
+                        "[runChildJob] forceCompactBeforeRun for $sessionId failed: " +
+                            "${e.javaClass.simpleName}: ${e.message}",
+                        e,
+                    )
+                }
+            }
+
+            val result = agent.runWithTermination(taskPrompt)
+
+            // Map StopReason + lifecycle + onFinalAnswer to the
+            // next runtime_state.
+            //
+            // The "Enter standby mode." marker is unambiguous: it
+            // always means "park" for STANDBY children, "close" for
+            // ONE_SHOT children (the marker is treated as a no-op
+            // final answer when the session is terminal anyway).
+            //
+            // Final Answer is more nuanced and depends on the
+            // declared [FinalAnswerAction]:
+            //  - STANDBY lifecycle + FinalAnswerAction.PARK →
+            //    STANDBY (park; the session keeps accepting mail).
+            //  - STANDBY lifecycle + FinalAnswerAction.EXIT →
+            //    CLOSED (the root STANDBY agent explicitly opted
+            //    into true exit; its resources will be released
+            //    by the parent AgentModule's startProcess() finally
+            //    block).
+            //  - ONE_SHOT lifecycle (regardless of action) →
+            //    CLOSED (the session is terminal; PARK collapses
+            //    to the same end state as EXIT).
+            val entry = spawnEntries[sessionId]
+            val onFinalAnswer = entry?.onFinalAnswer ?: FinalAnswerAction.EXIT
             val nextState = when {
                 result.stopReason == StopReason.STANDBY && lifecycle == Lifecycle.STANDBY -> RuntimeState.STANDBY
                 result.stopReason == StopReason.STANDBY -> RuntimeState.CLOSED
-                result.stopReason == StopReason.COMPLETED && lifecycle == Lifecycle.STANDBY ->
+                result.stopReason == StopReason.COMPLETED && lifecycle == Lifecycle.STANDBY && onFinalAnswer == FinalAnswerAction.PARK ->
                     RuntimeState.STANDBY
                 result.stopReason == StopReason.COMPLETED -> RuntimeState.CLOSED
+                // A STANDBY agent that hit max iterations should park
+                // back to STANDBY so it can be woken again later, rather
+                // than being terminally marked ERROR and stuck.
+                result.stopReason == StopReason.MAX_ITERATIONS && lifecycle == Lifecycle.STANDBY -> RuntimeState.STANDBY
                 else -> RuntimeState.ERROR
             }
-            val finalReason = mapStopReason(result.stopReason)
+            val finalReason = mapStopReason(result.stopReason, result)
             transition(
                 handle = handle,
                 next = nextState,
@@ -281,11 +546,15 @@ class AgentRuntime(
         }
     }
 
-    private fun mapStopReason(sr: StopReason): String = when (sr) {
+    private fun mapStopReason(sr: StopReason, result: AgentResult? = null): String = when (sr) {
         StopReason.COMPLETED -> "completed"
         StopReason.STANDBY -> "standby"
         StopReason.MAX_ITERATIONS -> "max_iterations"
-        StopReason.ERROR -> "error"
+        StopReason.ERROR -> buildString {
+            append("error")
+            val detail = result?.output?.trim()?.takeIf { it.isNotBlank() }?.take(500)
+            if (detail != null) append(": ").append(detail)
+        }
     }
 
     /**
@@ -386,6 +655,75 @@ class AgentRuntime(
     }
 
     /**
+     * Cascade-cancel every non-STANDBY descendant of
+     * [parentSessionId].  STANDBY children are deliberately
+     * left in place — they become orphans and the
+     * [OrphanReaper] picks them up on its next scan tick.
+     *
+     * This is the single chokepoint both the root
+     * [AgentModule.startProcess] `terminationHook` and the
+     * [runChildJob] `terminationHook` use.  Lifting the
+     * walk-then-cancel pair into the runtime means the
+     * STANDBY-orphan policy and the per-child `graceMs`
+     * cap live in one place rather than being duplicated
+     * in two `finally` blocks.
+     *
+     * Cancellation requests are issued **sequentially** so
+     * that a slow child (e.g. one stuck in an LLM call)
+     * cannot starve the others; each [cancel] is `suspend`
+     * and awaits the child's terminal state with the
+     * `graceMs` cap before the next one starts.
+     *
+     * Errors are caught and logged individually — a failure
+     * to cancel one descendant must not stop the cascade
+     * from continuing onto the next.
+     */
+    suspend fun cascadeCancelChildren(
+        parentSessionId: String,
+        reason: String = "parent_terminated",
+        graceMs: Long = 30_000L,
+    ): Int {
+        val live = try {
+            agentDbClient.listLiveSubtree(parentSessionId, includeClosed = false)
+        } catch (e: Exception) {
+            logger.warn("cascadeCancelChildren: listLiveSubtree($parentSessionId) failed: ${e.message}")
+            return 0
+        }
+        val standby = Lifecycle.STANDBY.name.lowercase()
+        val cancelable = live.filter { row ->
+            row.sessionId != parentSessionId &&
+                row.lifecycle?.lowercase() != standby
+        }
+        val orphanedStandby = live.count { row ->
+            row.sessionId != parentSessionId &&
+                row.lifecycle?.lowercase() == standby
+        }
+        for (row in cancelable) {
+            try {
+                cancel(
+                    sessionId = row.sessionId,
+                    callerSessionId = null,
+                    reason = reason,
+                    graceMs = graceMs,
+                )
+            } catch (e: Exception) {
+                logger.warn(
+                    "cascadeCancelChildren: cancel of ${row.sessionId} failed: ${e.message}",
+                    e
+                )
+            }
+        }
+        if (cancelable.isNotEmpty() || orphanedStandby > 0) {
+            logger.info(
+                "cascadeCancelChildren: parent=$parentSessionId — cancelled " +
+                    "${cancelable.size} one_shot child(ren), left $orphanedStandby " +
+                    "STANDBY child(ren) as orphans for the OrphanReaper"
+            )
+        }
+        return cancelable.size
+    }
+
+    /**
      * Direct children of [parentSessionId] currently registered.
      */
     fun listLiveChildren(parentSessionId: String): List<JobHandle> {
@@ -477,9 +815,14 @@ class AgentRuntime(
 
         // Create a fresh coroutine Job, swap into the existing
         // handle, and re-register with the scheduler so the
-        // cap counters re-admit the session.
+        // cap counters re-admit the session.  We explicitly pass
+        // `coldStart=false` so the woken child actually runs the
+        // LLM loop on the freshly-injected mailbox messages —
+        // re-using the spawn-time `coldStart` flag would
+        // re-enter the "park immediately" branch and the agent
+        // would never see its messages.
         val newJob = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
-            runChildJob(sessionId, newTaskPrompt, entry.factory)
+            runChildJob(sessionId, newTaskPrompt, entry.factory, coldStart = false)
         }
         handle.swapJob(newJob)
         scheduler.register(handle) { admitted ->
@@ -545,6 +888,21 @@ class AgentRuntime(
         }
 
         // Allowed: update in-memory state and mirror to DB.
+        //
+        // CRITICAL ORDERING: ancestor notifications MUST run BEFORE
+        // we write the terminal `status` to the DB.  The daemon's
+        // SendMessage route rejects messages from senders whose
+        // `status` is terminal ('error' or 'completed').  If we flip
+        // the status first, the mailbox notification silently fails
+        // with 403 Forbidden and the parent agent is never woken.
+        // (CLOSED is not in the daemon's terminal check, but we send
+        // before the flip for consistency and forward-safety.)
+        if (next == RuntimeState.ERROR) {
+            notifyAncestorsOfChildTerminal(handle, reason, isError = true)
+        }
+        if (next == RuntimeState.CLOSED) {
+            notifyAncestorsOfChildTerminal(handle, reason, isError = false)
+        }
         handle.updateState(next)
         try {
             agentDbClient.setRuntimeState(handle.sessionId, next.wire(), reason)
@@ -569,7 +927,159 @@ class AgentRuntime(
             transitionId = transitionId,
         )
         lastTransitionOutcome[handle.sessionId] = outcome
+
         return outcome
+    }
+
+    /**
+     * Default permanent wake for child terminal transitions: whenever
+     * a child transitions to ERROR or CLOSED, notify its direct parent
+     * and the root (if different) via mailbox.  This is intentionally
+     * NOT an explicit [WakeCondition]: terminal notifications are a
+     * safety mechanism and must be always-on so a parked orchestration
+     * tree cannot silently deadlock with all agents in STANDBY while
+     * one descendant finished or failed.
+     *
+     * The notification message includes:
+     *  - Basic metadata (session id, template id, reason).
+     *  - The child's last assistant message (truncated), so the parent
+     *    can preview the result without an extra DB round-trip.
+     *  - Guidance on how to query the child's full history.
+     *
+     * @param isError true for ERROR transitions, false for CLOSED.
+     */
+    private fun notifyAncestorsOfChildTerminal(
+        handle: JobHandle,
+        reason: String?,
+        isError: Boolean,
+    ) {
+        // Only notify the DIRECT parent, not the root session.
+        //
+        // Previously, both parentSessionId and rootSessionId were
+        // notified.  For grandchildren (e.g. linear_checker whose
+        // parent is batch_linear_planner and whose root is the
+        // VulnDetector root), this sent a "child complete" notification
+        // to the root for every grandchild — the root cannot act on
+        // these (it doesn't know about grandchildren) and the messages
+        // accumulated in its mailbox, causing the root to get stuck
+        // trying to ack/close them.
+        //
+        // The root will be woken when the direct child (BLP) itself
+        // closes, via the state_changed wake condition it registered.
+        val recipients = linkedSetOf<String>()
+        if (handle.parentSessionId.isNotBlank() && handle.parentSessionId != handle.sessionId) {
+            recipients.add(handle.parentSessionId)
+        }
+        if (recipients.isEmpty()) return
+
+        val detail = reason?.takeIf { it.isNotBlank() }
+            ?: if (isError) "child transitioned to error" else "child completed normally"
+
+        // Best-effort fetch of the child's last assistant message.
+        val lastMessage = try {
+            fetchLastAssistantMessage(handle.sessionId)
+        } catch (_: Exception) { null }
+
+        val body = buildString {
+            if (isError) {
+                appendLine("[child error] Agent ${handle.sessionId} transitioned to ERROR.")
+                appendLine("rootSessionId: ${handle.rootSessionId}")
+            } else {
+                appendLine("[child complete] Agent ${handle.sessionId} finished (CLOSED).")
+            }
+            appendLine("templateId: ${handle.templateId ?: "<adhoc>"}")
+            appendLine("parentSessionId: ${handle.parentSessionId}")
+            appendLine("reason: $detail")
+            appendLine()
+            if (lastMessage != null) {
+                appendLine("Last assistant message (truncated to 800 chars):")
+                appendLine(lastMessage.take(800))
+                if (lastMessage.length > 800) appendLine("…")
+            } else {
+                appendLine("(Could not retrieve the child's last message.)")
+            }
+            appendLine()
+            appendLine("To inspect the child's full conversation history, use:")
+            appendLine("  query_session_history sessionId=${handle.sessionId} limit=20")
+            appendLine("  read_history_tool_call sessionId=${handle.sessionId} <tool_call_id>")
+            appendLine()
+            if (isError) {
+                appendLine("This is a default safety wake. Review the failed child's session")
+                appendLine("and decide whether to retry, cancel the subtree, or continue with")
+                appendLine("degraded results.")
+            } else {
+                appendLine("This is a default safety wake. The child has finished its work.")
+                appendLine("Review its output and decide whether to dispatch more work or")
+                appendLine("proceed with aggregation.")
+            }
+        }
+
+        val kind = if (isError) "error" else "note"
+        val subject = if (isError)
+            "child agent error: ${handle.sessionId.take(8)}"
+        else
+            "child agent complete: ${handle.sessionId.take(8)}"
+        val priority = if (isError) 10 else 5
+
+        for (recipient in recipients) {
+            try {
+                // Send from "system" (not from the child's sessionId)
+                // because the child may already be terminal in the DB
+                // (the strategy's updateSessionStatus runs before
+                // transition()).  The daemon rejects messages from
+                // terminal senders with 403 Forbidden; using "system"
+                // bypasses that check so the notification always
+                // reaches the parent.
+                val msgId = agentDbClient.sendMailboxMessage(
+                    senderSessionId = "system",
+                    recipientSessionId = recipient,
+                    kind = kind,
+                    subject = subject,
+                    body = body,
+                    priority = priority,
+                )
+                // Register the conversation so close_conversation
+                // works for system-sent messages.  Without this, the
+                // ConversationRegistry has no participants for the
+                // conversation, and close_conversation fails with
+                // "caller is not a participant".
+                //
+                // Use the well-known system UUID (matching the daemon's
+                // SYSTEM_SESSION_UUID) so the participant entry is a
+                // valid session id — the string "system" would be
+                // rejected by the daemon if close_conversation tried
+                // to send a closure notification to it.
+                val systemUuid = "00000000-0000-0000-0000-000000000000"
+                ConversationRegistry.register(
+                    messageId = msgId,
+                    senderSessionId = systemUuid,
+                    recipientSessionId = recipient,
+                    inReplyTo = null,
+                )
+                logger.info(
+                    "Default child-${if (isError) "error" else "closed"} wake sent: " +
+                        "child=${handle.sessionId} recipient=$recipient msgId=$msgId reason=$detail"
+                )
+            } catch (e: Exception) {
+                logger.warn(
+                    "Failed to notify $recipient about child " +
+                        "${if (isError) "error" else "closed"} ${handle.sessionId}: ${e.message}"
+                )
+            }
+        }
+    }
+
+    /**
+     * Best-effort fetch of the last assistant message for [sessionId].
+     * Returns the content truncated to a reasonable length, or null
+     * if no assistant message was found or the query failed.
+     *
+     * Used by [notifyAncestorsOfChildTerminal] to include a preview
+     * of the child's final output in the wake notification.
+     */
+    private fun fetchLastAssistantMessage(sessionId: String): String? {
+        val messages = agentDbClient.getMessages(sessionId, fromIndex = 0, limit = 500)
+        return messages.lastOrNull { it.role == "assistant" && !it.content.isNullOrBlank() }?.content
     }
 
     /**
@@ -621,12 +1131,20 @@ class AgentRuntime(
 
         private val runtimes = ConcurrentHashMap<Int, AgentRuntime>()
 
+        /**
+         * Acquire the per-binary [AgentRuntime] singleton.  The
+         * binary id is used purely as the per-binary key for the
+         * registry map; the runtime itself does not store it
+         * (the [JobScheduler] and child-handle maps it owns are
+         * the actual per-binary state, and they key off session
+         * ids and parent ids, not the binary id).
+         */
         fun forBinary(
             binaryId: Int,
             agentDbClient: AgentDatabaseClient,
             config: SchedulerConfig = SchedulerConfig(),
         ): AgentRuntime = runtimes.computeIfAbsent(binaryId) {
-            AgentRuntime(binaryId, agentDbClient, config)
+            AgentRuntime(agentDbClient, config)
         }
 
         /** Test/CLI hook to wipe the registry (e.g. between test runs). */

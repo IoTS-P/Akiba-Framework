@@ -45,9 +45,13 @@ data class SchedulerConfig(
  *
  * The scheduler is intentionally single-instance per binary —
  * multiple schedulers would re-introduce the cap problem.
+ * The per-binary identity is held by [AgentRuntime] (the
+ * singleton that owns this scheduler); the scheduler itself
+ * has no use for the binary id, so it is intentionally not
+ * stored here — see the per-binary / per-parent / per-root
+ * counter maps below for the only state the scheduler needs.
  */
 class JobScheduler(
-    val binaryId: Int,
     val config: SchedulerConfig = SchedulerConfig(),
     val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
 ) {

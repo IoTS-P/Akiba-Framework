@@ -73,9 +73,22 @@ class AgentMailboxDispatcher(
      * the runtime to resume them.  Idempotent: a session that
      * has already been resumed (state moved past MSGHANDLE) is
      * skipped on subsequent ticks.
+     *
+     * Also evaluates registered [WakeCondition]s for all standby
+     * sessions: if a condition is satisfied, a synthetic "wake"
+     * message is sent to the agent's mailbox so it will be
+     * picked up by the next tick's `findStandbyWithUnread`.
      */
     private suspend fun tick() {
         if (!config.enabled) return
+
+        // 1. Evaluate wake conditions for all sessions that have
+        //    registered conditions.  This may deliver synthetic
+        //    messages that make a standby session "have unread"
+        //    even if no real message arrived.
+        evaluateWakeConditions()
+
+        // 2. Resume standby sessions with unread messages.
         val targets = findStandbyWithUnread()
         if (targets.isEmpty()) return
         val take = targets.take(config.maxWakesPerTick)
@@ -107,6 +120,135 @@ class AgentMailboxDispatcher(
         }
     }
 
+    /**
+     * Evaluate [WakeCondition]s for all sessions that have
+     * registered conditions.  For each satisfied condition, send
+     * a synthetic mailbox message to the target session so it
+     * will be picked up by [findStandbyWithUnread].
+     *
+     * The evaluation reads the current state of all sessions
+     * (for [StateChanged] conditions) and the unread message
+     * counts (for [MessageArrived] conditions) in a single pass.
+     * [TimeElapsed] conditions are evaluated against the current
+     * timestamp.
+     */
+    private suspend fun evaluateWakeConditions() {
+        // Get all sessions for this binary to build the state map.
+        val sessions = try {
+            agentDbClient.listSessions(
+                status = null,
+                binaryId = binaryId,
+                moduleName = null,
+                limit = 500,
+                offset = 0,
+                parentSessionId = "ALL",
+            )
+        } catch (e: Exception) {
+            return
+        }
+
+        // Build sessionId → runtime_state wire value map
+        val sessionStates = mutableMapOf<String, String>()
+        for (s in sessions) {
+            try {
+                val st = agentDbClient.getRuntimeState(s.sessionId)
+                if (st != null) sessionStates[s.sessionId] = st.runtimeState
+            } catch (_: Exception) {}
+        }
+
+        val now = System.currentTimeMillis()
+
+        // For each session that has registered wake conditions,
+        // build a WakeEvalContext and evaluate.
+        for (s in sessions) {
+            val conditions = WakeConditionRegistry.list(s.sessionId)
+            if (conditions.isEmpty()) continue
+
+            // Check if the session is still standby (conditions
+            // are only meaningful for parked agents)
+            if (sessionStates[s.sessionId] != RuntimeState.STANDBY.wire()) {
+                // Agent is not standby; clear its conditions (it
+                // already woke up via another path).
+                WakeConditionRegistry.clearAll(s.sessionId)
+                continue
+            }
+
+            val unreadCount = try {
+                agentDbClient.countUnreadMailbox(s.sessionId)
+            } catch (_: Exception) { 0 }
+
+            val unreadMessages = if (unreadCount > 0) {
+                try {
+                    // IMPORTANT: do NOT drain here. Wake-condition
+                    // evaluation must be read-only.  Draining in the
+                    // dispatcher would mark the message as read before
+                    // findStandbyWithUnread() runs, preventing the
+                    // default permanent message wake from resuming the
+                    // agent.  The real unread→seen transition belongs
+                    // to applyMailboxDrain() inside the agent run.
+                    agentDbClient.listMailboxMessages(
+                        sessionId = s.sessionId,
+                        limit = 50,
+                        includeRead = false,
+                    )
+                } catch (_: Exception) { emptyList() }
+            } else emptyList()
+
+            val evalCtx = WakeEvalContext(
+                agentSessionId = s.sessionId,
+                unreadCount = unreadCount,
+                unreadMessages = unreadMessages,
+                sessionStates = sessionStates,
+                registeredAt = conditions.first().registeredAt,
+                now = now,
+            )
+
+            val satisfied = WakeConditionRegistry.peek(s.sessionId, evalCtx)
+            if (satisfied.isNotEmpty()) {
+                // Send a synthetic wake message for each satisfied
+                // condition.  Only remove the condition from the
+                // registry AFTER the message is successfully
+                // inserted — if the send fails (e.g. transient DB
+                // error) the condition stays registered and will be
+                // retried on the next tick.
+                val sent = mutableListOf<WakeConditionRegistry.Entry>()
+                for (entry in satisfied) {
+                    try {
+                        val body = buildString {
+                            appendLine("[wake condition satisfied] ${entry.condition.description}")
+                            if (entry.label != null) {
+                                appendLine("(label: ${entry.label})")
+                            }
+                            appendLine("You registered this condition and it has been met.")
+                            appendLine("Process the triggering event and produce a response or")
+                            appendLine("register a new condition if you need to wait again.")
+                        }
+                        agentDbClient.sendMailboxMessage(
+                            senderSessionId = "system",
+                            recipientSessionId = s.sessionId,
+                            kind = "note",
+                            subject = "wake condition: ${entry.condition.description}",
+                            body = body,
+                        )
+                        sent.add(entry)
+                        logger.info(
+                            "WakeCondition fired for ${s.sessionId.take(8)}: " +
+                                "${entry.condition.description}"
+                        )
+                    } catch (e: Exception) {
+                        logger.warn(
+                            "WakeCondition: failed to send wake message to " +
+                                "${s.sessionId.take(8)}: ${e.message}"
+                        )
+                    }
+                }
+                if (sent.isNotEmpty()) {
+                    WakeConditionRegistry.removeEntries(s.sessionId, sent)
+                }
+            }
+        }
+    }
+
     private fun findStandbyWithUnread(): List<String> {
         val out = mutableListOf<String>()
         val sessions = try {
@@ -116,7 +258,7 @@ class AgentMailboxDispatcher(
                 moduleName = null,
                 limit = 200,
                 offset = 0,
-                parentSessionId = null,
+                parentSessionId = "ALL",
             )
         } catch (e: Exception) {
             return emptyList()

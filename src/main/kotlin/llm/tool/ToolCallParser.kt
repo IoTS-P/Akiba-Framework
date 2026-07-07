@@ -433,4 +433,162 @@ object ToolCallParser {
         val content = completion.content
         return if (content.isNotBlank()) parseAll(content) else emptyList()
     }
+
+    // ============================================================
+    //  Reverse-mistake detection helpers
+    // ============================================================
+    //
+    // The Tool *argument* layer already has a "this looks like a script
+    // variable, not a tool parameter" hint (see Tool.validateArguments for
+    // `scriptArgs` / `params` / `args`). The helpers below close the
+    // symmetric gap: when a *script* field (run_script `source` or
+    // script_library `parameters`) carries a payload that is structurally
+    // a tool_call JSON rather than Kotlin code or a parameter map, the
+    // LLM has confused the two layers. Surface this early with a clear
+    // hint so the model can self-correct without burning compile cycles.
+
+    /** Tool names that are known to exist on the agent's tool registry. */
+    private val knownToolNames: Set<String> = setOf(
+        "run_script", "script_library", "query_ghidra_api", "run_shell",
+        "query_module_data", "query_session_history", "query_memories",
+        "read_history_tool_call", "list_modules", "run_module",
+        "spawn_sub_agent", "await_agent", "await_multiple_children",
+        "get_agent_status", "agent_builder_alternatives",
+        "search_skill", "read_skill", "send_agent_message",
+        "read_agent_messages", "ack_agent_message", "close_conversation",
+        "publish_agent_artifact", "read_agent_artifact",
+        "query_conversation", "query_conversations", "await_condition",
+    )
+
+    /**
+     * Names of scripts in the agent's script library. These are NOT tool
+     * names, but a script name inside a tool_call JSON is a strong
+     * signal that the LLM confused the two layers (e.g. it called
+     * `run_script` with `source = {"name": "disassemble_function", ...}`
+     * when it meant to call `script_library` with
+     * `scriptName = "disassemble_function"`).
+     */
+    private val knownScriptNames: Set<String> = setOf(
+        "group_functions", "alter_label", "set_get_comment", "binary_info",
+        "search_strings", "list_strings", "entry_point_context",
+        "list_functions", "get_xrefs", "read_memory_region",
+        "list_memory_segments", "alter_func_signature", "rename_function",
+        "disassemble_function", "decompile_function", "find_dangerous_calls",
+    )
+
+    /**
+     * Union of [knownToolNames] and [knownScriptNames] — a name in this
+     * set is "something the agent can invoke", which is the property
+     * that makes its appearance inside a tool_call JSON meaningful for
+     * the reverse-mistake check.
+     */
+    private val knownInvocableNames: Set<String> = knownToolNames + knownScriptNames
+
+    /**
+     * Heuristic: does [text] look like a tool_call JSON object?
+     *
+     * The check is intentionally conservative — a false positive here would
+     * cause a real script source to be rejected, so we only fire on shapes
+     * that are essentially impossible to express as legitimate Kotlin code:
+     *
+     *  - `{"tool_call": {...}}`            — OpenAI-style single-call wrapper
+     *  - `{"name": "...", "arguments": ...}` — flat single-call form
+     *  - `{"function": {"name": "...", "arguments": ...}}` — function wrapper
+     *  - `{"tool_calls": [{...}]}`         — OpenAI-style batch wrapper
+     *  - `{"action": "...", "scriptName": ...}` — script_library expanded form
+     *  - `{"action": "search|read|read_class", "keyword": ...}` — query_ghidra_api expanded form
+     *
+     * Returns the inferred name when matched, or `null` when the
+     * text does not look like a tool_call JSON. The caller can use the
+     * returned name to construct a precise hint ("you called run_script
+     * but the source is actually a call to disassemble_function").
+     *
+     * The detection tolerates surrounding Kotlin code (a `;` or a
+     * `println(...)` after the closing `}`) — only the first balanced
+     * JSON object is inspected.
+     */
+    fun looksLikeToolCallJson(text: String): String? {
+        val trimmed = text.trim()
+        // Must start with `{` — this filters out all ordinary Kotlin
+        // source where braces are balanced inside a class body but
+        // never at the very first character of the source.
+        if (!trimmed.startsWith("{")) return null
+
+        // Try to extract the first balanced JSON object so that trailing
+        // junk (e.g. a `;` or a stray newline) does not defeat the parser.
+        val firstBrace = 0
+        val jsonStr = extractBalancedJson(trimmed, firstBrace) ?: return null
+
+        val parsed = try {
+            mapper.readValue<Map<String, Any?>>(jsonStr)
+        } catch (_: Exception) {
+            return null
+        }
+
+        // 1. Direct {"name": "...", "arguments": ...} or with a wrapper.
+        val candidate: Map<String, Any?>? = when {
+            parsed["tool_call"] is Map<*, *> -> toStringKeyMap(parsed["tool_call"] as Map<*, *>)
+            parsed["function"] is Map<*, *> -> toStringKeyMap(parsed["function"] as Map<*, *>)
+            parsed["tool_calls"] is List<*> -> {
+                // OpenAI-style batch wrapper. Drill into the first call,
+                // which may itself be wrapped in `function`.
+                val list = parsed["tool_calls"] as List<*>
+                val first = list.firstOrNull() as? Map<*, *>
+                if (first != null) {
+                    @Suppress("UNCHECKED_CAST")
+                    val inner = first["function"] as? Map<*, *>
+                    if (inner != null) toStringKeyMap(inner) else toStringKeyMap(first)
+                } else null
+            }
+            else -> parsed
+        }
+        if (candidate != null) {
+            val name = firstString(candidate, listOf("name", "tool", "tool_name", "toolName"))
+            if (!name.isNullOrBlank() && name in knownInvocableNames) return name
+            // Also accept an explicit `templateId`+`inputs` spawn_sub_agent shape.
+            if (candidate["templateId"] is String && candidate["inputs"] != null) {
+                return "spawn_sub_agent"
+            }
+        }
+
+        // 2. Expanded script_library form: {"action": "...", "scriptName": "..."}
+        val action = parsed["action"] as? String
+        if (action != null) {
+            if (parsed["scriptName"] is String && action in setOf("search", "read", "run")) {
+                return "script_library"
+            }
+            if (parsed["keyword"] is String && action in setOf("search", "read_class")) {
+                return "query_ghidra_api"
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * Heuristic: does any value in [map] look like a tool_call JSON?
+     *
+     * Walks the parameter map one level deep and also serialises the
+     * whole map back to JSON to catch deeply-nested cases. Used by
+     * [ScriptLibraryTool.runLibraryScript] to detect the LLM passing
+     * `{"tool_call": {...}}` as a script's runtime parameter — the
+     * script will receive that as a literal value instead of being
+     * executed as a real tool call.
+     *
+     * Returns the first inferred tool name found, or `null` if the
+     * parameters look like ordinary key/value arguments.
+     */
+    fun parametersLookLikeToolCall(map: Map<String, Any?>): String? {
+        for ((_, value) in map) {
+            if (value is String) {
+                looksLikeToolCallJson(value)?.let { return it }
+            } else if (value is Map<*, *>) {
+                @Suppress("UNCHECKED_CAST")
+                looksLikeToolCallJson(mapper.writeValueAsString(value as Map<String, Any?>))
+                    ?.let { return it }
+            }
+        }
+        // Last-resort: serialise the whole map and re-check.
+        return looksLikeToolCallJson(mapper.writeValueAsString(map))
+    }
 }

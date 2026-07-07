@@ -808,11 +808,15 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         sessionId: String,
         limit: Int = 50,
         includeRead: Boolean = false,
+        /** When true, return only read-but-unacked messages (the
+         *  "pending" set).  Takes precedence over [includeRead]. */
+        onlyPending: Boolean = false,
     ): List<MailboxMessageInfo> = runBlocking {
         val body = mapOf(
             "sessionId" to sessionId,
             "limit" to limit,
             "includeRead" to includeRead,
+            "onlyPending" to onlyPending,
         )
         val response = dbClient.post("/agent/mailbox/list", body)
         if (response.first == HttpStatusCode.OK) {
@@ -846,8 +850,10 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
     fun ackMailboxMessage(sessionId: String, messageId: Long) = runBlocking {
         val body = mapOf("sessionId" to sessionId, "messageId" to messageId)
         val response = dbClient.post("/agent/mailbox/ack", body)
-        if (response.first != HttpStatusCode.OK)
-            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+        if (response.first != HttpStatusCode.OK) {
+            val detail = response.second.takeIf { it.isNotBlank() } ?: response.first.description
+            throw DatabaseClient.DatabaseDaemonException(response.first, detail)
+        }
     }
 
     /** Cheap unread-count check (zero unread short-circuits the drain). */

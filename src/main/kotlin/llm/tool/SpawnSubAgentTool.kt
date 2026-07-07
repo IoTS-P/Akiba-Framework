@@ -9,9 +9,12 @@ import org.iotsplab.akiba.llm.agent.AgentTemplate
 import org.iotsplab.akiba.llm.agent.AgentTemplateRegistry
 import org.iotsplab.akiba.llm.agent.AgentTranscriptWriter
 import org.iotsplab.akiba.llm.agent.AkibaAgent
+import org.iotsplab.akiba.llm.agent.ConversationRegistry
+import org.iotsplab.akiba.llm.agent.FinalAnswerAction
 import org.iotsplab.akiba.llm.agent.JobHandle
 import org.iotsplab.akiba.llm.agent.Lifecycle
 import org.iotsplab.akiba.llm.agent.ModelContextLengthService
+import org.iotsplab.akiba.llm.agent.RuntimeState
 import org.iotsplab.akiba.llm.agent.ReActStrategy
 import org.iotsplab.akiba.llm.agent.ResolvedSubAgentSpec
 import org.iotsplab.akiba.llm.agent.SubAgentFactoryContext
@@ -52,6 +55,25 @@ fun SpawnSubAgentTool(
     parent: AgentModule,
     agentDbClient: AgentDatabaseClient,
     resolver: TemplateFactoryResolver = TemplateFactoryResolver(),
+    /**
+     * Optional override for the parent session of the spawned child.
+     *
+     * When null (default), the tool reads [AgentModule.agentSessionId]
+     * — correct when the calling agent IS the root.  When non-null,
+     * the value is used directly, which the framework's
+     * `buildLayer1Agent` (and any other sub-agent factory) MUST set
+     * so that grandchildren created by a layer-1 planner are
+     * correctly parented under the layer-1, not the root.
+     *
+     * Without this parameter a `spawn_sub_agent` call from a
+     * layer-1 STANDBY agent produces a child whose
+     * `parentSessionId` column points to the root — the
+     * per-context cap counters and the cascade-cancel walker both
+     * see a flat tree instead of a two-level one, and the
+     * children of different layer-1 agents share a single
+     * per-root budget.
+     */
+    callerSessionId: String? = null,
 ): Tool {
     val common = listOf(
         ToolParameter(
@@ -103,6 +125,16 @@ fun SpawnSubAgentTool(
             "[Template path] Comma-separated list of additional skill ids.",
             required = false
         ),
+        ToolParameter(
+            "reuseSessionId", "string",
+            "[Template path] Existing ERROR child session to reuse for a controlled retry. Internal scheduler use only.",
+            required = false
+        ),
+        ToolParameter(
+            "forceCompactBeforeRun", "boolean",
+            "[Template path] When reusing a session, force one context compaction before rerunning the child.",
+            required = false
+        ),
     )
     return Tool(
         name = "spawn_sub_agent",
@@ -120,7 +152,7 @@ fun SpawnSubAgentTool(
             appendLine("the child directly from `systemPrompt` / `taskPrompt` / `toolNames`.")
         },
         parameters = common,
-    ) { args -> handleSpawn(args, parent, agentDbClient, resolver) }
+    ) { args -> handleSpawn(args, parent, agentDbClient, resolver, callerSessionId) }
 }
 
 private fun handleSpawn(
@@ -128,11 +160,17 @@ private fun handleSpawn(
     parent: AgentModule,
     agentDbClient: AgentDatabaseClient,
     resolver: TemplateFactoryResolver,
+    callerSessionId: String? = null,
 ): String {
     val mapper = jacksonObjectMapper()
     val templateId = (args["templateId"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
     val parentAgent = parent.agent ?: return "Error: parent agent not initialised"
-    val parentSessionId = parent.agentSessionId
+    // When [callerSessionId] is provided (sub-agent calling through a
+    // tool instance that was registered with its own session), use it.
+    // Otherwise fall back to the module's session — the common case for
+    // the root agent where caller == module owner.
+    val parentSessionId = callerSessionId
+        ?: parent.agentSessionId
         ?: return "Error: parent agent has no session id"
 
     if (templateId != null) {
@@ -141,6 +179,74 @@ private fun handleSpawn(
         )
     }
     return spawnFreeform(args, parent, parentAgent, parentSessionId, agentDbClient, mapper)
+}
+
+private const val SYSTEM_SESSION_UUID = "00000000-0000-0000-0000-000000000000"
+
+/**
+ * Deliver a best-effort self-wake to the caller when `spawn_sub_agent`
+ * fails before an [AgentRuntime] child exists.
+ *
+ * Runtime-managed children already notify their direct parent on
+ * CLOSED/ERROR via [AgentRuntime].  However template input/rendering
+ * failures can happen after the child DB session has been created but
+ * BEFORE `runtime.spawn(...)` registers a [JobHandle].  In that gap
+ * there is no runtime terminal transition, so without this helper the
+ * parent (e.g. VulnDetector's Batch Linear Planner) may park forever
+ * waiting for a child-completion message that can never arrive.
+ */
+private fun notifyParentOfPreSpawnFailure(
+    agentDbClient: AgentDatabaseClient,
+    parentSessionId: String,
+    templateId: String?,
+    childSessionId: String?,
+    error: String,
+    args: Map<String, Any?>,
+): Long? = try {
+    val body = buildString {
+        appendLine("[sub-agent spawn failed]")
+        appendLine("templateId: ${templateId ?: "<freeform>"}")
+        if (childSessionId != null) appendLine("childSessionId: $childSessionId")
+        appendLine("parentSessionId: $parentSessionId")
+        appendLine("error: $error")
+        appendLine()
+        appendLine("This failure happened before the child was registered with AgentRuntime,")
+        appendLine("so no normal child-terminal wake would be emitted. Treat this message")
+        appendLine("as the failed child completion notification.")
+        appendLine()
+        appendLine("Original spawn_sub_agent arguments:")
+        appendLine(jacksonObjectMapper().writeValueAsString(args))
+        appendLine()
+        appendLine("Action: fix the bad parameters (for linear_checker, use groupRef exactly")
+        appendLine("as <groupingId>:<globalGroupIndex> from group_functions), then retry")
+        appendLine("that child or continue with degraded coverage. Ack this message after handling.")
+    }
+    val msgId = agentDbClient.sendMailboxMessage(
+        senderSessionId = "system",
+        recipientSessionId = parentSessionId,
+        kind = "error",
+        subject = "sub-agent spawn failed: ${templateId ?: "freeform"}",
+        body = body,
+        priority = 10,
+    )
+    ConversationRegistry.register(
+        messageId = msgId,
+        senderSessionId = SYSTEM_SESSION_UUID,
+        recipientSessionId = parentSessionId,
+        inReplyTo = null,
+    )
+    msgId
+} catch (_: Exception) {
+    null
+}
+
+private fun markChildSessionError(
+    agentDbClient: AgentDatabaseClient,
+    childSessionId: String,
+    reason: String,
+) {
+    try { agentDbClient.setRuntimeState(childSessionId, RuntimeState.ERROR.wire(), reason) } catch (_: Exception) {}
+    try { agentDbClient.updateSession(childSessionId, status = "error") } catch (_: Exception) {}
 }
 
 private fun spawnFromTemplate(
@@ -157,9 +263,26 @@ private fun spawnFromTemplate(
     val overridesNode = coerceArgsObject(args["overrides"])
     val name = (args["name"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
     val skillOverridesRaw = (args["skillOverrides"] as? String)?.trim().orEmpty()
+    val reuseSessionId = (args["reuseSessionId"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+    val forceCompactBeforeRun = when (val raw = args["forceCompactBeforeRun"]) {
+        is Boolean -> raw
+        is String -> raw.equals("true", ignoreCase = true)
+        else -> false
+    }
 
     val template = AgentTemplateRegistry.resolveForScope(parentSessionId, templateId)
-        ?: return "Error: template '$templateId' is not registered in this scope"
+        ?: run {
+            val err = "template '$templateId' is not registered in this scope"
+            val wakeId = notifyParentOfPreSpawnFailure(
+                agentDbClient, parentSessionId, templateId, null, err, args
+            )
+            return mapper.writeValueAsString(mapOf(
+                "status" to "error",
+                "error" to err,
+                "wakeMessageId" to wakeId,
+                "hint" to "The failure was also sent to this agent's mailbox so it can wake/retry if it parks.",
+            ))
+        }
 
     val inputs = jsonNodeToMap(inputsNode)
     val overrides = jsonNodeToMap(overridesNode)
@@ -180,9 +303,27 @@ private fun spawnFromTemplate(
             parentDepth = parentAgentDepth(parent),
         )
     } catch (e: IllegalArgumentException) {
-        return "Error: invalid spec for template '$templateId': ${e.message}"
+        val err = "invalid spec for template '$templateId': ${e.message}"
+        val wakeId = notifyParentOfPreSpawnFailure(
+            agentDbClient, parentSessionId, templateId, null, err, args
+        )
+        return mapper.writeValueAsString(mapOf(
+            "status" to "error",
+            "error" to err,
+            "wakeMessageId" to wakeId,
+            "hint" to "Fix the spawn_sub_agent inputs/overrides and retry. The failure was also sent to this agent's mailbox.",
+        ))
     } catch (e: IllegalStateException) {
-        return "Error: invalid spec for template '$templateId': ${e.message}"
+        val err = "invalid spec for template '$templateId': ${e.message}"
+        val wakeId = notifyParentOfPreSpawnFailure(
+            agentDbClient, parentSessionId, templateId, null, err, args
+        )
+        return mapper.writeValueAsString(mapOf(
+            "status" to "error",
+            "error" to err,
+            "wakeMessageId" to wakeId,
+            "hint" to "Fix the spawn_sub_agent inputs/overrides and retry. The failure was also sent to this agent's mailbox.",
+        ))
     }
 
     val llmConfig = try {
@@ -196,24 +337,43 @@ private fun spawnFromTemplate(
         llmClient.use { client ->
             val childName = name ?: "${template.id}-${System.nanoTime()}"
             val childSessionId = try {
-                agentDbClient.createSession(
-                    sessionName = "sub-agent::$childName",
-                    binaryId = parent.id,
-                    moduleName = "${parent.javaClass.simpleName}::SubAgent(${template.id})",
-                    modelName = llmConfig.modelName,
-                    parentSessionId = parentSessionId,
-                )
+                if (reuseSessionId != null) {
+                    val session = agentDbClient.getSession(reuseSessionId)
+                    if (session.parentSessionId != parentSessionId) {
+                        return@use "Error: reuseSessionId '$reuseSessionId' is not a direct child of caller session '$parentSessionId'"
+                    }
+                    val state = agentDbClient.getRuntimeState(reuseSessionId)?.runtimeState?.lowercase()
+                    if (state != RuntimeState.ERROR.wire()) {
+                        return@use "Error: reuseSessionId '$reuseSessionId' must be in runtime_state=error before retry; current=$state"
+                    }
+                    reuseSessionId
+                } else {
+                    agentDbClient.createSession(
+                        sessionName = "sub-agent::$childName",
+                        binaryId = parent.id,
+                        moduleName = "${parent.javaClass.simpleName}::SubAgent(${template.id})",
+                        modelName = llmConfig.modelName,
+                        parentSessionId = parentSessionId,
+                    )
+                }
             } catch (e: Exception) {
-                return@use "Error: failed to create child session: ${e.message}"
+                return@use "Error: failed to ${if (reuseSessionId != null) "reuse" else "create"} child session: ${e.message}"
             }
 
             val childMemory = persistentChatMemory(agentDbClient, childSessionId, maxMessages = 0)
             val childTranscript = AgentTranscriptWriter(agentDbClient, childSessionId)
 
+            // [parentSessionId] is the caller's session (layer-1 when a
+            // sub-agent calls this tool, or the root when the root calls
+            // it).  [rootSessionId] must ALWAYS be the root's session so
+            // the JobScheduler's per-root cap keys correctly and the
+            // cascade-cancel walker can trace the tree from the real root.
+            val rootSn = parent.agentSessionId ?: parentSessionId
+
             val factoryCtx = SubAgentFactoryContext(
                 templateId = template.id,
                 templateVersion = template.version,
-                rootSessionId = parentSessionId,
+                rootSessionId = rootSn,
                 parentSessionId = parentSessionId,
                 depth = resolved.childDepth,
                 budget = template.budgetPolicy,
@@ -231,14 +391,60 @@ private fun spawnFromTemplate(
                 transcript = childTranscript,
             )
 
-            val taskPrompt = buildTemplateTaskPrompt(template, resolved, factoryCtx)
+            val taskPrompt = try {
+                buildTemplateTaskPrompt(template, resolved, factoryCtx)
+            } catch (e: Throwable) {
+                val err = "failed to render task prompt for template '${template.id}': " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+                markChildSessionError(agentDbClient, childSessionId, err)
+                val wakeId = notifyParentOfPreSpawnFailure(
+                    agentDbClient = agentDbClient,
+                    parentSessionId = parentSessionId,
+                    templateId = template.id,
+                    childSessionId = childSessionId,
+                    error = err,
+                    args = args,
+                )
+                childTranscript.writeSessionStart(
+                    moduleName = "${parent.javaClass.simpleName}::SubAgent(${template.id})",
+                    binaryId = parent.id,
+                    modelName = llmConfig.modelName,
+                    strategy = resolved.effectiveStrategy.id.name.lowercase(),
+                )
+                childTranscript.writeUserMessage("[spawn_sub_agent failed before child run]\n$err")
+                childTranscript.close()
+                return@use mapper.writeValueAsString(mapOf(
+                    "status" to "error",
+                    "mode" to "template",
+                    "templateId" to template.id,
+                    "childSessionId" to childSessionId,
+                    "parentSessionId" to parentSessionId,
+                    "error" to err,
+                    "wakeMessageId" to wakeId,
+                    "hint" to "The child session was marked ERROR and an error wake was sent to the parent mailbox. Fix the bad inputs and retry.",
+                ))
+            }
             childTranscript.writeSessionStart(
                 moduleName = "${parent.javaClass.simpleName}::SubAgent(${template.id})",
                 binaryId = parent.id,
                 modelName = llmConfig.modelName,
                 strategy = resolved.effectiveStrategy.id.name.lowercase(),
             )
-            childTranscript.writeUserMessage(taskPrompt)
+            // Defer the user-message transcript entry to when the
+            // LLM actually sees it.  The template path defaults to
+            // coldStart=true (it is the common case for STANDBY
+            // children that park at spawn and wait for the first
+            // mailbox message), so without this guard a STANDBY
+            // child would have a "User" entry in its transcript
+            // even though the LLM never received the taskPrompt.
+            // ONE_SHOT templates (and any STANDBY template that
+            // explicitly requests cold-start false in a future
+            // extension) will call `agent.run(taskPrompt)`
+            // immediately, so writing the user message now is
+            // correct for those paths.
+            if (resolved.effectiveLifecycle != Lifecycle.STANDBY) {
+                childTranscript.writeUserMessage(taskPrompt)
+            }
 
             val factoryRef: (suspend (JobHandle) -> AkibaAgent) = { handle ->
                 try {
@@ -257,12 +463,30 @@ private fun spawnFromTemplate(
             val handle = runtime.spawn(
                 parentSessionId = parentSessionId,
                 childSessionId = childSessionId,
-                rootSessionId = factoryCtx.rootSessionId ?: parentSessionId,
+                rootSessionId = rootSn,
                 templateId = template.id,
                 depth = resolved.childDepth,
                 initialLifecycle = resolved.effectiveLifecycle,
+                // Match the AkibaAgent default for the template's
+                // declared lifecycle: STANDBY children park on
+                // Final Answer so they can keep accepting mail
+                // (the parent's mailbox dispatcher will wake them
+                // on demand); ONE_SHOT children exit.  A template
+                // that wants to override this can set
+                // `onFinalAnswer` explicitly on the agent it
+                // builds inside its factory — the
+                // [AkibaAgent.onFinalAnswer] field is read by the
+                // strategy for status updates; the value passed
+                // here is read by [runChildJob] for state
+                // transitions, and the two are kept in lockstep
+                // by the convention "if the agent's
+                // onFinalAnswer != lifecycle default, override
+                // here too".
+                onFinalAnswer = if (resolved.effectiveLifecycle == Lifecycle.STANDBY)
+                    FinalAnswerAction.PARK else FinalAnswerAction.EXIT,
                 taskPrompt = taskPrompt,
                 factory = factoryRef,
+                forceCompactBeforeRun = reuseSessionId != null && forceCompactBeforeRun,
             )
 
             mapper.writeValueAsString(mapOf(
@@ -274,6 +498,8 @@ private fun spawnFromTemplate(
                 "lifecycle" to resolved.effectiveLifecycle.name.lowercase(),
                 "runtimeState" to handle.state.value.wire(),
                 "depth" to resolved.childDepth,
+                "reusedSession" to (reuseSessionId != null),
+                "forceCompactBeforeRun" to (reuseSessionId != null && forceCompactBeforeRun),
                 "nextStep" to "Use await_agent childId=$childSessionId until=<state> to wait, " +
                     "or send_agent_message to push follow-up work.",
             ))
@@ -348,13 +574,11 @@ private fun spawnFreeform(
                 )
             },
             parentSessionId = parentSessionId,
-            // Free-form path: the parent's sessionId is the best
-            // signal we have. If the parent is itself a deep child
-            // this still over-attributes the per-root budget to the
-            // immediate parent, matching the existing free-form
-            // depth=1 assumption. The template path (above)
-            // propagates the real root correctly.
-            rootSessionId = parentSessionId,
+            // Free-form path: [parentSessionId] is the caller's
+            // session; [rootSessionId] must be the real root so
+            // per-root caps and cascade cancel work.  Derive from
+            // the owning module (always the root-level AgentModule).
+            rootSessionId = parent.agentSessionId ?: parentSessionId,
             depth = 1,
             lifecycle = Lifecycle.ONE_SHOT,
             taskPrompt = taskPrompt,
@@ -613,7 +837,19 @@ fun spawnChildFromTemplateProgrammatically(
             modelName = llmConfig.modelName,
             strategy = resolved.effectiveStrategy.id.name.lowercase(),
         )
-        childTranscript.writeUserMessage(taskPrompt)
+        // Defer the user-message transcript entry to when the LLM
+        // actually sees it.  Same rationale as the tool-path
+        // `spawnFromTemplate` above: STANDBY children park at
+        // spawn with coldStart=true and never call agent.run()
+        // on the primary taskPrompt, so writing it to the
+        // transcript now would create a "User" entry the LLM
+        // never observed.  ONE_SHOT templates (and STANDBY
+        // children that opt out of cold-start in a future
+        // extension) will call agent.run(taskPrompt)
+        // immediately, so the entry is correct for them.
+        if (resolved.effectiveLifecycle != Lifecycle.STANDBY) {
+            childTranscript.writeUserMessage(taskPrompt)
+        }
 
         val factoryRef: (suspend (JobHandle) -> AkibaAgent) = { handle ->
             try {
@@ -636,6 +872,16 @@ fun spawnChildFromTemplateProgrammatically(
             templateId = template.id,
             depth = depth,
             initialLifecycle = resolved.effectiveLifecycle,
+            // Match the AkibaAgent default for the template's
+            // declared lifecycle — see the long comment in the
+            // tool-path `spawnFromTemplate` above.  Programmatic
+            // host-side callers that want a STANDBY child to truly
+            // exit on Final Answer should override the agent's
+            // `onFinalAnswer` in the template's factory and pass
+            // the matching value to this spawn (the AkibaAgent
+            // default rule is: STANDBY → PARK, ONE_SHOT → EXIT).
+            onFinalAnswer = if (resolved.effectiveLifecycle == Lifecycle.STANDBY)
+                FinalAnswerAction.PARK else FinalAnswerAction.EXIT,
             taskPrompt = taskPrompt,
             factory = factoryRef,
         )

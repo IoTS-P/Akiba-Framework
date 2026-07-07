@@ -43,7 +43,22 @@ object WorkflowManager {
     private val runningProcesses = ConcurrentHashMap<String, Process>()
     private val workflowStatuses = ConcurrentHashMap<String, WorkflowStatusEntry>()
 
-    fun startWorkflowAsync(instanceName: String, configName: String?, threads: Int, serverPort: Int): String {
+    /**
+     * Daemon connection info captured at workflow start so that
+     * [stopWorkflow] and the post-exit reconciler can reach the
+     * DB without relying on the HTTP route that triggered the stop.
+     */
+    private data class DaemonInfo(val host: String, val port: Int, val instance: String)
+    private val workflowDaemons = ConcurrentHashMap<String, DaemonInfo>()
+
+    fun startWorkflowAsync(
+        instanceName: String,
+        configName: String?,
+        threads: Int,
+        serverPort: Int,
+        daemonHost: String,
+        daemonPort: Int,
+    ): String {
         val workflowId = UUID.randomUUID().toString()
         val workflowLogDir = Path.of(System.getProperty("user.home"), ".akiba", "logs", "workflows")
         val workflowLogFile = workflowLogDir.resolve("$workflowId.log")
@@ -51,6 +66,7 @@ object WorkflowManager {
 
         val status = WorkflowStatusEntry(id = workflowId, status = "running")
         workflowStatuses[workflowId] = status
+        workflowDaemons[workflowId] = DaemonInfo(daemonHost, daemonPort, instanceName)
         ProgressManager.onProgress(progressToken, "Workflow started for instance '$instanceName'")
 
         val job = CoroutineScope(Dispatchers.IO).launch {
@@ -177,6 +193,23 @@ object WorkflowManager {
                         successCount = successCount, failCount = failCount
                     )
                 }
+
+                // NOTE: do NOT call reconcileAgentSessions here.
+                // When the process exits normally, all agents should
+                // already be in a terminal state, so cleanup is
+                // unnecessary.  When the process crashes, the
+                // AgentSessionReconciler (startup-time) will clean
+                // up stale sessions on the next server start.
+                //
+                // Calling reconcileAgentSessions here would create a
+                // new daemon session via withDaemonSession →
+                // connectToInstance, which can force-disconnect the
+                // workflow process's existing daemon session before
+                // the daemon has detected the process's death.  This
+                // breaks in-flight mailbox operations (including
+                // child→parent wake-up messages) and also creates a
+                // race with stopWorkflow's own reconcileAgentSessions
+                // call when the user clicks Stop.
             } catch (e: Exception) {
                 logger.error("[workflow $workflowId] Error: {}", e.message, e)
                 ProgressManager.updateStatus(progressToken, "failed")
@@ -184,6 +217,7 @@ object WorkflowManager {
                 workflowStatuses[workflowId] = workflowStatuses[workflowId]!!.copy(status = "failed")
             } finally {
                 runningWorkflows.remove(workflowId)
+                workflowDaemons.remove(workflowId)
                 ProgressManager.finish(workflowId)
             }
         }
@@ -192,6 +226,11 @@ object WorkflowManager {
     }
 
     fun stopWorkflow(workflowId: String): Boolean {
+        // Capture daemon info BEFORE cancelling the coroutine —
+        // the coroutine's finally block removes workflowDaemons[workflowId],
+        // and we need the info for reconcileAgentSessions below.
+        val daemonInfo = workflowDaemons[workflowId]
+
         // Cancel the coroutine Job first. This stops *this* route's
         // `process.inputStream` reader loop (the one that fills
         // ProgressManager with stdout lines). The subprocess running the
@@ -243,11 +282,103 @@ object WorkflowManager {
         workflowStatuses[workflowId]?.let {
             workflowStatuses[workflowId] = it.copy(status = "cancelled")
         }
+
+        // The subprocess has been killed. Reconcile any agent sessions
+        // that are still non-terminal — the process did not get a chance
+        // to close them cleanly.
+        if (daemonInfo != null) {
+            reconcileAgentSessions(daemonInfo, workflowId, "workflow_stopped")
+        }
+
+        workflowDaemons.remove(workflowId)
         return true
     }
 
     fun getWorkflowStatus(workflowId: String): WorkflowStatusEntry? = workflowStatuses[workflowId]
     fun getAllWorkflowStatuses(): List<WorkflowStatusEntry> = workflowStatuses.values.toList()
+
+    /**
+     * Close every non-terminal agent session whose owning workflow
+     * process has just exited or been stopped.
+     *
+     * The `agent_sessions` table has no `workflow_id` column, so we
+     * cannot precisely associate a session with a specific workflow.
+     * Instead, we close **all** non-terminal, non-chat sessions —
+     * this is safe because:
+     *
+     *  1. In practice only one workflow runs at a time per instance.
+     *  2. Even if multiple workflows were running, a session whose
+     *     process is still alive will simply be re-opened by that
+     *     process on its next state transition (the daemon's
+     *     `set_runtime_state` route accepts `running` → `closed` →
+     *     `running` transitions for sessions in the same process).
+     *
+     * The [reasonTag] is embedded in the `closing_reason` column so
+     * an operator can tell whether the session was closed by a normal
+     * workflow exit (`"workflow_exited"`) or by a user-initiated stop
+     * (`"workflow_stopped"`).
+     *
+     * Failures are logged at WARN and never thrown — the workflow
+     * itself has already exited/stopped; the session cleanup is
+     * best-effort.
+     */
+    private fun reconcileAgentSessions(info: DaemonInfo, workflowId: String, reasonTag: String) {
+        try {
+            withDaemonSession(info.host, info.port, info.instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                val sessions = agentDbClient.listSessions(
+                    status = null,
+                    binaryId = null,
+                    moduleName = null,
+                    limit = 500,
+                    offset = 0,
+                    parentSessionId = "ALL",
+                )
+                val nonTerminalStates = setOf(
+                    org.iotsplab.akiba.llm.agent.RuntimeState.RUNNING.wire(),
+                    org.iotsplab.akiba.llm.agent.RuntimeState.STANDBY.wire(),
+                    org.iotsplab.akiba.llm.agent.RuntimeState.MSGHANDLE.wire(),
+                    org.iotsplab.akiba.llm.agent.RuntimeState.CANCELLING.wire(),
+                )
+                var closed = 0
+                for (s in sessions) {
+                    val rt = s.runtimeState?.lowercase() ?: s.status.lowercase()
+                    if (rt !in nonTerminalStates) continue
+                    // Skip chat sessions — they are user-interaction
+                    // sessions, not workflow sessions.
+                    if (s.moduleName == null || s.moduleName == "chat") continue
+                    val reason = "$reasonTag:$workflowId:at=${System.currentTimeMillis()}"
+                    try {
+                        agentDbClient.setRuntimeState(
+                            s.sessionId,
+                            org.iotsplab.akiba.llm.agent.RuntimeState.CLOSED.wire(),
+                            reason,
+                        )
+                        runCatching {
+                            agentDbClient.updateSession(s.sessionId, status = "closed")
+                        }
+                        closed++
+                    } catch (e: Exception) {
+                        logger.warn(
+                            "reconcileAgentSessions[$workflowId]: failed to close " +
+                                "session ${s.sessionId}: ${e.message}"
+                        )
+                    }
+                }
+                if (closed > 0) {
+                    logger.info(
+                        "reconcileAgentSessions[$workflowId]: closed $closed stale " +
+                            "agent session(s) ($reasonTag)"
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            logger.warn(
+                "reconcileAgentSessions[$workflowId]: daemon connection failed, " +
+                    "cannot clean up agent sessions: ${e.message}"
+            )
+        }
+    }
 }
 
 // Reuse the script finder from FileRoutes
@@ -291,7 +422,10 @@ fun Route.workflowRoutes(daemonHost: String, daemonPort: Int) {
             .getOrDefault(StartWorkflowRequest(instanceName = "akiba-instance"))
         try {
             val serverPort = call.request.local.serverPort
-            val workflowId = WorkflowManager.startWorkflowAsync(req.instanceName, req.configPath, req.threads, serverPort)
+            val workflowId = WorkflowManager.startWorkflowAsync(
+                req.instanceName, req.configPath, req.threads, serverPort,
+                daemonHost, daemonPort,
+            )
             call.respond(mapOf("workflowId" to workflowId, "message" to "Workflow started"))
         } catch (e: Exception) {
             call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "Failed to start workflow: ${e.message}"))
@@ -300,30 +434,7 @@ fun Route.workflowRoutes(daemonHost: String, daemonPort: Int) {
 
     post("/workflow/stop/{workflowId}") {
         val workflowId = call.parameters["workflowId"] ?: ""
-        val instance = call.requireInstanceHeader() ?: return@post
         WorkflowManager.stopWorkflow(workflowId)
-        // Also cancel all active automated (non-chat) agent sessions for this instance
-        try {
-            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-                val sessions = agentDbClient.listSessions(limit = 100)
-                for (s in sessions) {
-                    if (s.status != "closed" && s.status != "error" &&
-                        s.moduleName != null && s.moduleName != "chat") {
-                        agentDbClient.updateSession(s.sessionId, status = "closed")
-                        runCatching {
-                            agentDbClient.setRuntimeState(
-                                s.sessionId,
-                                org.iotsplab.akiba.llm.agent.RuntimeState.CLOSED.wire(),
-                                "workflow_stop",
-                            )
-                        }
-                    }
-                }
-            }
-        } catch (_: Exception) {
-            // Non-critical; workflow is already stopped
-        }
         call.respond(mapOf("workflowId" to workflowId, "message" to "Workflow stopped"))
     }
 

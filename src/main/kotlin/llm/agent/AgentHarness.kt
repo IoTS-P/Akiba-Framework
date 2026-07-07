@@ -65,11 +65,24 @@ data class AgentHarnessDirective(
     val systemPromptAppend: String? = null,
     val rejectFinalAnswer: Boolean = false,
     val blockCurrentAction: Boolean = false,
-    val skipCurrentAction: Boolean = false
+    val skipCurrentAction: Boolean = false,
+    /**
+     * When `true`, the strategy interrupts the current iteration
+     * immediately after processing this directive, forces a context
+     * compaction (if [StrategyContext.compactFn] is available), and
+     * injects [loopBreakReason] as a user message before resuming
+     * the loop.  Used to break out of unrecoverable LLM loops where
+     * the agent keeps issuing the same tool call despite repeated
+     * warnings.
+     */
+    val forceCompaction: Boolean = false,
+    /** Human-readable explanation injected alongside [forceCompaction]. */
+    val loopBreakReason: String? = null,
 ) {
     val isEmpty: Boolean
         get() = userMessages.isEmpty() && systemPromptAppend.isNullOrBlank() &&
-            !rejectFinalAnswer && !blockCurrentAction && !skipCurrentAction
+            !rejectFinalAnswer && !blockCurrentAction && !skipCurrentAction &&
+            !forceCompaction
 
     companion object {
         val None = AgentHarnessDirective()
@@ -97,16 +110,43 @@ data class AgentHarnessDirective(
                 userMessages = syntheticResult?.let { listOf(it) } ?: emptyList(),
                 skipCurrentAction = true
             )
+
+        /**
+         * Force the strategy to compact context and break the current
+         * iteration's flow, injecting [reason] as a user message.
+         */
+        fun forceCompaction(reason: String): AgentHarnessDirective =
+            AgentHarnessDirective(
+                userMessages = listOf(reason),
+                forceCompaction = true,
+                loopBreakReason = reason,
+            )
     }
 }
 
 fun StrategyContext.applyHarnessDirective(directive: AgentHarnessDirective, label: String = "harness") {
     if (directive.isEmpty) return
     directive.userMessages.forEach { message ->
-        memory.addUserMessage(message)
+        if (isTransientWakeContextMessage(message)) {
+            // Wake boards / resume hints are real-time scheduling
+            // views.  They must be visible to the *current* LLM
+            // call, but must NOT be persisted into chat history or
+            // compaction summaries.  Persisting them caused old
+            // wake boards to linger and confuse later turns.
+            addTransientUserMessage(message)
+        } else {
+            memory.addUserMessage(message)
+        }
         transcript?.writeFormatReminder("[$label] $message")
     }
 }
+
+/** True for real-time scheduling panels that should not enter history. */
+private fun isTransientWakeContextMessage(message: String): Boolean =
+    message.startsWith("[Agent Wake Board]") ||
+        message.startsWith("[resume context]") ||
+        message.contains("\n[resume context]") ||
+        message.contains("\n[BACKPRESSURE]")
 
 fun joinPromptParts(vararg parts: String?): String =
     parts.filter { !it.isNullOrBlank() }.joinToString("\n\n")

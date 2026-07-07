@@ -30,6 +30,25 @@ class AsyncAgentServices internal constructor(
         watchdog.stop()
     }
 
+    /**
+     * Startup-time session-state reconciliation for this binary.
+     *
+     * Wraps the package-level [AgentSessionReconciler] with the
+     * `module_startup` reason tag.  Idempotent across the JVM
+     * (the reconciler has an in-process guard) so calling it
+     * from both [AgentModule.startProcess] and
+     * [org.iotsplab.akiba.server.AkibaServer.start] is safe —
+     * only the first call per JVM does the actual work.
+     *
+     * Errors are caught inside the reconciler (logged at
+     * WARN); this method itself never throws.
+     */
+    fun reconcileOnStartup(): AgentSessionReconciler.ReconcileReport =
+        AgentSessionReconciler(
+            agentDbClient = agentDbClient,
+            reasonTag = "module_startup",
+        ).reconcile()
+
     companion object {
         private val logger = LogManager.getLogger(AsyncAgentServices::class.java)
         private val perBinary = ConcurrentHashMap<Int, AsyncAgentServices>()

@@ -23,6 +23,29 @@ data class ToolParameter(
 )
 
 /**
+ * Deduplication strategy for a tool's results.
+ *
+ * Controls how the [DefaultToolResultDuplicateDetector] decides whether
+ * a tool call is repeating evidence already seen earlier in the session.
+ *
+ * - [RESULT_HASH]: Compare the SHA-256 of the tool's OUTPUT.  This is
+ *   the default and works well for tools whose output is large and
+ *   distinctive (e.g. disassembly listings).  Short outputs (< 80 bytes)
+ *   are exempted for successful calls to reduce false positives.
+ *
+ * - [ARGS_ONLY]: Compare the canonical form of the tool's ARGUMENTS
+ *   (tool name + sorted JSON args), regardless of output.  Use this for
+ *   tools where calling with the same arguments is always wasteful
+ *   (e.g. `vuln_memory action=record_function function=main status=completed`
+ *   — the second call with the same args adds no new information).
+ *   Short results are NOT exempted under this strategy.
+ */
+enum class ToolDedupStrategy {
+    RESULT_HASH,
+    ARGS_ONLY,
+}
+
+/**
  * A tool that an agent can invoke during a ReAct loop.
  *
  * Tools are the primary mechanism by which an LLM agent interacts with
@@ -53,6 +76,28 @@ class Tool(
     val name: String,
     val description: String,
     val parameters: List<ToolParameter> = emptyList(),
+    /**
+     * Strategy used by [DefaultToolResultDuplicateDetector] to detect
+     * repeated tool calls.  Defaults to [ToolDedupStrategy.RESULT_HASH]
+     * (compare output SHA-256).  Set to [ToolDedupStrategy.ARGS_ONLY]
+     * for tools where calling with the same arguments is always
+     * wasteful regardless of output (e.g. state-recording tools like
+     * `vuln_memory`).
+     */
+    val dedupStrategy: ToolDedupStrategy = ToolDedupStrategy.RESULT_HASH,
+    /**
+     * Optional dynamic resolver that overrides [dedupStrategy] on a
+     * per-call basis.  When non-null, the strategy is invoked with the
+     * tool's arguments at call time and the returned value takes
+     * precedence over the static [dedupStrategy].
+     *
+     * Use this for **dispatch-style tools** (e.g. `script_library`)
+     * where different sub-commands need different dedup behavior:
+     * read-only scripts work well with [ToolDedupStrategy.RESULT_HASH]
+     * while state-changing scripts should use
+     * [ToolDedupStrategy.ARGS_ONLY] to catch redundant writes.
+     */
+    val dedupStrategyResolver: ((Map<String, Any?>) -> ToolDedupStrategy)? = null,
     val execute: (Map<String, Any?>) -> String
 ) {
     private val mapper = jacksonObjectMapper()

@@ -105,7 +105,8 @@ enum class RuntimeState {
                 next == RuntimeState.CANCELLING
             from == RuntimeState.STANDBY -> next == RuntimeState.MSGHANDLE ||
                 next == RuntimeState.CANCELLING
-            from == RuntimeState.MSGHANDLE -> next == RuntimeState.STANDBY ||
+            from == RuntimeState.MSGHANDLE -> next == RuntimeState.RUNNING ||
+                next == RuntimeState.STANDBY ||
                 next == RuntimeState.CANCELLING
             from == RuntimeState.CANCELLING -> next == RuntimeState.CLOSED
             else -> false

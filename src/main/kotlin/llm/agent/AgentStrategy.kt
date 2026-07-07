@@ -4,12 +4,15 @@ import org.apache.logging.log4j.LogManager
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.client.AkibaLLMClient
 import org.iotsplab.akiba.llm.client.ChatCompletion
+import org.iotsplab.akiba.llm.client.LLMTimeoutException
+import org.iotsplab.akiba.llm.memory.AgentChatMessage
 import org.iotsplab.akiba.llm.memory.ChatMemory
 import org.iotsplab.akiba.llm.memory.MemoryManager
 import org.iotsplab.akiba.llm.memory.MemoryType
 import org.iotsplab.akiba.llm.memory.MemoryScope
 import org.iotsplab.akiba.llm.tool.ToolCallParser
 import org.iotsplab.akiba.llm.tool.ToolRegistry
+import org.iotsplab.akiba.llm.agent.ToolResultDuplicateSeverity
 import java.util.UUID
 import kotlin.system.measureTimeMillis
 
@@ -137,6 +140,21 @@ class StrategyContext(
      */
     val lifecycle: Lifecycle = Lifecycle.ONE_SHOT,
     /**
+     * Behaviour when the LLM emits "Final Answer:".  See
+     * [FinalAnswerAction] for the semantics.  This is the
+     * strategy-facing half of [AkibaAgent.onFinalAnswer];
+     * the runtime_state half is consumed by
+     * [AgentRuntime.runChildJob] (which uses the matching
+     * value passed to [AgentRuntime.spawn]).
+     *
+     * Strategies use this to decide what `status` to write
+     * when the harness accepts a Final Answer:
+     *  - [FinalAnswerAction.EXIT]  → "closed" (true exit).
+     *  - [FinalAnswerAction.PARK]  → "standby" if
+     *    [lifecycle] is STANDBY, else "closed".
+     */
+    val finalAnswerAction: FinalAnswerAction = FinalAnswerAction.EXIT,
+    /**
      * Callback to compress [memory] in-place, persisting the
      * summary back to the underlying store (DB when
      * `agentDbClient` is set).  Provided by [AkibaAgent] via
@@ -154,6 +172,32 @@ class StrategyContext(
     /** Accumulated counters during the loop. Mutable, shared across the strategy. */
     @Suppress("LeakingThis")
     val stats: LoopStats = LoopStats()
+
+    /**
+     * Transient user messages for the **current LLM call only**.
+     *
+     * Wake boards and resume-context panels are highly real-time
+     * scheduling views. They must be visible to the immediate LLM
+     * call, but they must NOT be persisted into chat history or
+     * compacted summaries. Otherwise old wake boards linger in
+     * history and confuse later turns.
+     *
+     * [applyHarnessDirective] writes wake-board messages here
+     * instead of [memory]. [callLLM] appends them to the message
+     * list sent to the model and then clears them in `finally`.
+     */
+    private val transientUserMessages: MutableList<String> = mutableListOf()
+
+    fun addTransientUserMessage(content: String) {
+        transientUserMessages.add(content)
+    }
+
+    private fun consumeTransientMessages(): List<AgentChatMessage> =
+        transientUserMessages.map { AgentChatMessage(role = "user", content = it) }
+
+    private fun clearTransientMessages() {
+        transientUserMessages.clear()
+    }
 
     /** Build the effective system prompt with optional memory enrichment. */
     fun buildEffectiveSystemPrompt(extraInject: String? = null): String {
@@ -187,73 +231,141 @@ class StrategyContext(
      * @return the completion, or null on unrecoverable error (error is logged).
      */
     fun callLLM(systemPrompt: String): ChatCompletion? {
-        fun invokeChat(): ChatCompletion = client.chat(
-            systemPrompt = systemPrompt,
-            messages = contextMessagesProvider?.invoke() ?: memory.messages(),
-            tools = if (toolRegistry.isEmpty()) null else toolRegistry.toJsonSchemas()
-        )
+        fun invokeChat(): ChatCompletion {
+            val baseMessages = contextMessagesProvider?.invoke() ?: memory.messages()
+            val messagesForCall = baseMessages + consumeTransientMessages()
+            return client.chat(
+                systemPrompt = systemPrompt,
+                messages = messagesForCall,
+                tools = if (toolRegistry.isEmpty()) null else toolRegistry.toJsonSchemas()
+            )
+        }
 
-        cancellationReasonProvider?.invoke()?.let { reason ->
-            stats.lastError = "Agent cancelled before LLM call: $reason"
-            logger.warn(stats.lastError)
-            return null
-        }
-        beforeChatHook?.invoke()
-        cancellationReasonProvider?.invoke()?.let { reason ->
-            stats.lastError = "Agent cancelled before LLM call: $reason"
-            logger.warn(stats.lastError)
-            return null
-        }
         return try {
-            invokeChat()
-        } catch (initialError: Exception) {
-            stats.lastError = initialError.message
-            logger.warn("LLM chat failed: ${initialError.message}")
-
-            val hook = onLLMErrorHook ?: return null
-
-            var errorAttempt = 0
-            while (errorAttempt < maxLLMErrorRetries) {
-                errorAttempt++
-                val currentTokens = memory.messages().sumOf { client.estimateTokenCount(it.content) }
-                val info = LLMErrorInfo(
-                    exception = initialError,
-                    attempt = errorAttempt,
-                    totalCalls = stats.iterations + 1,
-                    currentTokens = currentTokens,
-                    stats = stats
-                )
-
-                logger.warn(
-                    "Invoking onLLMErrorHook (attempt $errorAttempt/$maxLLMErrorRetries, " +
-                        "currentTokens=$currentTokens): ${initialError.message}"
-                )
-
-                val shouldRetry = try {
-                    hook(info)
-                } catch (hookError: Exception) {
-                    stats.lastError = "${initialError.message}; recovery hook failed: ${hookError.message}"
-                    logger.warn("onLLMErrorHook threw: ${hookError.message}", hookError)
-                    return null
-                }
-
-                if (!shouldRetry) {
-                    logger.info("onLLMErrorHook declined retry on attempt $errorAttempt; propagating error.")
-                    return null
-                }
-
-                logger.info("onLLMErrorHook requested retry (attempt $errorAttempt/$maxLLMErrorRetries); retrying LLM chat.")
-                try {
-                    return invokeChat()
-                } catch (retryError: Exception) {
-                    stats.lastError = "${initialError.message}; retry #$errorAttempt failed: ${retryError.message}"
-                    logger.warn("LLM chat retry #$errorAttempt failed: ${retryError.message}", retryError)
-                    // Fall through to call the hook again with the same original error.
-                }
+            cancellationReasonProvider?.invoke()?.let { reason ->
+                stats.lastError = "Agent cancelled before LLM call: $reason"
+                logger.warn(stats.lastError)
+                return null
             }
+            beforeChatHook?.invoke()
+            cancellationReasonProvider?.invoke()?.let { reason ->
+                stats.lastError = "Agent cancelled before LLM call: $reason"
+                logger.warn(stats.lastError)
+                return null
+            }
+            try {
+                invokeChat()
+            } catch (initialError: Exception) {
+                stats.lastError = initialError.message
+                logger.warn("LLM chat failed: ${initialError.message}")
 
-            logger.warn("onLLMErrorHook retry budget exhausted after $maxLLMErrorRetries retries; giving up.")
-            null
+                // ---- Timeout-specific retry path ---------------------
+                // LLM timeouts are usually transient (network blip,
+                // provider overload) and do NOT benefit from context
+                // compaction.  We retry them with a linear backoff
+                // using the LLMConfig.maxRetries budget (default 3)
+                // BEFORE consulting the compaction hook, so a flaky
+                // network does not waste the single compaction-and-
+                // retry the hook provides.
+                //
+                // The backoff is intentionally linear (1s, 2s, 3s ...)
+                // rather than exponential: provider timeouts are
+                // typically short-lived and the agent's own
+                // timeoutSeconds is already the main latency cost.
+                if (initialError is LLMTimeoutException) {
+                    val maxTimeoutRetries = client.config.maxRetries.coerceAtLeast(1)
+                    var timeoutAttempt = 0
+                    while (timeoutAttempt < maxTimeoutRetries) {
+                        timeoutAttempt++
+                        val backoffMs = 1000L * timeoutAttempt
+                        logger.warn(
+                            "LLM timeout, backing off ${backoffMs}ms " +
+                                "(retry $timeoutAttempt/$maxTimeoutRetries): ${initialError.message}"
+                        )
+                        try {
+                            Thread.sleep(backoffMs)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            return null
+                        }
+                        try {
+                            val result = invokeChat()
+                            logger.info("LLM timeout retry $timeoutAttempt/$maxTimeoutRetries succeeded")
+                            return result
+                        } catch (retryError: LLMTimeoutException) {
+                            stats.lastError =
+                                "timeout; retry #$timeoutAttempt/$maxTimeoutRetries also timed out: ${retryError.message}"
+                            logger.warn("LLM timeout retry #$timeoutAttempt/$maxTimeoutRetries also timed out")
+                            // Continue the loop to try again.
+                        } catch (retryError: Exception) {
+                            // A different error on retry — fall
+                            // through to the compaction-hook path
+                            // below so the agent can try to recover
+                            // via context compaction.
+                            stats.lastError =
+                                "timeout; retry #$timeoutAttempt/$maxTimeoutRetries failed with different error: ${retryError.message}"
+                            logger.warn(
+                                "LLM timeout retry #$timeoutAttempt/$maxTimeoutRetries failed with different error: ${retryError.message}",
+                                retryError
+                            )
+                            break
+                        }
+                    }
+                    logger.warn("LLM timeout retries exhausted after $maxTimeoutRetries attempts; trying compaction hook as last resort")
+                    // Fall through to the compaction hook below —
+                    // if compaction succeeds it might help (e.g. the
+                    // provider was slow because of an oversized
+                    // context, not a network issue).
+                }
+
+                // ---- Compaction-hook retry path (original) ----------
+                val hook = onLLMErrorHook ?: return null
+
+                var errorAttempt = 0
+                while (errorAttempt < maxLLMErrorRetries) {
+                    errorAttempt++
+                    val currentTokens = memory.messages().sumOf { client.estimateTokenCount(it.content) }
+                    val info = LLMErrorInfo(
+                        exception = initialError,
+                        attempt = errorAttempt,
+                        totalCalls = stats.iterations + 1,
+                        currentTokens = currentTokens,
+                        stats = stats
+                    )
+
+                    logger.warn(
+                        "Invoking onLLMErrorHook (attempt $errorAttempt/$maxLLMErrorRetries, " +
+                            "currentTokens=$currentTokens): ${initialError.message}"
+                    )
+
+                    val shouldRetry = try {
+                        hook(info)
+                    } catch (hookError: Exception) {
+                        stats.lastError = "${initialError.message}; recovery hook failed: ${hookError.message}"
+                        logger.warn("onLLMErrorHook threw: ${hookError.message}", hookError)
+                        return null
+                    }
+
+                    if (!shouldRetry) {
+                        logger.info("onLLMErrorHook declined retry on attempt $errorAttempt; propagating error.")
+                        return null
+                    }
+
+                    logger.info("onLLMErrorHook requested retry (attempt $errorAttempt/$maxLLMErrorRetries); retrying LLM chat.")
+                    try {
+                        return invokeChat()
+                    } catch (retryError: Exception) {
+                        stats.lastError = "${initialError.message}; retry #$errorAttempt failed: ${retryError.message}"
+                        logger.warn("LLM chat retry #$errorAttempt failed: ${retryError.message}", retryError)
+                        // Fall through to call the hook again with the same original error.
+                    }
+                }
+
+                logger.warn("onLLMErrorHook retry budget exhausted after $maxLLMErrorRetries retries; giving up.")
+                null
+            }
+        } finally {
+            clearTransientMessages()
         }
     }
 
@@ -269,7 +381,12 @@ class StrategyContext(
     /** Result of executing a single tool call. */
     data class ToolResult(
         val output: String,
-        val durationMs: Long
+        val durationMs: Long,
+        val rawOutput: String = output,
+        /** Duplicate detection result for this tool call, if a
+         *  detector is configured. Null when no detector or when
+         *  the result was exempted (short output, etc.). */
+        val duplicateDetection: ToolResultDuplicateDetection? = null,
     )
 
     fun executeToolWithDuration(toolCall: ParsedToolCall): ToolResult {
@@ -306,7 +423,10 @@ class StrategyContext(
                 toolCall = toolCall,
                 resultUuid = resultUuid,
                 stored = stored,
-                isError = isError
+                isError = isError,
+                dedupStrategy = tool?.let { t ->
+                    t.dedupStrategyResolver?.invoke(toolCall.arguments) ?: t.dedupStrategy
+                } ?: org.iotsplab.akiba.llm.tool.ToolDedupStrategy.RESULT_HASH,
             )
         )
         var result = ToolResultContext.formatCurrentResult(rawResult, resultUuid, stored)
@@ -350,20 +470,95 @@ class StrategyContext(
             )
         }
 
-        return ToolResult(result, durationMs)
+        return ToolResult(result, durationMs, rawResult, duplicateDetection)
     }
 
     // Backward-compatible wrapper
     fun executeTool(toolCall: ParsedToolCall): String = executeToolWithDuration(toolCall).output
 
-    /** Update session status in the database. */
+    /**
+     * Update session status in the database.
+     *
+     * Mirrors the new value to BOTH the legacy `status` column and
+     * the canonical `runtime_state` column.  Without the second
+     * write, an agent that reaches the "Enter standby mode."
+     * marker only flips `status`, leaving `runtime_state` on
+     * `running`; the frontend's
+     * `GET /agent/sessions/{id}` route reports
+     * `runtime_state` as the source of truth, so the status pill
+     * in the chat header would stay on "Running" for the rest of
+     * the session's lifetime even though the agent has parked.
+     *
+     * `runtime_state` is the schema's authoritative column —
+     * `status` is kept for legacy clients that still read it.
+     * The two columns must agree at every observer-visible
+     * point; this helper is the single chokepoint that the
+     * strategies use, so doing both writes here is sufficient.
+     */
     fun updateSessionStatus(status: String) {
+        updateSessionStatus(status, reason = null)
+    }
+
+    /**
+     * Same as [updateSessionStatus] but lets the caller override the
+     * `closing_reason` stored alongside the runtime_state. Use this
+     * on error / failure paths so the DB row carries the real error
+     * detail (which the frontend surfaces in its error banner) rather
+     * than the generic `"llm_status:<status>"` placeholder.
+     *
+     * Pass `null` (or use the no-arg overload) for non-error
+     * transitions where the placeholder is fine.
+     */
+    fun updateSessionStatus(status: String, reason: String?) {
         if (sessionId != null && agentDbClient != null) {
             try {
                 agentDbClient.updateSession(sessionId, status = status)
             } catch (_: Exception) {}
+            // Mirror onto runtime_state.  Map the strategy's
+            // status vocabulary onto the runtime_state enum
+            // (closed vs cancelled, error vs failed) so the
+            // canonical column is never left holding an
+            // out-of-vocabulary value.
+            val rs = mapStatusToRuntimeState(status)
+            if (rs != null) {
+                val closingReason = reason ?: "llm_status:$status"
+                try {
+                    agentDbClient.setRuntimeState(
+                        sessionId = sessionId,
+                        runtimeState = rs,
+                        closingReason = closingReason,
+                    )
+                } catch (_: Exception) {}
+            }
         }
     }
+
+    /**
+     * Map the strategy's status vocabulary (which still carries
+     * legacy terms like "completed" and "failed") onto the
+     * canonical runtime_state enum.  Returns null when the
+     * value is not a runtime state and should be left to the
+     * legacy `status` column only.
+     */
+    private fun mapStatusToRuntimeState(status: String): String? = when (status.lowercase()) {
+        "running" -> "running"
+        "standby" -> "standby"
+        "msghandle" -> "msghandle"
+        "cancelling" -> "cancelling"
+        "closed", "completed" -> "closed"
+        "cancelled" -> "closed"
+        "error", "failed" -> "error"
+        else -> null
+    }
+}
+
+private fun isAwaitConditionRegistrationSuccess(rawOutput: String): Boolean {
+    val out = rawOutput.trim()
+    if (out.startsWith("Error:") ||
+        out.startsWith("Tool argument error") ||
+        out.startsWith("Tool 'await_condition' execution error")
+    ) return false
+    return Regex("\\\"status\\\"\\s*:\\s*\\\"registered\\\"").containsMatchIn(out)
 }
 
 /** Mutable counters shared across a strategy execution. */
@@ -373,6 +568,38 @@ class LoopStats {
     var totalInputTokens: Int = 0
     var totalOutputTokens: Int = 0
     var lastError: String? = null
+    /**
+     * Set to true when the LLM calls `await_condition` during this
+     * run.  When the LLM subsequently produces a Final Answer, the
+     * strategy checks this flag: if true, the run ends with
+     * [StopReason.STANDBY] (the agent parks and waits for the
+     * registered wake condition); if false, the run ends with
+     * [StopReason.COMPLETED] (the agent is truly done).
+     *
+     * This replaces the old "Enter standby mode." text marker:
+     * the LLM now expresses "I want to park" by calling
+     * `await_condition` rather than emitting a magic string.
+     */
+    var awaitConditionRegistered: Boolean = false
+
+    /**
+     * Consecutive tool calls that returned a WARNING-level
+     * duplicate detection. Reset to 0 whenever a non-duplicate
+     * (or only NOTICE-level) tool call is observed.
+     *
+     * When this counter reaches
+     * [DUPLICATE_LOOP_FORCE_COMPACT_THRESHOLD], the strategy
+     * forces a context compaction and injects a hard break
+     * instruction to disrupt the loop.
+     */
+    var consecutiveDuplicateWarnings: Int = 0
+    /**
+     * Total times a forced compaction was triggered by the
+     * duplicate-loop guard. Capped at
+     * [MAX_FORCED_COMPACTIONS] to prevent infinite
+     * compaction loops.
+     */
+    var forcedCompactions: Int = 0
 }
 
 // ============================================================
@@ -437,6 +664,20 @@ class ReActStrategy : AgentStrategy {
 
         /** The system prompt supplement that instructs the LLM to follow ReAct. */
         val REACT_INSTRUCTION: String get() = AgentPrompts.REACT_INSTRUCTION
+
+        /**
+         * When the duplicate detector flags [DUPLICATE_LOOP_FORCE_COMPACT_THRESHOLD]
+         * consecutive WARNING-level duplicate tool calls, the strategy
+         * forces a context compaction to break the loop.
+         */
+        const val DUPLICATE_LOOP_FORCE_COMPACT_THRESHOLD: Int = 5
+
+        /**
+         * Hard cap on the number of forced compactions within a single
+         * strategy run. Prevents an infinite compaction loop when the
+         * LLM keeps repeating even after compaction.
+         */
+        const val MAX_FORCED_COMPACTIONS: Int = 2
     }
 
     /**
@@ -502,7 +743,7 @@ class ReActStrategy : AgentStrategy {
             )
 
             val completion = ctx.callLLM(systemPrompt) ?: run {
-                ctx.updateSessionStatus("error")
+                ctx.updateSessionStatus("error", reason = ctx.stats.lastError?.take(500))
                 return ctx.stats.toResult(
                     output = buildErrorOutput(
                         errorLabel = "Agent error",
@@ -562,31 +803,6 @@ class ReActStrategy : AgentStrategy {
             // Final-Answer text in a single completion, so the parser's
             // native path is the source of truth in that case.
             val finalAnswerText = extractFinalAnswer(assistantText)
-
-            // Standby marker takes precedence over tool-call parsing
-            // and over `afterNoAction` (Final Answer already wins
-            // over standby marker per [SharedStandbyExtractor]'s
-            // contract).  When the LLM ends its reply with
-            // "Enter standby mode." and did not emit a Final
-            // Answer, we exit the run() loop immediately with
-            // [StopReason.STANDBY].  The runtime translates that
-            // to `runtime_state=standby` for `lifecycle=standby`
-            // children and to `closed` for one-shot children, so
-            // a standby agent parks and waits for mailbox; a
-            // one-shot agent terminates normally.
-            if (finalAnswerText == null && SharedStandbyExtractor.endsWithMarker(assistantText)) {
-                logger.info(
-                    "[ReAct] Standby marker detected at end of assistant text; " +
-                        "exiting run() with StopReason.STANDBY (lifecycle=${ctx.lifecycle})."
-                )
-                ctx.updateSessionStatus("standby")
-                val result = ctx.stats.toResult(
-                    output = SharedStandbyExtractor.MARKER,
-                    stopReason = StopReason.STANDBY,
-                )
-                ctx.transcript?.writeSessionEnd(result)
-                return compactAndReturn(ctx, result)
-            }
 
             val allToolCalls = when {
                 completion.toolCalls.isNotEmpty() ->
@@ -655,12 +871,92 @@ class ReActStrategy : AgentStrategy {
                     if (!beforeTool.skipCurrentAction) {
                         ctx.applyHarnessDirective(beforeTool, "harness.beforeToolExecution")
                     }
-                    ctx.applyHarnessDirective(
-                        ctx.harness.afterToolExecution(ctx, toolCall, toolResult),
-                        "harness.afterToolExecution"
-                    )
 
                     logger.debug("[ReAct] Observation: ${observation.take(200)}...")
+
+                    // ── Duplicate-loop guard ──────────────────────────
+                    // Track consecutive WARNING-level duplicate tool
+                    // results.  When the count reaches the threshold,
+                    // force a context compaction to break the loop.
+                    val dupDetection = toolResult.duplicateDetection
+                    if (dupDetection != null &&
+                        dupDetection.severity == ToolResultDuplicateSeverity.WARNING
+                    ) {
+                        ctx.stats.consecutiveDuplicateWarnings++
+                    } else {
+                        ctx.stats.consecutiveDuplicateWarnings = 0
+                    }
+
+                    // ── Harness-requested or auto forced compaction ──
+                    val afterToolDirective = ctx.harness.afterToolExecution(ctx, toolCall, toolResult)
+                    val needForceCompact = afterToolDirective.forceCompaction ||
+                        (ctx.stats.consecutiveDuplicateWarnings >= DUPLICATE_LOOP_FORCE_COMPACT_THRESHOLD &&
+                            ctx.stats.forcedCompactions < MAX_FORCED_COMPACTIONS)
+
+                    if (needForceCompact) {
+                        val reason = afterToolDirective.loopBreakReason
+                            ?: "Detected ${ctx.stats.consecutiveDuplicateWarnings} consecutive " +
+                                "WARNING-level duplicate tool calls. The agent appears to be " +
+                                "stuck in an unrecoverable loop. Forcing context compaction " +
+                                "to disrupt the pattern."
+                        logger.warn("[ReAct] Force compaction triggered: $reason")
+                        ctx.applyHarnessDirective(afterToolDirective, "harness.afterToolExecution")
+                        ctx.memory.addUserMessage(
+                            "[SYSTEM] $reason\n\n" +
+                                "You have been repeatedly calling the same tool with the same " +
+                                "arguments without progress. The context has been compacted. " +
+                                "Review what you have accomplished so far (see the summary) and " +
+                                "either:\n" +
+                                "  1. Produce **Final Answer:** if the task is already answerable, or\n" +
+                                "  2. Switch to a meaningfully different tool or argument, or\n" +
+                                "  3. If you are stuck, call `await_condition` to park and wait " +
+                                "for external input.\n\n" +
+                                "Do NOT repeat the same tool call that triggered this compaction."
+                        )
+                        ctx.transcript?.writeFormatReminder("[forced-compaction] $reason")
+                        ctx.compactFn?.let { compactFn ->
+                            val ok = compactFn()
+                            ctx.stats.forcedCompactions++
+                            ctx.stats.consecutiveDuplicateWarnings = 0
+                            logger.info("[ReAct] Forced compaction result: ok=$ok, " +
+                                "total forced compactions=${ctx.stats.forcedCompactions}")
+                        }
+                        // Break out of the inner tool-batch loop; the
+                        // outer while loop will start a fresh iteration
+                        // with the compacted context.
+                        break
+                    }
+
+                    // Normal path: apply the afterToolExecution directive
+                    // (we already fetched it above; no need to call again).
+                    ctx.applyHarnessDirective(afterToolDirective, "harness.afterToolExecution")
+
+                    // Detect `await_condition` tool call: this is the
+                    // LLM's signal that it wants to park and wait for a
+                    // wake condition.  We immediately exit the loop with
+                    // [StopReason.STANDBY] — do NOT continue to the next
+                    // LLM call.  The LLM already expressed its intent to
+                    // park; making it produce another response just to
+                    // emit a Final Answer wastes a round-trip and risks
+                    // the LLM calling more tools instead of wrapping up.
+                    if (toolCall.name == "await_condition") {
+                        if (!isAwaitConditionRegistrationSuccess(toolResult.rawOutput)) {
+                            logger.warn(
+                                "[ReAct] await_condition did not register successfully; " +
+                                    "continuing so the LLM can correct the arguments. Result: ${toolResult.rawOutput.take(300)}"
+                            )
+                            continue
+                        }
+                        ctx.stats.awaitConditionRegistered = true
+                        logger.info("[ReAct] await_condition registered — exiting loop immediately with StopReason.STANDBY")
+                        ctx.updateSessionStatus("standby")
+                        val standbyResult = ctx.stats.toResult(
+                            output = assistantText,
+                            stopReason = StopReason.STANDBY,
+                        )
+                        ctx.transcript?.writeSessionEnd(standbyResult)
+                        return compactAndReturn(ctx, standbyResult)
+                    }
                 }
 
                 // If we capped the batch, hint to the LLM that some calls were dropped
@@ -677,10 +973,55 @@ class ReActStrategy : AgentStrategy {
 
                 if (finalAnswer != null) {
                     val finalAnswerDirective = ctx.harness.validateFinalAnswer(ctx, assistantText, finalAnswer)
+
                     ctx.applyHarnessDirective(finalAnswerDirective, "harness.validateFinalAnswer")
+
                     if (!finalAnswerDirective.rejectFinalAnswer) {
                         // LLM explicitly signaled it's done and harness accepted it.
-                        ctx.updateSessionStatus("closed")
+                        //
+                        // StopReason decision:
+                        //  - If the LLM called `await_condition` during
+                        //    this run (awaitConditionRegistered=true),
+                        //    it wants to PARK and wait for the wake
+                        //    condition.  Use [StopReason.STANDBY] so the
+                        //    runtime transitions to STANDBY (for
+                        //    lifecycle=STANDBY) or CLOSED (for ONE_SHOT).
+                        //  - Otherwise, the agent is truly done.  Use
+                        //    [StopReason.COMPLETED] with the status
+                        //    derived from [FinalAnswerAction].
+                        //
+                        // This replaces the old "Enter standby mode."
+                        // text marker: the LLM now expresses "I want
+                        // to park" by calling `await_condition` rather
+                        // than emitting a magic string.  The marker
+                        // path below is kept as a fallback for agents
+                        // that don't have the tool in their registry.
+                        if (ctx.stats.awaitConditionRegistered) {
+                            logger.info(
+                                "[ReAct] Final Answer after await_condition — " +
+                                    "exiting with StopReason.STANDBY"
+                            )
+                            ctx.updateSessionStatus("standby")
+                            val result = ctx.stats.toResult(
+                                output = finalAnswer,
+                                stopReason = StopReason.STANDBY,
+                            )
+                            ctx.transcript?.writeSessionEnd(result)
+                            return compactAndReturn(ctx, result)
+                        }
+
+                        // No await_condition: truly done.
+                        // The `status` we write depends on
+                        // [FinalAnswerAction]:
+                        //  - EXIT:  "cancelling" (two-step transition to
+                        //    "closed" via the parent's finally block).
+                        //  - PARK:  "standby" if lifecycle=STANDBY;
+                        //    "closed" if lifecycle=ONE_SHOT.
+                        val finalStatus = when (ctx.finalAnswerAction) {
+                            FinalAnswerAction.EXIT -> "cancelling"
+                            FinalAnswerAction.PARK -> if (ctx.lifecycle == Lifecycle.STANDBY) "standby" else "closed"
+                        }
+                        ctx.updateSessionStatus(finalStatus)
                         val result = ctx.stats.toResult(
                             output = finalAnswer,
                             stopReason = StopReason.COMPLETED
@@ -705,7 +1046,15 @@ class ReActStrategy : AgentStrategy {
 
         // Max iterations
         logger.warn("[ReAct] reached max iterations (${ctx.maxIterations})")
-        ctx.updateSessionStatus("error")
+        // A STANDBY agent that hits max iterations should park back to
+        // STANDBY rather than ERROR, so it can be woken again later.
+        // A ONE_SHOT agent is terminal either way, so "error" is still
+        // the right signal (the session will be closed, not resumed).
+        if (ctx.lifecycle == Lifecycle.STANDBY) {
+            ctx.updateSessionStatus("standby", reason = "max_iterations: ${ctx.maxIterations}")
+        } else {
+            ctx.updateSessionStatus("error", reason = "max_iterations: ${ctx.maxIterations}")
+        }
         val result = ctx.stats.toResult(
             output = extractLastAnswer(ctx.memory)
                 ?: "Agent reached maximum iterations without producing a final answer.",
@@ -865,7 +1214,7 @@ class PlanExecuteStrategy(
 
             if (plan.isEmpty()) {
                 logger.warn("[PlanExec] Failed to create a plan, falling back to direct answer")
-                ctx.updateSessionStatus("error")
+                ctx.updateSessionStatus("error", reason = "empty_plan")
                 val result = ctx.stats.toResult(
                     output = "Agent could not formulate a plan for this task.",
                     stopReason = StopReason.ERROR
@@ -896,10 +1245,42 @@ class PlanExecuteStrategy(
                 is ExecResult.Completed -> {
                     // ── Phase 3: Reflection ────────────────────────────
                     val finalAnswer = reflect(ctx)
-                    ctx.updateSessionStatus("closed")
+                    // Same await_condition check as the ReAct path:
+                    // if the LLM registered a wake condition during
+                    // execution, park to STANDBY instead of COMPLETED.
+                    if (ctx.stats.awaitConditionRegistered) {
+                        logger.info(
+                            "[PlanExec] Final Answer after await_condition — " +
+                                "exiting with StopReason.STANDBY"
+                        )
+                        ctx.updateSessionStatus("standby")
+                        val result = ctx.stats.toResult(
+                            output = finalAnswer,
+                            stopReason = StopReason.STANDBY,
+                        )
+                        ctx.transcript?.writeSessionEnd(result)
+                        return compactAndReturn(ctx, result)
+                    }
+                    // No await_condition: truly done.
+                    //  - EXIT  → "cancelling" (two-step to "closed").
+                    //  - PARK  → "standby" if STANDBY lifecycle, else "closed".
+                    val finalStatus = when (ctx.finalAnswerAction) {
+                        FinalAnswerAction.EXIT -> "cancelling"
+                        FinalAnswerAction.PARK -> if (ctx.lifecycle == Lifecycle.STANDBY) "standby" else "closed"
+                    }
+                    ctx.updateSessionStatus(finalStatus)
                     val result = ctx.stats.toResult(
                         output = finalAnswer,
                         stopReason = StopReason.COMPLETED
+                    )
+                    ctx.transcript?.writeSessionEnd(result)
+                    return compactAndReturn(ctx, result)
+                }
+                is ExecResult.StandbyRequested -> {
+                    ctx.updateSessionStatus("standby")
+                    val result = ctx.stats.toResult(
+                        output = extractLastAnswer(ctx.memory) ?: "Awaiting wake condition.",
+                        stopReason = StopReason.STANDBY,
                     )
                     ctx.transcript?.writeSessionEnd(result)
                     return compactAndReturn(ctx, result)
@@ -910,7 +1291,11 @@ class PlanExecuteStrategy(
                     continue
                 }
                 is ExecResult.MaxIterations -> {
-                    ctx.updateSessionStatus("error")
+                    if (ctx.lifecycle == Lifecycle.STANDBY) {
+                        ctx.updateSessionStatus("standby", reason = "plan_exec_max_iterations")
+                    } else {
+                        ctx.updateSessionStatus("error", reason = "plan_exec_max_iterations")
+                    }
                     val result = ctx.stats.toResult(
                         output = extractLastAnswer(ctx.memory)
                             ?: "Agent reached maximum iterations during plan execution.",
@@ -920,7 +1305,7 @@ class PlanExecuteStrategy(
                     return compactAndReturn(ctx, result)
                 }
                 is ExecResult.Error -> {
-                    ctx.updateSessionStatus("error")
+                    ctx.updateSessionStatus("error", reason = executionResult.message.take(500))
                     val result = ctx.stats.toResult(
                         output = buildErrorOutput(
                             errorLabel = "Agent error",
@@ -932,22 +1317,20 @@ class PlanExecuteStrategy(
                     ctx.transcript?.writeSessionEnd(result)
                     return compactAndReturn(ctx, result)
                 }
-                is ExecResult.StandbyRequested -> {
-                    ctx.updateSessionStatus("standby")
-                    val result = ctx.stats.toResult(
-                        output = SharedStandbyExtractor.MARKER,
-                        stopReason = StopReason.STANDBY,
-                    )
-                    ctx.transcript?.writeSessionEnd(result)
-                    return compactAndReturn(ctx, result)
-                }
             }
         }
 
         // Exceeded max replan cycles
         logger.warn("[PlanExec] Exceeded max replan cycles ($maxReplanCycles)")
         val finalAnswer = reflect(ctx)
-        ctx.updateSessionStatus("closed")
+        // Same Final-Answer semantics as the normal Completed path —
+        // see the long comment at the `is ExecResult.Completed`
+        // branch for why we branch on `finalAnswerAction`.
+        val finalStatus = when (ctx.finalAnswerAction) {
+            FinalAnswerAction.EXIT -> "closed"
+            FinalAnswerAction.PARK -> if (ctx.lifecycle == Lifecycle.STANDBY) "standby" else "closed"
+        }
+        ctx.updateSessionStatus(finalStatus)
         val result = ctx.stats.toResult(
             output = finalAnswer,
             stopReason = StopReason.COMPLETED
@@ -1029,6 +1412,7 @@ class PlanExecuteStrategy(
         class ReplanNeeded(val reason: String) : ExecResult()
         object MaxIterations : ExecResult()
         class Error(val message: String) : ExecResult()
+        /** LLM called await_condition — park to STANDBY immediately. */
         object StandbyRequested : ExecResult()
     }
 
@@ -1108,28 +1492,9 @@ class PlanExecuteStrategy(
                     return ExecResult.ReplanNeeded(reason)
                 }
 
-                // Standby marker short-circuits the step loop.  See
-                // [SharedStandbyExtractor] for the precedence rule
-                // (Final Answer beats standby).  Returned as a
-                // dedicated [ExecResult.StandbyRequested] so the
-                // outer execute() function can map it to
-                // [StopReason.STANDBY].
-                if (SharedStandbyExtractor.endsWithMarker(assistantText)) {
-                    logger.info(
-                        "[PlanExec] Standby marker detected at end of step " +
-                            "${step.index} assistant text; exiting with " +
-                            "StopReason.STANDBY (lifecycle=${ctx.lifecycle})."
-                    )
-                    return ExecResult.StandbyRequested
-                }
-
-                // Parse tool call.  Final-Answer check MUST come first for the
-                // same reason as in [ReActStrategy]: the LLM's Final
-                // Answer payload is itself JSON and may contain nested
-                // objects with `name` / `tool` keys that would otherwise
-                // be misclassified as tool calls and put the agent into
-                // an infinite loop.
                 val stepFinalAnswer = extractFinalAnswer(assistantText)
+
+                // Parse tool call.
                 val toolCall = when {
                     completion.toolCalls.isNotEmpty() ->
                         ToolCallParser.parseFromCompletion(completion)
@@ -1179,6 +1544,23 @@ class PlanExecuteStrategy(
                         ctx.harness.afterToolExecution(ctx, toolCall, toolResult),
                         "harness.afterToolExecution"
                     )
+                    // Detect await_condition: same as ReAct path —
+                    // immediately exit with StandbyRequested.  The
+                    // outer execute() maps it to STANDBY.  The LLM
+                    // has expressed its intent to park; don't wait
+                    // for a Final Answer.
+                    if (toolCall.name == "await_condition") {
+                        if (!isAwaitConditionRegistrationSuccess(toolResult.rawOutput)) {
+                            logger.warn(
+                                "[PlanExec] await_condition did not register successfully; " +
+                                    "continuing so the LLM can correct the arguments. Result: ${toolResult.rawOutput.take(300)}"
+                            )
+                            continue
+                        }
+                        ctx.stats.awaitConditionRegistered = true
+                        logger.info("[PlanExec] await_condition registered — exiting immediately")
+                        return ExecResult.StandbyRequested
+                    }
                     // Continue loop to let the agent process the observation
                 } else {
                     // No tool call — reuse the Final Answer already detected
@@ -1186,6 +1568,7 @@ class PlanExecuteStrategy(
                     val finalAnswer = stepFinalAnswer
                     if (finalAnswer != null) {
                         val finalAnswerDirective = ctx.harness.validateFinalAnswer(ctx, assistantText, finalAnswer)
+
                         ctx.applyHarnessDirective(finalAnswerDirective, "harness.validateFinalAnswer")
                         if (!finalAnswerDirective.rejectFinalAnswer) {
                             return ExecResult.Completed
@@ -1332,67 +1715,6 @@ internal object SharedFinalAnswerExtractor {
             return match.range.first
         }
         return null
-    }
-}
-
-// ============================================================
-//  SharedStandbyExtractor — recognise the "park to standby" signal
-// ============================================================
-//
-// Companion to [SharedFinalAnswerExtractor].  The two markers
-// share the same "marker → strategy exits" semantics; they differ
-// only in the resulting [StopReason] (FINAL_ANSWER → COMPLETED,
-// STANDBY_MARKER → STANDBY).  Detection precedence matters:
-//
-//   1. If a Final Answer marker is present, the agent has finished —
-//      the Final Answer wins and the standby marker is ignored
-//      (otherwise an LLM that accidentally writes both would flip
-//      the run into a STANDBY session even when it meant to wrap up).
-//   2. If only a standby marker is present at the END of the
-//      response, the strategy returns [StopReason.STANDBY] so the
-//      runtime parks the session to `runtime_state=standby`
-//      (lifecycle=standby) and the dispatcher can later wake it
-//      on a new mailbox message.
-//
-// The marker must be the LAST non-blank line of the assistant
-// message.  We do not require the entire response to be a single
-// line — the LLM can output reasoning, a `Tool decision: ...`
-// sentence, an `Action:` block, etc., and then a final
-// "Enter standby mode." line that signals "I'm done for now,
-// park me".  Matching against the last line keeps the marker
-// cheap to detect and avoids false positives on a stray "enter
-// standby mode" word inside a long Thought block.
-//
-// The canonical text is exactly `Enter standby mode.` (with the
-// trailing period and capital `E` / lowercase `s/m`); the
-// case-insensitive fallback accepts any casing and trims
-// surrounding whitespace.  The trailing period is REQUIRED in
-// the canonical form to make accidental matches on
-// "I will enter standby mode shortly" impossible.
-
-internal object SharedStandbyExtractor {
-    /** Canonical marker text.  Kept in one place so the agent
-     *  prompt and the extractor stay in sync. */
-    const val MARKER: String = "Enter standby mode."
-
-    /**
-     * True when [text] ends (after trimming) with the standby
-     * marker.  Used by the strategies to short-circuit the run()
-     * loop and return [StopReason.STANDBY] before the next
-     * iteration.
-     */
-    fun endsWithMarker(text: String): Boolean {
-        val trimmed = text.trimEnd()
-        // Canonical form first (case-sensitive), so "ENTER STANDBY MODE."
-        // does NOT match — the LLM is taught the exact lowercase form.
-        if (trimmed.endsWith(MARKER)) return true
-        // Case-insensitive fallback: trim the trailing line and
-        // accept any casing as long as the line equals the marker.
-        val lastLine = trimmed.lineSequence()
-            .lastOrNull { it.isNotBlank() }
-            ?.trim()
-            ?: return false
-        return lastLine.equals(MARKER, ignoreCase = true)
     }
 }
 

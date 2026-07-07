@@ -92,7 +92,27 @@ fun ScriptLibraryTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): 
             "For 'run': the script's runtime parameters as a JSON object. Key name MUST be \"parameters\" — do NOT use \"scriptArgs\" (that is the internal variable name inside script source code, not the API key). Example: {\"target\":\"main\",\"direction\":\"to\"}.",
             required = false
         )
-    )
+    ),
+    // Per-script dedup strategy: read-only scripts use RESULT_HASH (default),
+    // state-changing scripts declare // @dedup: args_only in their header.
+    // The resolver is invoked at call time with the tool's arguments so the
+    // detector knows which strategy to apply for the specific script being run.
+    dedupStrategyResolver = { toolArgs ->
+        val action = toolArgs["action"] as? String
+        if (action != "run") {
+            // 'search' and 'read' are read-only metadata queries — RESULT_HASH
+            // (the default) is appropriate and avoids false positives from
+            // slightly different search keyword normalisation.
+            ToolDedupStrategy.RESULT_HASH
+        } else {
+            val scriptName = toolArgs["scriptName"] as? String
+            if (scriptName != null) {
+                resolveScriptDedupStrategy(agentDbClient, scriptName)
+            } else {
+                ToolDedupStrategy.RESULT_HASH
+            }
+        }
+    }
 ) { args ->
     val mapper = jacksonObjectMapper()
     val action = args["action"] as? String
@@ -147,6 +167,14 @@ fun ScriptLibraryTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): 
 
 /**
  * Metadata parsed from script file headers.
+ *
+ * [dedupStrategy] controls how the [DefaultToolResultDuplicateDetector]
+ * handles repeated calls to this specific script.  It is parsed from the
+ * optional `// @dedup:` header annotation and defaults to
+ * [ToolDedupStrategy.RESULT_HASH] (compare output SHA-256), which works
+ * for read-only scripts.  State-changing scripts (rename, comment-write,
+ * data-type-edit, …) should declare `// @dedup: args_only` so that any
+ * repeat call with the same arguments is flagged regardless of output.
  */
 private data class ScriptMeta(
     val name: String,
@@ -155,12 +183,45 @@ private data class ScriptMeta(
     val parameters: String,
     val source: String,
     val className: String,
-    val dbId: Int? = null   // script row id in the DB, set when loaded from library
+    val dbId: Int? = null,  // script row id in the DB, set when loaded from library
+    val dedupStrategy: ToolDedupStrategy = ToolDedupStrategy.RESULT_HASH,
 )
 
 /** Cached script library entries. */
 @Volatile
 private var scriptLibrary: List<ScriptMeta>? = null
+
+/**
+ * Cached mapping of `scriptName → dedupStrategy`, populated lazily when
+ * scripts are first loaded from the DB.  Used by the
+ * [dedupStrategyResolver] on the `script_library` tool so that the
+ * [DefaultToolResultDuplicateDetector] can apply per-script dedup logic
+ * without re-querying the database on every tool call.
+ */
+@Volatile
+private var scriptDedupCache: Map<String, ToolDedupStrategy>? = null
+
+/**
+ * Resolve the dedup strategy for a given library script.
+ *
+ * Looks up the cached mapping first; on cache miss (or when the script
+ * is not yet known) reloads all scripts from the DB, refreshes the
+ * cache, and returns the strategy.  Unknown scripts default to
+ * [ToolDedupStrategy.RESULT_HASH].
+ */
+private fun resolveScriptDedupStrategy(
+    agentDbClient: AgentDatabaseClient,
+    scriptName: String,
+): ToolDedupStrategy {
+    scriptDedupCache?.let { cache ->
+        cache[scriptName]?.let { return it }
+    }
+    // Cache miss — reload all scripts and rebuild the cache.
+    val strategies = loadDbLibraryScripts(agentDbClient)
+        .associate { it.name to it.dedupStrategy }
+    scriptDedupCache = strategies
+    return strategies[scriptName] ?: ToolDedupStrategy.RESULT_HASH
+}
 
 /**
  * Load user-saved library scripts from the `scripts` table.
@@ -198,12 +259,24 @@ private fun loadDbLibraryScripts(agentDbClient: AgentDatabaseClient): List<Scrip
 
 /**
  * Parse metadata annotations from script source.
+ *
+ * Recognised header annotations (all optional except `@name` which
+ * falls back to the file basename):
+ *  - `// @name:`        — script display name
+ *  - `// @author:`      — author tag
+ *  - `// @description:` — short description
+ *  - `// @parameters:`  — parameter documentation
+ *  - `// @dedup:`       — dedup strategy: `result_hash` (default) or
+ *                         `args_only`.  Use `args_only` for state-changing
+ *                         scripts so repeat calls with identical arguments
+ *                         are flagged as duplicates regardless of output.
  */
 private fun parseScriptMeta(source: String, fileName: String): ScriptMeta? {
     var name = fileName.removeSuffix(".kts")
     var description = ""
     var author = ""
     var parameters = "none"
+    var dedupStrategy = ToolDedupStrategy.RESULT_HASH
 
     for (line in source.lines()) {
         val trimmed = line.trim()
@@ -218,6 +291,14 @@ private fun parseScriptMeta(source: String, fileName: String): ScriptMeta? {
                 description = trimmed.removePrefix("// @description:").trim()
             trimmed.startsWith("// @parameters:") ->
                 parameters = trimmed.removePrefix("// @parameters:").trim()
+            trimmed.startsWith("// @dedup:") -> {
+                val v = trimmed.removePrefix("// @dedup:").trim().lowercase()
+                dedupStrategy = when (v) {
+                    "args_only", "args-only", "argsonly" -> ToolDedupStrategy.ARGS_ONLY
+                    "result_hash", "result-hash", "resulthash" -> ToolDedupStrategy.RESULT_HASH
+                    else -> ToolDedupStrategy.RESULT_HASH
+                }
+            }
         }
     }
 
@@ -225,7 +306,7 @@ private fun parseScriptMeta(source: String, fileName: String): ScriptMeta? {
     val classNameRegex = Regex("""class\s+(\w+)\s*""")
     val className = classNameRegex.find(source)?.groupValues?.get(1) ?: return null
 
-    return ScriptMeta(name, description, author, parameters, source, className)
+    return ScriptMeta(name, description, author, parameters, source, className, dedupStrategy = dedupStrategy)
 }
 
 // ============================================================
@@ -332,6 +413,30 @@ private fun runLibraryScript(
     val script = loadDbLibraryScripts(agentDbClient).firstOrNull { it.name == scriptName }
         ?: return "Error: Script '$scriptName' not found in library. Use 'search' action to see available scripts."
 
+    // -----------------------------------------------------------------
+    //  Reverse-mistake guard: detect when the LLM put a tool_call JSON
+    //  inside the `parameters` map (or one of its values) instead of
+    //  passing the script's actual runtime arguments. Without this
+    //  guard the script would receive the JSON string as a literal
+    //  parameter and likely fail in a confusing way.
+    // -----------------------------------------------------------------
+    val mistakenlyWrappedTool = ToolCallParser.parametersLookLikeToolCall(parameters)
+    if (mistakenlyWrappedTool != null) {
+        return mapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "The 'parameters' of script_library action=run are passed to the " +
+                "script as its runtime arguments (the `scriptArgs` variable inside the " +
+                "script). One of the provided parameter values looks like a tool_call JSON " +
+                "for '$mistakenlyWrappedTool' — the LLM is treating a script run as a tool call.",
+            "hint" to "If you wanted to invoke '$mistakenlyWrappedTool', emit it as a separate " +
+                "Action tool_call JSON block in the same response. Do NOT nest tool calls " +
+                "inside the `parameters` object of script_library; those values are forwarded " +
+                "to the script verbatim. Inspect the script's `// @parameters:` header to see " +
+                "the keys it actually expects (e.g. {\"query\": \"...\"} or {\"target\": \"...\"}).",
+            "remediation" to "emit '${mistakenlyWrappedTool}' as its own tool_call block"
+        ))
+    }
+
     // Inject parameters as scriptArgs by prepending a property to the source
     val sourceWithArgs = if (parameters.isNotEmpty()) {
         // Inject a scriptArgs map accessible within execute()
@@ -392,21 +497,44 @@ private fun runLibraryScript(
                 val report = scriptObj.runtimeReportView
                 val success = scriptObj.failureSign == AkibaModule.SUCCESS
 
+                // ── Result payload returned to the strategy ───────────────
+                // IMPORTANT: do NOT include `executionTimeMs` / `totalTimeMs`
+                // (or any other per-call non-deterministic field) in this
+                // JSON.  The strategy's tool-result duplicate detector
+                // ([DefaultToolResultDuplicateDetector]) hashes the ENTIRE
+                // raw result string via SHA-256 and looks for byte-for-byte
+                // identical previous results in the same session.  A
+                // single-digit change in a timing field flips the hash and
+                // silently defeats dedup, so the LLM can re-issue the same
+                // `disassemble_function(address=X, ...)` call indefinitely
+                // without ever seeing a `[Repeated tool result warning]`
+                // prefix.
+                //
+                // Timing is still measured below (for [report] and
+                // [totalElapsed]) and may be inspected via the
+                // [ScriptInstance.runtimeReportView] / the surrounding
+                // `measureTimeMillis` block, but it must NEVER enter the
+                // returned [resultJson].  If you need to surface timing
+                // for an audit, write it to a server-side log file --
+                // never to the LLM-visible tool result.
+                val scriptExecutionTimeMs =
+                    report?.get(RuntimeReport.KEY_EXECUTION_TIME_MS) ?: 0L
                 resultJson = mapper.writeValueAsString(mapOf(
                     "success" to success,
                     "scriptName" to script.name,
-                    "output" to scriptObj.getOutput(),
-                    "executionTimeMs" to (report?.get(RuntimeReport.KEY_EXECUTION_TIME_MS) ?: 0L)
+                    "output" to scriptObj.getOutput()
                 ))
             }
         }
+        // [totalElapsed] and the inner [scriptExecutionTimeMs] are
+        // intentionally NOT patched back into [resultJson] -- see the
+        // comment above the mapOf call.  They are kept in scope so a
+        // future change can route them to a logger / metrics sink
+        // without re-introducing the non-deterministic-field bug.
+        @Suppress("UNUSED_VARIABLE")
+        val _totalElapsedMs = totalElapsed
 
-        // Patch totalTimeMs
-        val finalResult = try {
-            val node = mapper.readTree(resultJson)
-            (node as? com.fasterxml.jackson.databind.node.ObjectNode)?.put("totalTimeMs", totalElapsed)
-            node?.toString() ?: resultJson
-        } catch (_: Exception) { resultJson }
+        val finalResult = resultJson
 
         val outputText = (mapper.readTree(finalResult)["output"]?.asText() ?: "").take(10000)
 

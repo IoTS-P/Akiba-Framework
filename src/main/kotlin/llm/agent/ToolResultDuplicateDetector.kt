@@ -3,6 +3,7 @@ package org.iotsplab.akiba.llm.agent
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
+import org.iotsplab.akiba.llm.tool.ToolDedupStrategy
 import java.security.MessageDigest
 
 /**
@@ -23,6 +24,7 @@ data class ToolResultInspectionRequest(
     val resultUuid: String,
     val stored: ToolResultContext.StoredResult,
     val isError: Boolean = false,
+    val dedupStrategy: ToolDedupStrategy = ToolDedupStrategy.RESULT_HASH,
 )
 
 data class ToolResultDuplicateDetection(
@@ -77,6 +79,17 @@ class DefaultToolResultDuplicateDetector(
         val current = request.toMatch(hash)
 
         try {
+            // ── ARGS_ONLY strategy ──────────────────────────────
+            // Compare canonical args (tool name + sorted JSON args)
+            // regardless of output.  Used for tools where calling
+            // with the same arguments is always wasteful (e.g.
+            // `vuln_memory action=record_function function=main`).
+            // Short results are NOT exempted.
+            if (request.dedupStrategy == ToolDedupStrategy.ARGS_ONLY) {
+                return inspectByArgs(request, current, hash)
+            }
+
+            // ── RESULT_HASH strategy (default) ──────────────────
             if (hash == null) {
                 inMemoryHistory.add(current)
                 return ToolResultDuplicateDetection(skippedReason = "missing result hash")
@@ -97,43 +110,101 @@ class DefaultToolResultDuplicateDetector(
                 )
             }
 
-            val matchesByUuid = linkedMapOf<String, ToolResultDuplicateMatch>()
-
-            loadDbMatches(request, hash).forEach { match ->
-                if (match.resultUuid != request.resultUuid) {
-                    matchesByUuid[match.resultUuid] = match
-                }
-            }
-
-            inMemoryHistory
-                .asSequence()
-                .filter { it.resultSha256 == hash && it.resultUuid != request.resultUuid }
-                .forEach { match -> matchesByUuid.putIfAbsent(match.resultUuid, match) }
-
-            val matches = matchesByUuid.values.toList()
-            inMemoryHistory.add(current)
-
-            if (matches.isEmpty()) {
-                return ToolResultDuplicateDetection()
-            }
-
-            val appearances = matches.size + 1
-            val severity = if (appearances >= warningThreshold) {
-                ToolResultDuplicateSeverity.WARNING
-            } else {
-                ToolResultDuplicateSeverity.NOTICE
-            }
-
-            return ToolResultDuplicateDetection(
-                matches = matches,
-                totalAppearancesIncludingCurrent = appearances,
-                severity = severity
-            )
+            return inspectByResultHash(request, current, hash)
         } catch (e: Exception) {
             logger?.warn("Tool result duplicate detection failed: ${e.message}")
             inMemoryHistory.add(current)
             return ToolResultDuplicateDetection(skippedReason = "duplicate detection failed")
         }
+    }
+
+    /**
+     * ARGS_ONLY dedup: compare canonical args across the whole session.
+     * Any previous call to the SAME tool with the SAME args counts as
+     * a match, regardless of the output.
+     */
+    private fun inspectByArgs(
+        request: ToolResultInspectionRequest,
+        current: ToolResultDuplicateMatch,
+        hash: String?,
+    ): ToolResultDuplicateDetection {
+        val currentArgsKey = canonicalArgsKey(request.toolCall)
+
+        val matchesByUuid = linkedMapOf<String, ToolResultDuplicateMatch>()
+
+        // DB matches: find previous calls to the same tool with the same args.
+        loadDbMatchesByArgs(request, currentArgsKey).forEach { match ->
+            if (match.resultUuid != request.resultUuid) {
+                matchesByUuid[match.resultUuid] = match
+            }
+        }
+
+        // In-memory matches.
+        inMemoryHistory
+            .asSequence()
+            .filter { it.resultUuid != request.resultUuid }
+            .filter { canonicalArgsKey(it.toolName, it.toolArgs) == currentArgsKey }
+            .forEach { match -> matchesByUuid.putIfAbsent(match.resultUuid, match) }
+
+        inMemoryHistory.add(current)
+
+        if (matchesByUuid.isEmpty()) {
+            return ToolResultDuplicateDetection()
+        }
+
+        val appearances = matchesByUuid.size + 1
+        val severity = if (appearances >= warningThreshold) {
+            ToolResultDuplicateSeverity.WARNING
+        } else {
+            ToolResultDuplicateSeverity.NOTICE
+        }
+
+        return ToolResultDuplicateDetection(
+            matches = matchesByUuid.values.toList(),
+            totalAppearancesIncludingCurrent = appearances,
+            severity = severity,
+        )
+    }
+
+    /**
+     * RESULT_HASH dedup (original logic): compare SHA-256 of the output.
+     */
+    private fun inspectByResultHash(
+        request: ToolResultInspectionRequest,
+        current: ToolResultDuplicateMatch,
+        hash: String,
+    ): ToolResultDuplicateDetection {
+        val matchesByUuid = linkedMapOf<String, ToolResultDuplicateMatch>()
+
+        loadDbMatches(request, hash).forEach { match ->
+            if (match.resultUuid != request.resultUuid) {
+                matchesByUuid[match.resultUuid] = match
+            }
+        }
+
+        inMemoryHistory
+            .asSequence()
+            .filter { it.resultSha256 == hash && it.resultUuid != request.resultUuid }
+            .forEach { match -> matchesByUuid.putIfAbsent(match.resultUuid, match) }
+
+        inMemoryHistory.add(current)
+
+        if (matchesByUuid.isEmpty()) {
+            return ToolResultDuplicateDetection()
+        }
+
+        val appearances = matchesByUuid.size + 1
+        val severity = if (appearances >= warningThreshold) {
+            ToolResultDuplicateSeverity.WARNING
+        } else {
+            ToolResultDuplicateSeverity.NOTICE
+        }
+
+        return ToolResultDuplicateDetection(
+            matches = matchesByUuid.values.toList(),
+            totalAppearancesIncludingCurrent = appearances,
+            severity = severity,
+        )
     }
 
     private fun loadDbMatches(
@@ -180,6 +251,55 @@ class DefaultToolResultDuplicateDetector(
             source = "current-run"
         )
 
+    /**
+     * Build a canonical args key for ARGS_ONLY dedup:
+     * `"<toolName>:<canonicalJson(args)>"`.
+     */
+    private fun canonicalArgsKey(toolCall: ParsedToolCall): String =
+        canonicalArgsKey(toolCall.name, toolCall.argumentsJson)
+
+    private fun canonicalArgsKey(toolName: String, argsJson: String?): String {
+        val canonical = argsJson?.let { canonicalJson(it) } ?: "{}"
+        return "$toolName:$canonical"
+    }
+
+    /**
+     * Load previous calls to the same tool with the same canonical args
+     * from the DB.  Used by ARGS_ONLY dedup.
+     */
+    private fun loadDbMatchesByArgs(
+        request: ToolResultInspectionRequest,
+        argsKey: String,
+    ): List<ToolResultDuplicateMatch> {
+        val sid = request.sessionId ?: sessionId ?: return emptyList()
+        val client = agentDbClient ?: return emptyList()
+
+        return try {
+            client.findToolCallResults(
+                sessionId = sid,
+                toolName = request.toolCall.name,
+                limit = maxDbMatches,
+            ).filter { match ->
+                canonicalArgsKey(match.toolName, match.toolArgs) == argsKey
+            }.map { info ->
+                ToolResultDuplicateMatch(
+                    resultUuid = info.resultUuid,
+                    callId = info.callId,
+                    iteration = null,
+                    toolName = info.toolName,
+                    toolArgs = info.toolArgs,
+                    resultSha256 = info.sha256,
+                    originalBytes = info.originalBytes,
+                    createdAt = info.createdAt,
+                    source = "database"
+                )
+            }
+        } catch (e: Exception) {
+            logger?.warn("Failed to load historical tool calls by args: ${e.message}")
+            emptyList()
+        }
+    }
+
     private fun canonicalJson(text: String): String = try {
         mapper.readTree(text).toString()
     } catch (_: Exception) {
@@ -198,15 +318,15 @@ fun ToolResultDuplicateDetection.toObservationPrefix(currentToolName: String): S
 
     val first = matches.first()
     val header = when (severity) {
-        ToolResultDuplicateSeverity.WARNING -> "[Repeated tool result warning]"
-        ToolResultDuplicateSeverity.NOTICE -> "[Duplicate tool result notice]"
+        ToolResultDuplicateSeverity.WARNING -> "[Repeated tool call warning]"
+        ToolResultDuplicateSeverity.NOTICE -> "[Duplicate tool call notice]"
         ToolResultDuplicateSeverity.NONE -> return null
     }
 
     return buildString {
         appendLine(header)
-        appendLine("The output of the current `$currentToolName` call is byte-for-byte identical to a previous tool result in this session.")
-        appendLine("same_result_appearances_including_current: $totalAppearancesIncludingCurrent")
+        appendLine("This `$currentToolName` call repeats a previous call with the same arguments in this session.")
+        appendLine("same_call_appearances_including_current: $totalAppearancesIncludingCurrent")
         appendLine("first_matching_result_uuid: ${first.resultUuid}")
         first.callId?.let { appendLine("first_matching_call_id: $it") }
         first.iteration?.let { appendLine("first_matching_iteration: $it") }
@@ -214,9 +334,9 @@ fun ToolResultDuplicateDetection.toObservationPrefix(currentToolName: String): S
         first.toolArgs?.let { appendLine("first_matching_args: $it") }
         first.createdAt?.let { appendLine("first_matching_created_at: $it") }
         if (severity == ToolResultDuplicateSeverity.WARNING) {
-            appendLine("This may indicate a large reasoning loop. Do not repeat this analysis path unless you can state what new evidence it provides; produce **Final Answer:** if the task is already answerable, or switch to a meaningfully different tool/argument.")
+            appendLine("This may indicate a reasoning loop. Do not repeat this call with the same arguments unless you can state what new information it provides; produce **Final Answer:** if the task is already answerable, or switch to a meaningfully different tool/argument.")
         } else {
-            appendLine("Avoid repeating this path unless there is a clear validation reason.")
+            appendLine("Avoid repeating this call unless there is a clear reason.")
         }
     }.trim()
 }

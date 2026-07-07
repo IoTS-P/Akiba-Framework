@@ -189,6 +189,35 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
 
     val mapper = jacksonObjectMapper()
 
+    // -----------------------------------------------------------------
+    //  Reverse-mistake guard: detect when the LLM put a tool_call JSON
+    //  inside the `source` field instead of Kotlin code. Without this
+    //  guard the script would fail with a generic "missing class"
+    //  validation error and the LLM would loop on the same mistake.
+    //
+    //  The hint points the LLM at the correct shape: tool calls belong
+    //  in the Action JSON, not inside a script body.
+    // -----------------------------------------------------------------
+    val mistakenlyWrappedTool = ToolCallParser.looksLikeToolCallJson(source)
+    if (mistakenlyWrappedTool != null) {
+        return@Tool mapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "The 'source' parameter of run_script must be Kotlin source code (a class " +
+                "extending AkibaScript). The provided value looks like a tool_call JSON for " +
+                "'$mistakenlyWrappedTool' — the LLM is treating a script run as a tool call.",
+            "hint" to "If you wanted to invoke '$mistakenlyWrappedTool', emit it as a separate " +
+                "Action tool_call JSON block in the same response. Do NOT wrap tool calls inside " +
+                "the `source` field of run_script; that field is compiled as Kotlin code and will " +
+                "fail with a syntax error. To write a script, the `source` MUST define a class " +
+                "extending AkibaScript, e.g.:\n" +
+                "```kotlin\nimport org.iotsplab.akiba.script.AkibaScript\n\n" +
+                "class MyScript : AkibaScript() {\n" +
+                "    override suspend fun execute() { /* your logic */ }\n" +
+                "}\n```",
+            "remediation" to "emit '${mistakenlyWrappedTool}' as its own tool_call block"
+        ))
+    }
+
     if (saveToLibrary) {
         val metadataError = validateLibraryScriptMetadata(source)
         if (metadataError != null) {
