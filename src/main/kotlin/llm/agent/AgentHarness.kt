@@ -150,3 +150,72 @@ private fun isTransientWakeContextMessage(message: String): Boolean =
 
 fun joinPromptParts(vararg parts: String?): String =
     parts.filter { !it.isNullOrBlank() }.joinToString("\n\n")
+
+// ============================================================
+//  Built-in batch tool-call hint
+// ============================================================
+
+/**
+ * Built-in check for oversized or repetitive tool-call batches.
+ *
+ * Returns a [AgentHarnessDirective] with user messages when:
+ *  - The LLM emitted more than [maxBatch] tool calls in a single
+ *    response (the extras are capped, so the LLM needs to know).
+ *  - All calls target the same tool (or the same `script_library`
+ *    script with different arguments), suggesting the LLM should
+ *    check whether the tool supports batch operations instead of
+ *    issuing many individual calls.
+ *
+ * Called by [ReActStrategy] after the domain harness's
+ * [AgentHarness.beforeToolCalls] but before the batch is capped
+ * and executed, so the hint is visible in the same LLM context
+ * as the observations from the executed calls.
+ */
+fun batchToolCallHint(
+    toolCalls: List<ParsedToolCall>,
+    maxBatch: Int,
+): AgentHarnessDirective {
+    if (toolCalls.size <= maxBatch) return AgentHarnessDirective.None
+
+    val messages = mutableListOf<String>()
+
+    // Hint 1: batch size exceeded
+    messages.add(
+        "You emitted ${toolCalls.size} tool calls in one response, but the maximum " +
+            "is $maxBatch per response. Only the first $maxBatch were executed; " +
+            "the remaining ${toolCalls.size - maxBatch} were dropped. " +
+            "If you still need them, request them in your next response."
+    )
+
+    // Hint 2: same-tool / same-script pattern
+    val toolNames = toolCalls.map { it.name }
+    val allSameTool = toolNames.distinct().size == 1
+
+    if (allSameTool) {
+        val toolName = toolNames.first()
+        messages.add(
+            "Notice: all ${toolCalls.size} calls target the same tool '$toolName'. " +
+                "Check whether '$toolName' supports batch operations (e.g. an " +
+                "`action=batch` parameter or an `operations` array) — a single " +
+                "batched call is more efficient and avoids hitting the per-response " +
+                "tool-call cap."
+        )
+    } else {
+        // Check for same script_library scriptName with different params
+        val scriptEntries = toolCalls
+            .filter { it.name == "script_library" }
+            .mapNotNull { it.arguments["scriptName"]?.toString() }
+        if (scriptEntries.size > 1 && scriptEntries.distinct().size == 1) {
+            val scriptName = scriptEntries.first()
+            messages.add(
+                "Notice: ${scriptEntries.size} of the calls run the same script " +
+                    "'$scriptName' via script_library with different parameters. " +
+                    "Check whether '$scriptName' supports batch operations (e.g. " +
+                    "passing multiple targets in one call) — a single invocation " +
+                    "is more efficient than many individual script_library calls."
+            )
+        }
+    }
+
+    return AgentHarnessDirective(userMessages = messages)
+}

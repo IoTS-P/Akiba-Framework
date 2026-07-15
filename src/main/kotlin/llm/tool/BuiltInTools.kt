@@ -18,6 +18,8 @@ import org.iotsplab.akiba.module.AkibaModule
  * - [RunModuleTool] — delegate work to another [AkibaModule]
  * - [SpawnSubAgentTool] — async fire-and-forget child LLM agent
  *   (template path or freeform path)
+ * - [ListSubAgentsTool] — list/search the caller's sub-agents and
+ *   their runtime states (with optional status filter and recursion)
  * - [AwaitAgentTool] — wait for an async child to reach a target state
  * - [AwaitMultipleChildrenTool] — batch-wait for N child agents in
  *   one call (mode=any|all)
@@ -32,6 +34,8 @@ import org.iotsplab.akiba.module.AkibaModule
  * - [SearchSkillTool] / [ReadSkillTool] — discover installed skills and read skill files
  * - [QueryGhidraAPITool] — search and read Ghidra API documentation
  * - [RunShellTool] — execute shell commands in the module workspace
+ * - [WorkspaceFileTools] — read/write/list/move/delete files within the
+ *   module workspace (sandboxed, path-traversal-safe)
  *
  * ### Usage in AgentModule
  *
@@ -60,6 +64,7 @@ object BuiltInTools {
     fun all(parent: AgentModule, agentDbClient: AgentDatabaseClient, username: String? = null): List<Tool> = listOf(
         RunModuleTool(parent),
         SpawnSubAgentTool(parent, agentDbClient),
+        ListSubAgentsTool(parent, agentDbClient),
         AwaitAgentTool(parent, agentDbClient),
         AwaitMultipleChildrenTool(parent, agentDbClient),
         GetAgentStatusTool(agentDbClient, parent.agentSessionId),
@@ -68,6 +73,7 @@ object BuiltInTools {
         QuerySessionHistoryTool(agentDbClient),
         QueryMemoriesTool(agentDbClient),
         ReadHistoryToolCallTool(agentDbClient),
+        SearchHistoryToolCallsTool(agentDbClient),
         ListModulesTool(),
         ScriptLibraryTool(parent, agentDbClient),
         SearchSkillTool(username),
@@ -75,7 +81,7 @@ object BuiltInTools {
         RunScriptTool(parent, agentDbClient),
         QueryGhidraAPITool(),
         RunShellTool(parent)
-    )
+    ) + WorkspaceFileTools(parent)
 
     /**
      * Register all built-in tools into a [ToolRegistry].

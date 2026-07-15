@@ -91,10 +91,7 @@ class ScratchpadRegistry {
     // pushed here so it can be restored after the urgent one is handled.
     private val preemptStack = mutableListOf<Long>()
 
-    companion object {
-        /** Messages with priority >= this value trigger preemption. */
-        const val PREEMPTION_THRESHOLD = 5
-    }
+    // PREEMPTION_THRESHOLD is defined in AgentConstants.kt.
 
     /**
      * Get or create a scratchpad for [conversationId].

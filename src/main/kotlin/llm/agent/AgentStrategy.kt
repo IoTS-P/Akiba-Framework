@@ -4,7 +4,6 @@ import org.apache.logging.log4j.LogManager
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.client.AkibaLLMClient
 import org.iotsplab.akiba.llm.client.ChatCompletion
-import org.iotsplab.akiba.llm.client.LLMTimeoutException
 import org.iotsplab.akiba.llm.memory.AgentChatMessage
 import org.iotsplab.akiba.llm.memory.ChatMemory
 import org.iotsplab.akiba.llm.memory.MemoryManager
@@ -12,9 +11,32 @@ import org.iotsplab.akiba.llm.memory.MemoryType
 import org.iotsplab.akiba.llm.memory.MemoryScope
 import org.iotsplab.akiba.llm.tool.ToolCallParser
 import org.iotsplab.akiba.llm.tool.ToolRegistry
+import kotlinx.coroutines.delay
 import org.iotsplab.akiba.llm.agent.ToolResultDuplicateSeverity
 import java.util.UUID
 import kotlin.system.measureTimeMillis
+
+// ============================================================
+//  LLM retry backoff schedule — see AgentConstants.kt
+// ============================================================
+
+/** Human-readable label for a backoff duration, used in log messages. */
+private fun formatBackoffDuration(ms: Long): String {
+    val seconds = ms / 1000
+    return when {
+        seconds < 60 -> "${seconds}s"
+        seconds < 3600 -> {
+            val mins = seconds / 60
+            val secs = seconds % 60
+            if (secs == 0L) "${mins}min" else "${mins}min${secs}s"
+        }
+        else -> {
+            val hours = seconds / 3600
+            val mins = (seconds % 3600) / 60
+            if (mins == 0L) "${hours}h" else "${hours}h${mins}min"
+        }
+    }
+}
 
 // ============================================================
 //  Agent Strategy — interface
@@ -24,8 +46,9 @@ import kotlin.system.measureTimeMillis
  * Information about a failed LLM call, passed to [StrategyContext.onLLMErrorHook].
  *
  * The hook can inspect this struct to decide whether to retry (e.g. compact
- * memory on the first error but give up on subsequent ones), and may also
- * read or update [stats] to track recovery state.
+ * memory on the first error), and may also read or update [stats]
+ * to track recovery state. The hook is now called only once (attempt
+ * is always 1); the unlimited retry loop handles subsequent failures.
  */
 data class LLMErrorInfo(
     /** The exception thrown by the LLM client. */
@@ -61,7 +84,7 @@ interface AgentStrategy {
      * @param ctx Fully-wired [StrategyContext] providing all dependencies.
      * @return The final [AgentResult].
      */
-    fun execute(ctx: StrategyContext): AgentResult
+    suspend fun execute(ctx: StrategyContext): AgentResult
 }
 
 /**
@@ -83,27 +106,27 @@ class StrategyContext(
     /** Optional hook invoked before every LLM chat call. Used for threshold-based context compaction. */
     val beforeChatHook: (() -> Unit)? = null,
     /**
-     * Optional hook invoked **on every LLM call failure** (not just the first).
+     * Optional hook invoked **once** on the first LLM call failure.
      *
-     * The hook may:
-     * - Inspect the failure context via [LLMErrorInfo] (exception, attempt, token count, ...).
-     * - Perform side effects (e.g. compact memory, lower effective context cap).
-     * - Return `true` to retry the same LLM call, or `false` to propagate the error.
+     * The hook may perform side effects such as context compaction
+     * or lowering the effective context cap.  Its return value is
+     * **informational only** — the callLLM retry loop always enters
+     * an unlimited exponential-backoff retry regardless of the
+     * hook's decision, so that long-running unattended agents
+     * survive transient provider outages.
      *
-     * The hook is invoked at most [maxLLMErrorRetries] times per failed call to
-     * prevent infinite loops. Implementations can gate their own policy using
-     * [LLMErrorInfo.attempt] (e.g. only retry on the first error to keep the
-     * previous "single compaction attempt" behavior).
+     * The hook is called at most once per failed call (attempt = 1).
+     * Subsequent retries do not re-invoke the hook.
      *
-     * If null (default), the first LLM error is propagated without retry,
-     * matching pre-recovery behavior.
+     * If null (default), no compaction attempt is made and the
+     * retry loop starts immediately.
      */
     val onLLMErrorHook: ((LLMErrorInfo) -> Boolean)? = null,
     /**
-     * Maximum number of times [onLLMErrorHook] may request a retry per failed
-     * LLM call. Defaults to 1 so an accidentally-infinite hook cannot lock up
-     * the loop. Set higher only if the hook is well-tested and uses
-     * [LLMErrorInfo.attempt] to bound its own behavior.
+     * Deprecated — no longer used to cap retries.  Retained for
+     * backward-compatible constructor signatures.  The callLLM
+     * retry loop is now unlimited with exponential backoff (see
+     * [LLM_RETRY_BACKOFF_MS]).
      */
     val maxLLMErrorRetries: Int = 1,
     /** Agent database client for audit / session updates. */
@@ -168,6 +191,18 @@ class StrategyContext(
     val compactFn: (() -> Boolean)? = null,
     /** Returns a cancellation reason when the runtime has requested this agent to stop. */
     val cancellationReasonProvider: (() -> String?)? = null,
+
+    /**
+     * Returns `true` when the user has requested this agent to be
+     * paused.  The strategy loop checks this at the top of each
+     * iteration (after the current LLM response has been processed)
+     * and blocks until the provider returns `false`.
+     *
+     * Unlike [cancellationReasonProvider], pausing does NOT abort the
+     * loop — it simply waits.  The agent finishes the in-flight LLM
+     * call, processes its response, then blocks before the next call.
+     */
+    val pauseCheckProvider: (() -> Boolean)? = null,
 ) {
     /** Accumulated counters during the loop. Mutable, shared across the strategy. */
     @Suppress("LeakingThis")
@@ -220,15 +255,22 @@ class StrategyContext(
     /**
      * Call the LLM with the current conversation history.
      *
-     * If [onLLMErrorHook] is provided and the provider call fails, the hook is
-     * invoked (up to [maxLLMErrorRetries] times) with full [LLMErrorInfo]
-     * context. The hook decides whether to retry the same call; typical
-     * implementations compact memory on the first error to recover from
-     * underestimated token usage, then lower the effective context cap so the
-     * next iteration compacts earlier. If the hook returns false (or is null)
-     * the error is propagated as a normal LLM failure.
+     * On failure (timeout or any other error), the call is retried
+     * indefinitely with an exponential backoff schedule (see
+     * [LLM_RETRY_BACKOFF_MS]: 30s, 1min, 2min, 5min, 15min, 30min,
+     * 1h, 2h, 4h, 6h, then 6h for all subsequent attempts).
      *
-     * @return the completion, or null on unrecoverable error (error is logged).
+     * If [onLLMErrorHook] is provided, it is invoked **once** before
+     * the retry loop starts, so it can compact memory as a recovery
+     * side effect. The hook's return value does not affect whether
+     * retries occur.
+     *
+     * The retry loop only exits on:
+     * - Success (returns the completion)
+     * - Cancellation via [cancellationReasonProvider] (returns null)
+     * - Thread interruption (returns null)
+     *
+     * @return the completion, or null if cancelled or interrupted.
      */
     fun callLLM(systemPrompt: String): ChatCompletion? {
         fun invokeChat(): ChatCompletion {
@@ -259,110 +301,92 @@ class StrategyContext(
                 stats.lastError = initialError.message
                 logger.warn("LLM chat failed: ${initialError.message}")
 
-                // ---- Timeout-specific retry path ---------------------
-                // LLM timeouts are usually transient (network blip,
-                // provider overload) and do NOT benefit from context
-                // compaction.  We retry them with a linear backoff
-                // using the LLMConfig.maxRetries budget (default 3)
-                // BEFORE consulting the compaction hook, so a flaky
-                // network does not waste the single compaction-and-
-                // retry the hook provides.
-                //
-                // The backoff is intentionally linear (1s, 2s, 3s ...)
-                // rather than exponential: provider timeouts are
-                // typically short-lived and the agent's own
-                // timeoutSeconds is already the main latency cost.
-                if (initialError is LLMTimeoutException) {
-                    val maxTimeoutRetries = client.config.maxRetries.coerceAtLeast(1)
-                    var timeoutAttempt = 0
-                    while (timeoutAttempt < maxTimeoutRetries) {
-                        timeoutAttempt++
-                        val backoffMs = 1000L * timeoutAttempt
-                        logger.warn(
-                            "LLM timeout, backing off ${backoffMs}ms " +
-                                "(retry $timeoutAttempt/$maxTimeoutRetries): ${initialError.message}"
-                        )
-                        try {
-                            Thread.sleep(backoffMs)
-                        } catch (_: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                            return null
-                        }
-                        try {
-                            val result = invokeChat()
-                            logger.info("LLM timeout retry $timeoutAttempt/$maxTimeoutRetries succeeded")
-                            return result
-                        } catch (retryError: LLMTimeoutException) {
-                            stats.lastError =
-                                "timeout; retry #$timeoutAttempt/$maxTimeoutRetries also timed out: ${retryError.message}"
-                            logger.warn("LLM timeout retry #$timeoutAttempt/$maxTimeoutRetries also timed out")
-                            // Continue the loop to try again.
-                        } catch (retryError: Exception) {
-                            // A different error on retry — fall
-                            // through to the compaction-hook path
-                            // below so the agent can try to recover
-                            // via context compaction.
-                            stats.lastError =
-                                "timeout; retry #$timeoutAttempt/$maxTimeoutRetries failed with different error: ${retryError.message}"
-                            logger.warn(
-                                "LLM timeout retry #$timeoutAttempt/$maxTimeoutRetries failed with different error: ${retryError.message}",
-                                retryError
-                            )
-                            break
-                        }
-                    }
-                    logger.warn("LLM timeout retries exhausted after $maxTimeoutRetries attempts; trying compaction hook as last resort")
-                    // Fall through to the compaction hook below —
-                    // if compaction succeeds it might help (e.g. the
-                    // provider was slow because of an oversized
-                    // context, not a network issue).
-                }
-
-                // ---- Compaction-hook retry path (original) ----------
-                val hook = onLLMErrorHook ?: return null
-
-                var errorAttempt = 0
-                while (errorAttempt < maxLLMErrorRetries) {
-                    errorAttempt++
+                // ---- One-shot recovery hook (context compaction) ----
+                // Call the hook ONCE on the first error.  The hook may
+                // compact memory (side effect).  Its return value is
+                // informational only — we always enter the unlimited
+                // retry loop below regardless, because long-running
+                // unattended agents must survive transient provider
+                // outages without manual intervention.
+                onLLMErrorHook?.let { hook ->
                     val currentTokens = memory.messages().sumOf { client.estimateTokenCount(it.content) }
                     val info = LLMErrorInfo(
                         exception = initialError,
-                        attempt = errorAttempt,
+                        attempt = 1,
                         totalCalls = stats.iterations + 1,
                         currentTokens = currentTokens,
                         stats = stats
                     )
-
                     logger.warn(
-                        "Invoking onLLMErrorHook (attempt $errorAttempt/$maxLLMErrorRetries, " +
-                            "currentTokens=$currentTokens): ${initialError.message}"
+                        "Invoking onLLMErrorHook (one-shot, currentTokens=$currentTokens): ${initialError.message}"
                     )
-
-                    val shouldRetry = try {
-                        hook(info)
-                    } catch (hookError: Exception) {
-                        stats.lastError = "${initialError.message}; recovery hook failed: ${hookError.message}"
-                        logger.warn("onLLMErrorHook threw: ${hookError.message}", hookError)
-                        return null
-                    }
-
-                    if (!shouldRetry) {
-                        logger.info("onLLMErrorHook declined retry on attempt $errorAttempt; propagating error.")
-                        return null
-                    }
-
-                    logger.info("onLLMErrorHook requested retry (attempt $errorAttempt/$maxLLMErrorRetries); retrying LLM chat.")
                     try {
-                        return invokeChat()
-                    } catch (retryError: Exception) {
-                        stats.lastError = "${initialError.message}; retry #$errorAttempt failed: ${retryError.message}"
-                        logger.warn("LLM chat retry #$errorAttempt failed: ${retryError.message}", retryError)
-                        // Fall through to call the hook again with the same original error.
+                        val shouldRetry = hook(info)
+                        if (!shouldRetry) {
+                            logger.info("onLLMErrorHook declined retry, but entering retry loop anyway (unlimited retries enabled).")
+                        }
+                    } catch (hookError: Exception) {
+                        logger.warn(
+                            "onLLMErrorHook threw: ${hookError.message} (continuing to retry loop)",
+                            hookError
+                        )
                     }
                 }
 
-                logger.warn("onLLMErrorHook retry budget exhausted after $maxLLMErrorRetries retries; giving up.")
-                null
+                // ---- Unlimited retry loop with exponential backoff ----
+                // Both timeouts and other errors trigger retries.  The
+                // backoff schedule grows roughly exponentially (30s →
+                // 1min → 2min → 5min → … → 6h), capping at 6h for
+                // truly prolonged outages.  The loop only exits on
+                // success, cancellation, or thread interruption.
+                var retryAttempt = 0
+                while (true) {
+                    // Check cancellation before sleeping
+                    cancellationReasonProvider?.invoke()?.let { reason ->
+                        stats.lastError = "Agent cancelled during LLM retry: $reason"
+                        logger.warn(stats.lastError)
+                        return null
+                    }
+
+                    val backoffMs = LLM_RETRY_BACKOFF_MS.getOrElse(retryAttempt) { LLM_RETRY_BACKOFF_MS.last() }
+                    retryAttempt++
+
+                    val backoffLabel = formatBackoffDuration(backoffMs)
+                    logger.warn(
+                        "LLM call failed (retry #$retryAttempt). " +
+                            "Retrying in $backoffLabel: ${initialError.message}"
+                    )
+
+                    try {
+                        Thread.sleep(backoffMs)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        stats.lastError = "LLM retry interrupted: ${initialError.message}"
+                        logger.warn(stats.lastError)
+                        return null
+                    }
+
+                    // Check cancellation again after sleeping — the
+                    // agent may have been cancelled during the wait.
+                    cancellationReasonProvider?.invoke()?.let { reason ->
+                        stats.lastError = "Agent cancelled during LLM retry backoff: $reason"
+                        logger.warn(stats.lastError)
+                        return null
+                    }
+
+                    try {
+                        val result = invokeChat()
+                        logger.info("LLM retry #$retryAttempt succeeded after $backoffLabel backoff")
+                        return result
+                    } catch (retryError: Exception) {
+                        stats.lastError = "${initialError.message}; retry #$retryAttempt failed: ${retryError.message}"
+                        logger.warn("LLM retry #$retryAttempt failed: ${retryError.message}", retryError)
+                        // Continue the loop for the next retry with longer backoff.
+                    }
+                }
+                // Unreachable — while(true) only exits via return inside the loop.
+                @Suppress("UNREACHABLE_CODE")
+                return null
             }
         } finally {
             clearTransientMessages()
@@ -424,17 +448,15 @@ class StrategyContext(
                 resultUuid = resultUuid,
                 stored = stored,
                 isError = isError,
-                dedupStrategy = tool?.let { t ->
-                    t.dedupStrategyResolver?.invoke(toolCall.arguments) ?: t.dedupStrategy
-                } ?: org.iotsplab.akiba.llm.tool.ToolDedupStrategy.RESULT_HASH,
+                dedupStrategy = tool.dedupStrategyResolver?.invoke(toolCall.arguments) ?: tool.dedupStrategy,
             )
         )
-        var result = ToolResultContext.formatCurrentResult(rawResult, resultUuid, stored)
-        duplicateDetection?.toObservationPrefix(toolCall.name)?.let { prefix ->
-            result = "$prefix\n\n$result"
-        }
 
         // Audit to database and store the retrievable result snapshot.
+        // Record FIRST — if this fails, we must NOT include result_uuid
+        // in the observation, otherwise the LLM would try
+        // read_history_tool_call and get a 404 (the UUID was never stored).
+        var resultStored = false
         if (auditToolCalls && sessionId != null && agentDbClient != null) {
             try {
                 agentDbClient.recordToolCall(
@@ -443,17 +465,29 @@ class StrategyContext(
                     toolName = toolCall.name,
                     toolArgs = toolCall.argumentsJson,
                     resultUuid = resultUuid,
-                    resultSummary = result.take(2000),
+                    resultSummary = rawResult.take(2000),
                     resultContent = stored.content,
                     resultOriginalBytes = stored.originalBytes,
                     resultStoredBytes = stored.storedBytes,
                     resultTruncated = stored.truncated,
                     resultSha256 = stored.sha256,
                     storagePolicy = stored.storagePolicy,
-                    success = !rawResult.startsWith("Tool '${toolCall.name}' execution error"),
+                    success = !isError,
                     durationMs = durationMs
                 )
+                resultStored = true
             } catch (_: Exception) {}
+        }
+
+        // Format the observation — only include result_uuid if the
+        // result was successfully stored and can be retrieved later.
+        var result = ToolResultContext.formatCurrentResult(
+            rawResult,
+            if (resultStored) resultUuid else null,
+            stored
+        )
+        duplicateDetection?.toObservationPrefix(toolCall.name)?.let { prefix ->
+            result = "$prefix\n\n$result"
         }
 
         // Auto-remember significant tool results
@@ -658,26 +692,11 @@ class ReActStrategy : AgentStrategy {
         /**
          * Maximum number of tool calls executed sequentially in a single
          * iteration before requesting another LLM round-trip. Defined in
-         * [AgentPrompts] (it is also referenced inside the ReAct instruction).
+         * [AgentConstants] (it is also referenced inside the ReAct instruction).
          */
-        const val MAX_BATCH_TOOL_CALLS: Int = AgentPrompts.MAX_BATCH_TOOL_CALLS
 
         /** The system prompt supplement that instructs the LLM to follow ReAct. */
         val REACT_INSTRUCTION: String get() = AgentPrompts.REACT_INSTRUCTION
-
-        /**
-         * When the duplicate detector flags [DUPLICATE_LOOP_FORCE_COMPACT_THRESHOLD]
-         * consecutive WARNING-level duplicate tool calls, the strategy
-         * forces a context compaction to break the loop.
-         */
-        const val DUPLICATE_LOOP_FORCE_COMPACT_THRESHOLD: Int = 5
-
-        /**
-         * Hard cap on the number of forced compactions within a single
-         * strategy run. Prevents an infinite compaction loop when the
-         * LLM keeps repeating even after compaction.
-         */
-        const val MAX_FORCED_COMPACTIONS: Int = 2
     }
 
     /**
@@ -710,7 +729,7 @@ class ReActStrategy : AgentStrategy {
         }
     }
 
-    override fun execute(ctx: StrategyContext): AgentResult {
+    override suspend fun execute(ctx: StrategyContext): AgentResult {
         val logger = ctx.logger
 
         logger.info("[ReAct] Harness: ${ctx.harness.name}")
@@ -722,6 +741,36 @@ class ReActStrategy : AgentStrategy {
         while (ctx.stats.iterations < ctx.maxIterations) {
             ctx.stats.iterations++
             logger.debug("[ReAct] iteration ${ctx.stats.iterations}/${ctx.maxIterations}")
+
+            // ---- User-requested pause ----
+            // Check before each LLM call.  If the user has paused the
+            // session, block here until they resume.  The previous
+            // iteration's LLM response has already been fully processed
+            // (tool calls executed, memory updated), so this is the
+            // correct boundary to wait.
+            //
+            // We use coroutine `delay` (not `Thread.sleep`) so the
+            // underlying coroutine Job can still be cancelled while
+            // the agent is paused — `delay` is a suspending function
+            // that checks for cancellation on every wake.
+            if (ctx.pauseCheckProvider?.invoke() == true) {
+                logger.info("[ReAct] Session paused by user; blocking before LLM call")
+                while (ctx.pauseCheckProvider?.invoke() == true) {
+                    if (ctx.cancellationReasonProvider?.invoke() != null) {
+                        logger.info("[ReAct] Cancelled while paused")
+                        return ctx.stats.toResult(
+                            output = "Agent cancelled while paused.",
+                            stopReason = StopReason.ERROR
+                        )
+                    }
+                    // `delay` is cooperative — if the coroutine Job is
+                    // cancelled (e.g. via runtime.cancel), the
+                    // CancellationException propagates here and up
+                    // through runChildJob.
+                    delay(500)
+                }
+                logger.info("[ReAct] Session resumed from pause")
+            }
 
             val beforeIteration = ctx.harness.beforeIteration(ctx)
             ctx.applyHarnessDirective(beforeIteration, "harness.beforeIteration")
@@ -828,6 +877,14 @@ class ReActStrategy : AgentStrategy {
 
                 // Cap the batch size so a single response can't blow through the
                 // iteration budget or overwhelm downstream tools.
+                // Built-in batch-size and same-tool pattern hint.
+                // Runs after the domain harness so it doesn't interfere
+                // with domain-specific blocking. The hint is added to
+                // memory before the observations, so the LLM sees it
+                // alongside the results in the next iteration.
+                val batchHint = batchToolCallHint(allToolCalls, MAX_BATCH_TOOL_CALLS)
+                ctx.applyHarnessDirective(batchHint, "react.batchHint")
+
                 val batch = allToolCalls.take(MAX_BATCH_TOOL_CALLS)
                 if (allToolCalls.size > MAX_BATCH_TOOL_CALLS) {
                     logger.warn("[ReAct] LLM emitted ${allToolCalls.size} tool calls in one response, " +
@@ -957,13 +1014,6 @@ class ReActStrategy : AgentStrategy {
                         ctx.transcript?.writeSessionEnd(standbyResult)
                         return compactAndReturn(ctx, standbyResult)
                     }
-                }
-
-                // If we capped the batch, hint to the LLM that some calls were dropped
-                if (allToolCalls.size > MAX_BATCH_TOOL_CALLS) {
-                    ctx.memory.addUserMessage(
-                        AgentPrompts.batchTruncatedNote(allToolCalls.size, MAX_BATCH_TOOL_CALLS)
-                    )
                 }
             } else {
                 // No tool call detected — `finalAnswerText` was computed
@@ -1192,7 +1242,7 @@ class PlanExecuteStrategy(
         val expected: String?
     )
 
-    override fun execute(ctx: StrategyContext): AgentResult {
+    override suspend fun execute(ctx: StrategyContext): AgentResult {
         val logger = ctx.logger
         var replanCycle = 0
 

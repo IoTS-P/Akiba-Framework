@@ -84,7 +84,7 @@ fun RunModuleTool(parent: AkibaModule): Tool = Tool(
             runBlocking {
                 // Resolve the program for the target binary
                 val targetProgram = if (targetId == parent.id) {
-                    parent.currentProgram ?: parent.getProgram(targetId)
+                    parent.program ?: parent.getProgram(targetId)
                 } else {
                     parent.getProgram(targetId)
                         ?: return@runBlocking run {

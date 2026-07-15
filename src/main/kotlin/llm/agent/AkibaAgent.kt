@@ -491,7 +491,7 @@ class AkibaAgent(
      * @param userInput The user's request / question.
      * @return The [AgentResult] containing the agent's final output.
      */
-    fun run(userInput: String): AgentResult {
+    suspend fun run(userInput: String): AgentResult {
         memory.addUserMessage(userInput)
         return executeWithStrategy()
     }
@@ -503,7 +503,7 @@ class AkibaAgent(
      * the strategy loop requires detecting tool-call chunks from the
      * stream and will be added in a future iteration.
      */
-    fun runStream(userInput: String): AgentResult {
+    suspend fun runStream(userInput: String): AgentResult {
         return run(userInput)
     }
 
@@ -511,7 +511,7 @@ class AkibaAgent(
      * Continue the conversation with a follow-up message, retaining
      * all previous context in memory.
      */
-    fun continueConversation(userInput: String): AgentResult {
+    suspend fun continueConversation(userInput: String): AgentResult {
         return run(userInput)
     }
 
@@ -760,6 +760,20 @@ class AkibaAgent(
             // effectively dead — the framework cannot guarantee
             // a clean resume after a tool-failure storm.
             true
+        stopReason == StopReason.STANDBY ->
+            // Explicit park (await_condition / "Enter standby mode."
+            // marker) is NEVER a terminating outcome, regardless of
+            // [onFinalAnswer].  A STANDBY+EXIT root that calls
+            // `await_condition` to wait for children must park, not
+            // close — only its real Final Answer (COMPLETED) should
+            // terminate.  Without this exemption, EXIT makes
+            // `await_condition` fire the termination hook and the
+            // session is closed instead of parked (breaking the
+            // multi-agent wait-for-children flow).  This also keeps
+            // the root consistent with child agents, whose state
+            // mapping (AgentRuntime.runChildJob) already exempts
+            // STANDBY before consulting onFinalAnswer.
+            false
         onFinalAnswer == FinalAnswerAction.EXIT ->
             // Explicit exit policy: hook fires regardless of
             // whether lifecycle is ONE_SHOT (default EXIT) or
@@ -816,7 +830,7 @@ class AkibaAgent(
 
     // ---- Internal --------------------------------------------------------
 
-    private fun executeWithStrategy(): AgentResult {
+    private suspend fun executeWithStrategy(): AgentResult {
         // Detect a STANDBY-resume run: the caller passed a
         // runtime-generated [AgentRuntime.STANDBY_RESUME_PROMPT_*]
         // marker as the user input.  We recognise the marker by
@@ -832,8 +846,8 @@ class AkibaAgent(
         val lastUserIdx = msgs.indexOfLast { it.role == "user" }
         val lastUserContent = if (lastUserIdx >= 0) msgs[lastUserIdx].content else null
         val isResumed = lastUserContent != null &&
-            lastUserContent.startsWith(AgentRuntime.STANDBY_RESUME_PROMPT_PREFIX) &&
-            lastUserContent.endsWith(AgentRuntime.STANDBY_RESUME_PROMPT_SUFFIX)
+            lastUserContent.startsWith(STANDBY_RESUME_PROMPT_PREFIX) &&
+            lastUserContent.endsWith(STANDBY_RESUME_PROMPT_SUFFIX)
         if (isResumed) {
             // Strip the synthetic resume marker from memory WITHOUT
             // clearing the entire conversation history.  The previous
@@ -880,10 +894,9 @@ class AkibaAgent(
                 // messages from other agents.  The conversation ID
                 // is derived from inReplyTo ?: messageId, matching
                 // the wake board's conv#<N> convention.
-                val SYSTEM_UUID = "00000000-0000-0000-0000-000000000000"
                 val parts = wakeSenders.map { msg ->
                     val convId = msg.inReplyToMessageId ?: msg.messageId
-                    if (msg.senderSessionId == SYSTEM_UUID) "system" else "conv#$convId"
+                    if (msg.senderSessionId == SYSTEM_SESSION_UUID) "system" else "conv#$convId"
                 }.distinct().take(5)
                 "Woken by ${parts.joinToString(", ")}"
             } else {
@@ -938,6 +951,9 @@ class AkibaAgent(
                 runtimeHandle?.takeIf { it.cancelRequested }
                     ?.requestedCancelReason
                     ?: runtimeHandle?.takeIf { it.cancelRequested }?.let { "cancelled" }
+            },
+            pauseCheckProvider = {
+                runtimeHandle?.pauseRequested == true
             },
         )
         // Initialise the fresh LoopStats with cumulative token counts
@@ -1080,14 +1096,26 @@ class AkibaAgent(
             summaryContent = "<previous_summary>\n$summaryContent\n</previous_summary>"
         }
 
-        // 6. Rebuild memory: original system messages → summary → kept rounds
+        // 6. Rebuild memory: original system messages → summary → tool call history → kept rounds
         memory.clear()
         systemMsgs.forEach { memory.add(it) }
         memory.addSystemMessage(summaryContent)
+
+        // 6a. Build a compact tool-call history from the compacted-away
+        // rounds so the LLM retains visibility into what tools it already
+        // called and with what arguments.  This prevents the LLM from
+        // repeating the same tool calls after compaction (e.g. re-running
+        // disassemble_function on a function it already analyzed).
+        val toolHistory = buildToolCallHistory(oldRounds)
+        if (toolHistory != null) {
+            memory.addSystemMessage(toolHistory)
+        }
+
         keptRounds.flatten().forEach { memory.add(it) }
 
         logger.info(
-            "Compacted context: summarised ${oldRounds.size} rounds into previous_summary, kept ${keptRounds.size} rounds."
+            "Compacted context: summarised ${oldRounds.size} rounds into previous_summary, kept ${keptRounds.size} rounds." +
+                if (toolHistory != null) " Injected tool_call_history." else ""
         )
         return true
     }
@@ -1117,8 +1145,58 @@ class AkibaAgent(
         return text.substring(start + startTag.length, end).trim()
     }
 
-    companion object {
-        /** Maximum length of a tool result before truncation. */
-        const val MAX_TOOL_RESULT_LENGTH = 8000
+    /**
+     * Maximum number of tool-call entries retained in the compact
+     * history injected after compaction.
+     */
+    private val maxToolHistoryEntries: Int = 30
+
+    /**
+     * Maximum byte length of the `args` field per tool-call entry.
+     * Arguments exceeding this are truncated with an ellipsis marker.
+     */
+    private val maxToolArgsBytes: Int = 1000
+
+    /**
+     * Build a compact system-message block listing the tool calls from
+     * the [oldRounds] being compacted away.  Each entry shows the tool
+     * name and its arguments (truncated to [maxToolArgsBytes] bytes).
+     * At most [maxToolHistoryEntries] entries are kept; if more exist,
+     * a hint is appended telling the LLM to use `read_history_tool_call`
+     * for older entries.
+     *
+     * Returns `null` when [oldRounds] contain no tool messages.
+     */
+    private fun buildToolCallHistory(oldRounds: List<List<AgentChatMessage>>): String? {
+        val toolMsgs = oldRounds.flatten()
+            .filter { it.role == "tool" && it.toolName != null }
+        if (toolMsgs.isEmpty()) return null
+
+        val entries = toolMsgs.takeLast(maxToolHistoryEntries)
+        val truncated = toolMsgs.size > maxToolHistoryEntries
+        val skippedCount = if (truncated) toolMsgs.size - maxToolHistoryEntries else 0
+
+        val lines = mutableListOf<String>()
+        lines.add("<tool_call_history>")
+        lines.add("The following tool calls were made before context compaction.")
+        lines.add("Use this list to avoid repeating calls you have already made.")
+        if (truncated) {
+            lines.add("($skippedCount older calls omitted — use `read_history_tool_call`/`search_history_tool_call` to query them.)")
+        }
+        lines.add("")
+        for (msg in entries) {
+            val name = msg.toolName ?: "unknown"
+            val args = msg.toolCallArgs ?: ""
+            val argsDisplay = if (args.length <= maxToolArgsBytes) {
+                args
+            } else {
+                args.substring(0, maxToolArgsBytes) + "…(truncated)"
+            }
+            lines.add("- $name($argsDisplay)")
+        }
+        lines.add("")
+        lines.add("If you need to see the full result of any of these calls, use the `read_history_tool_call`/`search_history_tool_call` tool.")
+        lines.add("</tool_call_history>")
+        return lines.joinToString("\n")
     }
 }

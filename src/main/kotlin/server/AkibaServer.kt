@@ -40,6 +40,8 @@ import org.iotsplab.akiba.server.routes.llmConfigRoutes
 import org.iotsplab.akiba.server.routes.runtimeConfigRoutes
 import org.iotsplab.akiba.server.routes.projectRoutes
 import org.iotsplab.akiba.server.routes.skillRoutes
+import org.iotsplab.akiba.server.routes.moduleRoutes
+import org.iotsplab.akiba.server.routes.updateRoutes
 import org.iotsplab.akiba.server.routes.DAEMON_USER
 import org.iotsplab.akiba.server.routes.DAEMON_PASSWORD
 import java.util.concurrent.atomic.AtomicBoolean
@@ -155,9 +157,11 @@ object AkibaServer {
                     queryRoutes(config.daemonHost, config.daemonPort)
                     agentRoutes(config.daemonHost, config.daemonPort)
                     skillRoutes()
+                    moduleRoutes()
                     projectRoutes(config.daemonHost, config.daemonPort)
                     llmConfigRoutes()
                     runtimeConfigRoutes()
+                    updateRoutes()
                 }
             }
         }.start(wait = true)

@@ -249,13 +249,34 @@ object ProcedureArgumentsDeserializer: JsonDeserializer<ProcedureArguments>() {
     }
 
     /**
-     * peekAllModules: Get main classes of all modules in /modules, but doesn't load them
+     * peekAllModules: Get main classes of all modules in /modules, but doesn't load them.
+     *
+     * Scans the top-level `modules/` directory for public jars **and** one
+     * level of subdirectories (`modules/<username>/`) for per-user private
+     * jars. This ensures privately uploaded modules are discoverable by the
+     * module resolver at workflow-execution time.
      */
     @Throws(IllegalStateException::class)
     fun peekAllModules() {
-        File("modules").listFiles { _, name ->
-            name.endsWith(".jar")
-        } ?.forEach { filename ->
+        val modulesDir = File("modules")
+        if (!modulesDir.exists() || !modulesDir.isDirectory) return
+
+        // Collect all .jar files: top-level (public) + one-level-deep (private)
+        val jarFiles = mutableListOf<File>()
+        modulesDir.listFiles { file ->
+            file.isFile && file.name.endsWith(".jar")
+        }?.let { jarFiles.addAll(it) }
+
+        // Scan subdirectories for private user modules
+        modulesDir.listFiles { file ->
+            file.isDirectory
+        }?.forEach { subDir ->
+            subDir.listFiles { file ->
+                file.isFile && file.name.endsWith(".jar")
+            }?.let { jarFiles.addAll(it) }
+        }
+
+        jarFiles.forEach { filename ->
             val jarFile = JarFile(filename)
             val mainClassAttr: String = (jarFile.manifest.mainAttributes.getValue("Main-Class")) ?: run {
                 globalLogger.warn("Jar file $filename don't have attribute `Main-Class`, skipped")
@@ -263,7 +284,7 @@ object ProcedureArgumentsDeserializer: JsonDeserializer<ProcedureArguments>() {
             }
             allModules.keys.firstOrNull {
                 it != mainClassAttr && it.split(".").last() == mainClassAttr.split(".").last()
-            } ?.let {
+            }?.let {
                 throw IllegalStateException("Conflicted module main class: $it, " +
                         "in ${allModules[it]} and $filename")
             }

@@ -497,7 +497,8 @@ object ConversationRegistry {
  */
 private val seenWakeCounter = ConcurrentHashMap<String, ConcurrentHashMap<Long, Int>>()
 
-private const val ESCALATE_AFTER_WAKES = 3
+// ESCALATE_AFTER_WAKES is defined in AgentConstants.kt (shared
+// policy value).
 
 private fun bumpSeenCount(sessionId: String, messageId: Long): Int {
     val sessionMap = seenWakeCounter.computeIfAbsent(sessionId) { ConcurrentHashMap() }
@@ -553,6 +554,7 @@ private fun clearSeenCount(sessionId: String, messageId: Long) {
  * `ack_agent_message messageId=<N>` for messages that need no
  * reply.
  */
+
 fun applyMailboxDrain(
     ctx: StrategyContext,
     mailboxService: AgentMailboxService?,
@@ -586,8 +588,48 @@ fun applyMailboxDrain(
     val pendingLimit = maxOf(maxMessages * 8, 100)
     val pendingMessages = mailboxService.listPending(sessionId, limit = pendingLimit)
         .filter { it.messageId !in newMessageIds }
+        .filter { it.kind != "user-hint" }  // user-hints are auto-acked, never pending
 
-    if (newMessages.isEmpty() && pendingMessages.isEmpty()) return AgentHarnessDirective.None
+    // 1b. Extract user-hint messages and deliver them directly as
+    //     user messages (transient or persistent), bypassing the
+    //     wake board.  User-hint messages are injected by the
+    //     frontend when the user types into the chat input during
+    //     an automated session.  They should appear as the LAST
+    //     user message before the LLM call — prominent, not buried
+    //     inside a wake board panel.  The `subject` field carries
+    //     the delivery mode: "[transient]" or "[persistent]".
+    //
+    //     Auto-ack these messages so they don't reappear in
+    //     [PENDING] on the next wake board.
+    val userHints = newMessages.filter { it.kind == "user-hint" }
+    val regularNew = newMessages.filter { it.kind != "user-hint" }
+    for (hint in userHints) {
+        val isTransient = hint.subject?.contains("[transient]", ignoreCase = true) == true
+        val body = hint.body
+        if (isTransient) {
+            ctx.addTransientUserMessage("[User hint] $body")
+            // Transient messages are not persisted to agent_messages,
+            // but we still record them in the transcript so they
+            // appear in the exported conversation record.
+            ctx.transcript?.writeUserMessage("[User hint] (transient) $body")
+        } else {
+            ctx.memory.addUserMessage("[User hint] $body")
+        }
+        // Auto-ack so the hint doesn't show up in [PENDING] later.
+        try {
+            mailboxService.ack(sessionId, hint.messageId)
+        } catch (_: Exception) {
+            // Best-effort: if ack fails, the hint will appear in
+            // [PENDING] on the next wake — annoying but not broken.
+        }
+    }
+
+    if (regularNew.isEmpty() && pendingMessages.isEmpty()) {
+        // Only user-hints were delivered (or nothing at all); no
+        // wake board to build.  Return None so the harness does not
+        // inject an empty panel.
+        return AgentHarnessDirective.None
+    }
 
     // 3. Route messages into conversation scratchpads + schedule.
     //    The agent's [ScratchpadRegistry] (accessed via the agent
@@ -601,7 +643,7 @@ fun applyMailboxDrain(
     //    isolation and resume hints).
     val registry = currentScratchpadRegistry.get()
     if (registry != null) {
-        for (m in newMessages) {
+        for (m in regularNew) {
             registry.addMessage(m)
         }
         for (m in pendingMessages) {
@@ -617,7 +659,7 @@ fun applyMailboxDrain(
     }
 
     // 4. Bump seen-count for new messages (they're now "seen")
-    for (m in newMessages) {
+    for (m in regularNew) {
         bumpSeenCount(sessionId, m.messageId)
     }
 
@@ -633,7 +675,7 @@ fun applyMailboxDrain(
     // 7. Build the panel + resume hint (if any)
     val panel = buildWakeBoard(
         sessionId = sessionId,
-        newMessages = newMessages,
+        newMessages = regularNew,
         pendingMessages = normalPending,
         escalatedMessages = escalated,
         maxSummaryChars = maxSummaryChars,
@@ -664,8 +706,8 @@ fun applyMailboxDrain(
     // 11. If backpressure is active, append a warning to the panel
     //     so the LLM knows it should prioritize clearing the backlog.
     val bpLevel = BackpressureTracker.pendingCount(sessionId)
-    val finalPanel = if (bpLevel >= BackpressureTracker.BACKPRESSURE_THRESHOLD) {
-        "$fullPanel\n\n[BACKPRESSURE] You have $bpLevel pending items (>= ${BackpressureTracker.BACKPRESSURE_THRESHOLD}). " +
+    val finalPanel = if (bpLevel >= BACKPRESSURE_THRESHOLD) {
+        "$fullPanel\n\n[BACKPRESSURE] You have $bpLevel pending items (>= $BACKPRESSURE_THRESHOLD). " +
             "New non-urgent messages to you are being REJECTED. Clear your backlog ASAP."
     } else fullPanel
 

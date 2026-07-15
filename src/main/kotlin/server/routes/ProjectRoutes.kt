@@ -16,14 +16,21 @@ import ghidra.util.task.ConsoleTaskMonitor
 import ghidra.util.task.TaskMonitor
 import io.ktor.http.*
 import io.ktor.server.application.*
+import io.ktor.http.content.PartData
+import io.ktor.http.content.forEachPart
+import io.ktor.http.content.streamProvider
+import io.ktor.server.request.receiveMultipart
 import io.ktor.server.request.receiveText
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
+import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.managers.GarImporter
 import org.iotsplab.akiba.managers.WorkspaceManager
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
@@ -168,6 +175,60 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
 
             call.respond(mapOf("projects" to result))
         } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    /**
+     * List the domain files (programs) inside a Ghidra project.
+     *
+     * Opens the project via `WorkspaceManager.openOrCreateInteractiveProject`,
+     * refreshes the project-data index from disk, and returns every domain
+     * file whose stored class is a `Program` implementation (e.g. `ProgramDB`).
+     *
+     * Used by the New Session modal so the user can pick which program to
+     * interact with — a single binary may exist in multiple projects with
+     * different analysis states.
+     */
+    get("/projects/{name}/programs") {
+        val projectName = call.parameters["name"]
+            ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
+        if (!isValidProjectName(projectName)) {
+            return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name: $projectName"))
+        }
+
+        val projectDirectory = call.currentUserGhidraProjectsRoot()
+        val grpFile = projectDirectory.resolve("$projectName.gpr")
+        val repFile = projectDirectory.resolve("$projectName.rep")
+        if (!grpFile.isRegularFile() || !repFile.isDirectory()) {
+            return@get call.respond(HttpStatusCode.NotFound, mapOf("error" to "Project '$projectName' not found"))
+        }
+
+        try {
+            WorkspaceManager.openOrCreateInteractiveProject(projectName, false, projectDirectory)
+            val project = WorkspaceManager.project
+
+            try {
+                project.projectData.refresh(true)
+            } catch (_: Exception) { /* best-effort */ }
+
+            val programs = mutableListOf<Map<String, Any?>>()
+            collectDomainFilesForListing(project.projectData.rootFolder).forEach { domainFile: DomainFile ->
+                val doc = domainFile.domainObjectClass
+                if (doc != null && Program::class.java.isAssignableFrom(doc)) {
+                    programs.add(mapOf(
+                        "name" to domainFile.name,
+                        "path" to domainFile.pathname,
+                    ))
+                }
+            }
+
+            WorkspaceManager.releaseActiveProject()
+
+            call.respond(mapOf("programs" to programs))
+        } catch (e: Exception) {
+            logger.error("[programs] failed to list programs in '$projectName': ${e.message}", e)
             val (status, body) = errorPayload(e)
             call.respond(status, body)
         }
@@ -341,8 +402,8 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                 mapOf("error" to "Invalid export_text request body: ${e.message ?: e.javaClass.simpleName}")
             )
         }
-        val opts = try {
-            buildProjectTextExportOptions(req)
+        try {
+            buildProjectTextExportOptions(req) // validate early
         } catch (e: IllegalArgumentException) {
             return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Invalid export option")))
         }
@@ -369,19 +430,137 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             )
         }
 
-        var openedHere = false
         try {
-            Files.createDirectories(projectDirectory)
-            logger.info("[text-export] opening project='$projectName' root='$projectDirectory'")
-            WorkspaceManager.openOrCreateInteractiveProject(projectName, createNew = false, projectDirectory = projectDirectory)
-            openedHere = true
+            // Spawn a child process to do the export.  The server JVM
+            // cannot reliably open projects created/modified by child
+            // processes (stale ProjectData index), so we delegate the
+            // entire export to a fresh `akiba --export` subprocess
+            // which opens the project the same way normal module
+            // execution does.
+            //
+            // Export options are passed via the config file's
+            // "textExport" section, which AkibaUtils parses as its
+            // module config (via @WithConfigClass).  This reuses the
+            // standard module-config pipeline — no environment
+            // variables needed.
+            val scriptPath = findAkibaScript()
+            val tempDir = Files.createTempDirectory("akiba_text_export_")
+            val configPath = tempDir.resolve("config.json")
+            val exportDir = tempDir.resolve("AkibaUtils").resolve("-1").resolve("export")
 
-            val bytes = ByteArrayOutputStream().use { out ->
-                ZipOutputStream(out).use { zip ->
-                    writeProjectTextExportZip(zip, projectName, opts, logger)
-                }
-                out.toByteArray()
+            // Build the config.  sqlSource.constraint = "server"
+            // triggers invokeServerMode() in ProgramManager, which
+            // creates AkibaUtils with the TextExportConfig from the
+            // "textExport" key and calls startProcess().  The subprocess
+            // runs as a normal workflow (no --export flag); after it
+            // finishes, this route collects the output files from
+            // exportDir and zips them.
+            val textExportSection = linkedMapOf<String, Any>(
+                "contents" to req.contents,
+                "includeComments" to req.includeComments,
+                "includeEolComment" to req.includeEolComment,
+                "includePlateComment" to req.includePlateComment,
+                "includePreComment" to req.includePreComment,
+                "includePostComment" to req.includePostComment,
+                "includeRepeatableComment" to req.includeRepeatableComment,
+                "includeDecompile" to req.includeDecompile,
+                "decompileTimeoutSec" to req.decompileTimeoutSec,
+                "includeData" to req.includeData,
+                "includeUndefined" to req.includeUndefined,
+                "maxFunctions" to req.maxFunctions,
+                "maxFunctionSize" to req.maxFunctionSize,
+                "sortBy" to req.sortBy,
+            )
+            req.functionFilter?.let { textExportSection["functionFilter"] = it }
+            req.addressFilter?.let {
+                textExportSection["addressFilter"] = mapOf(
+                    "start" to it.start,
+                    "end" to it.end,
+                )
             }
+
+            val config = linkedMapOf<String, Any>(
+                "main" to linkedMapOf<String, Any>(
+                    "username" to call.currentUsernameOrDefault(),
+                    "password" to DAEMON_PASSWORD,
+                    "usingInstance" to (call.instanceHeader() ?: "akiba-instance"),
+                    "general" to linkedMapOf<String, Any>(
+                        "workspaceRoot" to tempDir.toString()
+                    ),
+                    "withGhidraProject" to linkedMapOf<String, Any>(
+                        "projectRoot" to projectDirectory.toString(),
+                        "name" to projectName,
+                        "mode" to "base",
+                        "continueLog" to "text-export-${projectName}",
+                        "saveProject" to false,
+                        "noCreateProgram" to true
+                    ),
+                    "sqlSource" to linkedMapOf<String, Any>(
+                        "constraint" to "server",
+                        "serverIP" to daemonHost,
+                        "serverPort" to daemonPort
+                    ),
+                    "tasks" to listOf(
+                        linkedMapOf<String, Any>(
+                            "mainClassName" to "org.iotsplab.akiba.module.AkibaUtils",
+                            "configKey" to "@@/textExport"
+                        )
+                    ),
+                ),
+                "textExport" to textExportSection,
+            )
+            Files.writeString(configPath, projectTextExportMapper.writeValueAsString(config))
+
+            val env = mutableMapOf<String, String>()
+            env["AKIBA_LLM_API_KEY"] = System.getenv("AKIBA_LLM_API_KEY") ?: ""
+
+            logger.info("[text-export] spawning subprocess: $scriptPath -c ${configPath.fileName}@/main")
+
+            val pb = ProcessBuilder(
+                scriptPath,
+                "-c", configPath.toAbsolutePath().toString() + "@/main"
+            )
+            pb.directory(java.io.File(System.getProperty("user.dir", ".")))
+            pb.environment().clear()
+            pb.environment().putAll(env)
+            pb.redirectErrorStream(true)
+            val process = pb.start()
+
+            // Consume stdout to avoid buffer deadlock and log for debugging.
+            process.inputStream.bufferedReader().use { reader ->
+                var line: String?
+                while (reader.readLine().also { line = it } != null) {
+                    logger.info("[text-export subprocess] $line")
+                }
+            }
+
+            val exitCode = process.waitFor()
+            if (exitCode != 0) {
+                logger.error("[text-export] subprocess failed with exit code $exitCode")
+                val (http, body) = errorPayload(IllegalStateException("Export subprocess failed (exit code $exitCode)"))
+                call.respond(http, body)
+                return@post
+            }
+
+            // Collect export files produced by the subprocess and zip them.
+            if (!Files.exists(exportDir) ||
+                Files.list(exportDir).use { !it.findAny().isPresent }) {
+                logger.error("[text-export] subprocess exited 0 but no output in $exportDir")
+                val (http, body) = errorPayload(IllegalStateException(
+                    "Export subprocess succeeded but produced no output. " +
+                    "Check server logs for [text-export subprocess] lines."))
+                call.respond(http, body)
+                return@post
+            }
+
+            val zipBytes = ByteArrayOutputStream().use { baos ->
+                ZipOutputStream(baos).use { zip ->
+                    collectExportFiles(exportDir, exportDir, zip)
+                }
+                baos.toByteArray()
+            }
+            logger.info("[text-export] subprocess complete, zip size=${zipBytes.size} bytes")
+
             call.response.header(
                 HttpHeaders.ContentDisposition,
                 ContentDisposition.Attachment.withParameter(
@@ -389,16 +568,125 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                     "$projectName-export_text.zip"
                 ).toString()
             )
-            call.respondBytes(bytes, ContentType.Application.Zip)
+            call.respondBytes(zipBytes, ContentType.Application.Zip)
         } catch (e: Exception) {
             logger.error("[text-export] failed for project '$projectName': ${e.message}", e)
             val (http, body) = errorPayload(e)
             call.respond(http, body)
         } finally {
-            if (openedHere) {
-                WorkspaceManager.releaseActiveProject()
-            }
             projectTextExportLock.unlock()
+        }
+    }
+
+    /**
+     * Import a `.gar` (Ghidra Archive) as a standalone project.
+     *
+     * Multipart form: `file` = the .gar archive, `projectName` = optional
+     * name (defaults to the archive's base name). The archive is extracted
+     * under the caller's project directory, every program is registered in
+     * the `binaries` table (hash-deduped), and programs are renamed to
+     * `<id>-<originalName>` so existing `getProgram(id)` lookups keep
+     * working.
+     *
+     * Requires the `X-Akiba-Instance` header so a database session can be
+     * opened for binary registration. Auto-analysis is skipped — the `.gar`
+     * already carries the analysis state from the source machine.
+     */
+    post("/projects/import-gar") {
+        val instance = call.instanceHeader()
+            ?: return@post call.respond(
+                HttpStatusCode.BadRequest,
+                mapOf("error" to "Missing X-Akiba-Instance header")
+            )
+        val projectDirectory = call.currentUserGhidraProjectsRoot()
+        Files.createDirectories(projectDirectory)
+
+        var garTemp: Path? = null
+        var projectName: String? = null
+        val uploadDir = Files.createTempDirectory("akiba_gar_upload_")
+        try {
+            call.receiveMultipart().forEachPart { part ->
+                when (part) {
+                    is PartData.FileItem -> {
+                        val origName = part.originalFileName ?: "project.gar"
+                        val dest = uploadDir.resolve(origName)
+                        // streamProvider is deprecated in ktor 3.x in favour of
+                        // provider() (ByteReadChannel), but the InputStream form
+                        // is simpler for Files.copy and matches FileRoutes.
+                        // Suppressed locally rather than migrating the whole
+                        // upload path to ByteReadChannel.
+                        @Suppress("DEPRECATION")
+                        val input = part.streamProvider()
+                        input.use { ins ->
+                            Files.copy(ins, dest, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                        }
+                        if (garTemp == null) garTemp = dest
+                    }
+                    is PartData.FormItem -> {
+                        if (part.name == "projectName") {
+                            projectName = part.value.takeIf { it.isNotBlank() }
+                        }
+                    }
+                    else -> {}
+                }
+                part.dispose()
+            }
+            val garFile = garTemp
+                ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "No .gar file uploaded"))
+            if (!garFile.fileName.toString().endsWith(".gar")) {
+                return@post call.respond(
+                    HttpStatusCode.BadRequest,
+                    mapOf("error" to "Uploaded file must have a .gar extension")
+                )
+            }
+
+            val resolvedName = projectName ?: garFile.fileName.toString().removeSuffix(".gar")
+            if (!isValidProjectName(resolvedName)) {
+                return@post call.respond(
+                    HttpStatusCode.BadRequest,
+                    mapOf("error" to "Invalid project name: $resolvedName")
+                )
+            }
+
+            // binaryRoot mirrors WorkspaceManager.initBinaryPaths' auto-compute
+            // default so newly-imported binaries land next to those imported
+            // via the regular /files/import subprocess.
+            val username = call.currentSafeUsername()
+            val binaryRoot = Path.of(
+                System.getProperty("user.home"), ".akiba", "binaries", username, instance, "original"
+            )
+
+            val result = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                GarImporter.importGar(
+                    garFile = garFile,
+                    newProjectName = resolvedName,
+                    projectRoot = projectDirectory,
+                    dbClient = dbClient,
+                    binaryRoot = binaryRoot,
+                    logger = logger,
+                )
+            }
+
+            call.respond(mapOf(
+                "projectName" to result.projectName,
+                "projectPath" to result.projectPath.toString(),
+                "programs" to result.programs.map { p ->
+                    mapOf(
+                        "name" to p.domainFileName,
+                        "renamedTo" to p.renamedTo,
+                        "binaryId" to p.binaryId,
+                        "checksum" to p.checksum,
+                        "newlyImported" to p.newlyImported,
+                        "error" to p.error,
+                    )
+                },
+            ))
+        } catch (e: Exception) {
+            logger.error("[gar-import] failed: {}", e.message, e)
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        } finally {
+            try { uploadDir.toFile().deleteRecursively() } catch (_: Exception) {}
         }
     }
 }
@@ -531,6 +819,50 @@ private val FINISHED_SESSION_STATES = setOf("closed", "completed", "cancelled", 
 private fun isValidProjectName(name: String): Boolean =
     Regex("^[A-Za-z0-9._-]{1,64}$").matches(name) && !name.contains("..")
 
+/** Find the `bin/akiba` launch script (same logic as FileRoutes / WorkflowRoutes). */
+/** Recursively collect all files under [root] into [zip], preserving relative paths. */
+private fun collectExportFiles(root: Path, current: Path, zip: ZipOutputStream) {
+    if (!Files.exists(current)) return
+    Files.list(current).use { stream ->
+        stream.forEach { path ->
+            if (Files.isDirectory(path)) {
+                collectExportFiles(root, path, zip)
+            } else {
+                val relative = root.relativize(path).toString().replace('\\', '/')
+                zip.putNextEntry(ZipEntry(relative))
+                Files.copy(path, zip)
+                zip.closeEntry()
+            }
+        }
+    }
+}
+
+/** Recursively collect all domain files under a folder (for the programs listing endpoint). */
+private fun collectDomainFilesForListing(folder: DomainFolder): List<DomainFile> {
+    val out = mutableListOf<DomainFile>()
+    out += folder.files.toList()
+    folder.folders.forEach { out += collectDomainFilesForListing(it) }
+    return out
+}
+
+private fun findAkibaScript(): String {
+    try {
+        val source = org.iotsplab.akiba.Main::class.java.protectionDomain.codeSource
+        val loc = source.location.toURI()
+        val jarFile = File(loc)
+        if (jarFile.name.endsWith(".jar")) {
+            val distRoot = jarFile.parentFile.parentFile
+            val script = File(distRoot, "bin/akiba")
+            if (script.isFile) return script.absolutePath
+        }
+    } catch (_: Exception) { }
+    val cwd = System.getProperty("user.dir", ".")
+    for (candidate in listOf(File(cwd, "bin/akiba"), File(cwd, "../bin/akiba"))) {
+        if (candidate.isFile) return candidate.absolutePath
+    }
+    return "akiba"
+}
+
 private fun buildProjectTextExportOptions(req: ProjectTextExportRequest): ProjectTextExportOptions {
     require(req.format.lowercase() == "zip") { "format must be 'zip'" }
     val contents = req.contents.map { it.lowercase() }.toSet()
@@ -597,12 +929,30 @@ private fun projectTextExportStatus(
     daemonPort: Int,
     instance: String?,
 ): ProjectTextExportStatus {
+    // A Ghidra project on disk is a PAIR: `<name>.gpr` (the project
+    // marker / index file) and `<name>.rep/` (the actual content
+    // directory).  Both must be present for `GhidraProject.openProject`
+    // to succeed.  Checking only `.rep` (as the previous version did)
+    // lets a stale / half-deleted project pass the status gate, and
+    // `openOrCreateInteractiveProject` then falls through to
+    // `GhidraProject.createProject(...)` which creates a BRAND-NEW
+    // EMPTY project at the same path — producing an export zip that
+    // contains only manifest/index/README with zero programs.
     val repDir = projectDirectory.resolve("$projectName.rep")
-    if (!repDir.isDirectory()) {
+    val grpFile = projectDirectory.resolve("$projectName.gpr")
+    if (!repDir.isDirectory() || !Files.exists(grpFile)) {
         return ProjectTextExportStatus(
             projectName = projectName,
             projectExists = false,
             state = "project_not_found",
+            hints = if (repDir.isDirectory() && !Files.exists(grpFile)) {
+                listOf(
+                    "Project directory '$projectName.rep' exists but the marker file " +
+                        "'$projectName.gpr' is missing. Ghidra cannot open a project without " +
+                        "its .gpr file. Restore $projectName.gpr from backup or re-import the " +
+                        "binary into a new project."
+                )
+            } else emptyList(),
         )
     }
 
@@ -688,11 +1038,48 @@ private fun writeProjectTextExportZip(
 ) {
     val exportedAt = Instant.now().toString()
     val warnings = mutableListOf<String>()
+
+    // Force-refresh the project data index from disk.  Programs may
+    // have been added or modified by child processes (module
+    // subprocesses) after the server JVM last had the project open.
+    // Without a refresh, the in-memory DomainFolder index can be stale
+    // and report 0 domain files even though the .rep/ directory on
+    // disk contains program files — which is why .gar export (which
+    // reads .rep/ directly) works while text export produces an empty
+    // zip.  The boolean parameter requests a deep refresh (all
+    // subfolders recursively).
+    try {
+        WorkspaceManager.project.projectData.refresh(true)
+    } catch (e: Exception) {
+        logger.warn("[text-export] projectData.refresh() failed: ${e.message} (continuing with cached index)")
+    }
+
     val programs = collectDomainFiles(WorkspaceManager.project.projectData.rootFolder)
+
+    // Diagnostic: log how many domain files were found so the user can
+    // tell from the server logs whether the empty-export problem is
+    // "no files in project" (0 domain files) vs "files exist but all
+    // failed to open" (>0 domain files, 0 programs rendered).  The
+    // manifest.json also carries this count via programMeta.size, but
+    // the server log is what the user checks first when debugging.
+    logger.info(
+        "[text-export] project='$projectName' rootFolder='{}' domainFiles=${programs.size}"
+    )
+    if (programs.isEmpty()) {
+        logger.warn(
+            "[text-export] project '$projectName' has 0 domain files in its root folder. " +
+                "This means the opened Ghidra project is empty — either it was just created " +
+                "(no programs imported yet) or the .gpr file was missing and " +
+                "openOrCreateInteractiveProject created a new empty project. " +
+                "Check that the project at the expected directory actually contains programs."
+        )
+        warnings += "Project root folder contains 0 domain files — the opened project appears to be empty."
+    }
+
     val programMeta = mutableListOf<Map<String, Any?>>()
 
     for (domainFile in programs) {
-        val program = tryOpenProgram(domainFile) ?: run {
+        val program = tryOpenProgram(domainFile, logger) ?: run {
             warnings += "Skipped non-program or unreadable domain file: ${domainFile.pathname}"
             continue
         }
@@ -781,10 +1168,24 @@ private fun collectDomainFiles(folder: DomainFolder): List<DomainFile> {
     return out
 }
 
-private fun tryOpenProgram(domainFile: DomainFile): Program? = try {
+private fun tryOpenProgram(domainFile: DomainFile, logger: Logger): Program? = try {
     if (domainFile.domainObjectClass != Program::class.java) return null
-    WorkspaceManager.project.openProgram(domainFile.parent.pathname, domainFile.name, false)
-} catch (_: Exception) {
+    // okToUpgrade=true: the export is READ-ONLY, so it is always safe
+    // to auto-upgrade an older-format program into memory.  The
+    // previous `okToUpgrade=false` caused every program created by a
+    // different Ghidra build to throw VersionException, which was then
+    // silently swallowed by the catch below — producing an empty zip
+    // even when the project had plenty of programs on disk.
+    WorkspaceManager.project.openProgram(domainFile.parent.pathname, domainFile.name, true)
+} catch (e: Exception) {
+    // Log the actual failure so the user can tell from the manifest /
+    // server logs WHY a program was skipped, instead of just seeing
+    // "Skipped non-program or unreadable domain file" with no reason.
+    logger.warn(
+        "[text-export] failed to open domain file '${domainFile.pathname}' " +
+            "(class=${domainFile.domainObjectClass?.simpleName}): " +
+            "${e.javaClass.simpleName}: ${e.message}"
+    )
     null
 }
 

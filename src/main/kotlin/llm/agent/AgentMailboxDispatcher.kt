@@ -96,6 +96,7 @@ class AgentMailboxDispatcher(
             try {
                 val current = agentDbClient.getRuntimeState(sessionId) ?: continue
                 if (current.runtimeState == RuntimeState.MSGHANDLE.wire()) continue
+                if (current.runtimeState == RuntimeState.PAUSED.wire()) continue
                 if (current.runtimeState != RuntimeState.STANDBY.wire()) continue
                 if (current.lifecycle != Lifecycle.STANDBY.name.lowercase()) continue
 

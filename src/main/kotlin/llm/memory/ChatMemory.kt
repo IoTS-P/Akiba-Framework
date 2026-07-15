@@ -35,6 +35,7 @@ data class AgentChatMessage(
     val content: String,
     val toolCallId: String? = null,
     val toolName: String? = null,
+    val toolCallArgs: String? = null,
     val tokenCount: Int? = null,
     val inputTokenCount: Int? = null,
     val messageIndex: Int? = null,
@@ -79,7 +80,7 @@ interface ChatMemory : AutoCloseable {
         toolName: String,
         args: String? = null,
         result: String? = null
-    ) = add(AgentChatMessage(role = "tool", content = result ?: "", toolCallId = toolCallId, toolName = toolName))
+    ) = add(AgentChatMessage(role = "tool", content = result ?: "", toolCallId = toolCallId, toolName = toolName, toolCallArgs = args))
 
     /** Add a pre-built [AgentChatMessage]. */
     fun add(message: AgentChatMessage)
@@ -246,6 +247,7 @@ class PersistentChatMemory(
                         content = content,
                         toolCallId = msg.toolCallId,
                         toolName = msg.toolName,
+                        toolCallArgs = msg.toolCallArgs,
                         messageIndex = msg.messageIndex,
                     )
                 )
@@ -368,6 +370,7 @@ class PersistentChatMemory(
                 content = result ?: "",
                 toolCallId = toolCallId,
                 toolName = toolName,
+                toolCallArgs = args,
                 messageIndex = nextMessageIndex,
             )
         )

@@ -184,10 +184,21 @@ fun <T> withDaemonSession(
  * Translate a [DatabaseClient.DatabaseDaemonException] into a stable
  * `(HTTP status, error message)` pair. Falls back to 500 + the exception
  * message for unexpected errors.
+ *
+ * **Logs every exception** — previously this function swallowed the
+ * throwable silently, producing 500 responses with no backend log entry.
+ * Now unexpected errors (500) are logged at ERROR with the full stack
+ * trace, and database daemon errors are logged at WARN so they are
+ * visible without cluttering the error stream.
  */
 fun errorPayload(e: Throwable): Pair<HttpStatusCode, Map<String, String?>> {
     val msg = e.message ?: e.javaClass.simpleName
-    val status = (e as? DatabaseClient.DatabaseDaemonException)?.statusCode
-        ?: HttpStatusCode.InternalServerError
+    val dbEx = e as? DatabaseClient.DatabaseDaemonException
+    val status = dbEx?.statusCode ?: HttpStatusCode.InternalServerError
+    if (dbEx != null) {
+        logger.warn("Route error (HTTP ${status.value}): ${dbEx.message}", dbEx)
+    } else {
+        logger.error("Unexpected route error (HTTP 500): ${e.message}", e)
+    }
     return status to mapOf("error" to msg)
 }

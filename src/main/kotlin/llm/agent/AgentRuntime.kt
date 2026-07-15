@@ -581,6 +581,77 @@ class AgentRuntime(
      *         flight).  false when the hook denied it, the
      *         handle is gone, or the underlying Job threw.
      */
+    /**
+     * Pause a running agent session.
+     *
+     * Sets the [JobHandle.pauseRequested] flag and transitions the
+     * runtime state to [RuntimeState.PAUSED].  The agent loop checks
+     * the flag at the top of each iteration (after the current LLM
+     * response is fully processed) and blocks until [resume] is called.
+     *
+     * Only sessions in RUNNING or MSGHANDLE state can be paused.
+     * STANDBY, terminal, and already-paused sessions are rejected.
+     *
+     * @return `true` if the pause was applied, `false` if the session
+     *   was not found or not in a pausable state.
+     */
+    fun pause(sessionId: String): Boolean {
+        val handle = handles[sessionId] ?: return false
+        val current = handle.state.value
+        if (current != RuntimeState.RUNNING && current != RuntimeState.MSGHANDLE) {
+            logger.info("AgentRuntime.pause: $sessionId is in $current, not pausable")
+            return false
+        }
+        handle.markPauseRequested()
+        val outcome = transition(
+            handle = handle,
+            next = RuntimeState.PAUSED,
+            reason = "user_pause",
+            requesterSessionId = null,
+        )
+        if (!outcome.allowed) {
+            logger.warn("AgentRuntime.pause: transition denied for $sessionId: ${outcome.denyReason}")
+            // Roll back the pause flag since the state transition failed
+            handle.clearPauseRequested()
+            return false
+        }
+        logger.info("AgentRuntime.pause: $sessionId paused")
+        return true
+    }
+
+    /**
+     * Resume a paused agent session.
+     *
+     * Clears the [JobHandle.pauseRequested] flag and transitions the
+     * runtime state back to [RuntimeState.RUNNING].  The agent loop,
+     * which has been blocked in the pause-check wait loop, will detect
+     * the cleared flag on its next poll and resume execution.
+     *
+     * @return `true` if the resume was applied, `false` if the session
+     *   was not found or not in PAUSED state.
+     */
+    fun resume(sessionId: String): Boolean {
+        val handle = handles[sessionId] ?: return false
+        val current = handle.state.value
+        if (current != RuntimeState.PAUSED) {
+            logger.info("AgentRuntime.resume: $sessionId is in $current, not paused")
+            return false
+        }
+        handle.clearPauseRequested()
+        val outcome = transition(
+            handle = handle,
+            next = RuntimeState.RUNNING,
+            reason = "user_resume",
+            requesterSessionId = null,
+        )
+        if (!outcome.allowed) {
+            logger.warn("AgentRuntime.resume: transition denied for $sessionId: ${outcome.denyReason}")
+            return false
+        }
+        logger.info("AgentRuntime.resume: $sessionId resumed")
+        return true
+    }
+
     suspend fun cancel(
         sessionId: String,
         callerSessionId: String? = null,
@@ -836,6 +907,80 @@ class AgentRuntime(
     }
 
     /**
+     * Resume a CLOSED or ERROR session for user-injection.
+     *
+     * Unlike [resumeStandby] (which only works for STANDBY), this
+     * method restarts a session that has already terminated — either
+     * cleanly (CLOSED) or due to a failure (ERROR).  The user sends a
+     * hint message via the frontend; the runtime transitions the
+     * session back to RUNNING and launches a fresh agent.run() so the
+     * LLM sees the user's hint and can act on it.
+     *
+     * The [RuntimeState.canTransition] rule was updated to allow
+     * `CLOSED → RUNNING` and `ERROR → RUNNING` specifically for this
+     * path.  The factory must still be registered in [spawnEntries]
+     * (i.e. the session was originally spawned in this JVM); cross-
+     * process resume is not supported.
+     *
+     * The [userMessage] is NOT passed as the task prompt — instead,
+     * it is delivered via the mailbox (`kind="user-hint"`) so
+     * [applyMailboxDrain] picks it up in `beforeIteration` and
+     * injects it into the LLM context at the right position.  The
+     * task prompt is a short resume marker that tells the agent
+     * "you were restarted because the user sent a hint; check your
+     * mailbox".
+     *
+     * @return the new coroutine [Job], or `null` if the session
+     *   cannot be resumed (not registered, or not in a terminal
+     *   state).
+     */
+    fun resumeForUserInjection(
+        sessionId: String,
+    ): Job? {
+        val entry = spawnEntries[sessionId]
+            ?: run {
+                logger.warn(
+                    "AgentRuntime.resumeForUserInjection: $sessionId is not registered in this runtime " +
+                        "(cross-process resume is not supported)"
+                )
+                return null
+            }
+        val handle = entry.handle
+        val currentState = handle.state.value
+        require(currentState == RuntimeState.CLOSED || currentState == RuntimeState.ERROR) {
+            "AgentRuntime.resumeForUserInjection: $sessionId is not in a terminal state " +
+                "(current=$currentState; expected CLOSED or ERROR)"
+        }
+
+        // Transition terminal → RUNNING directly.  The canTransition
+        // rule allows this specifically for user-injection resume.
+        // Both CLOSED and ERROR skip the MSGHANDLE intermediate
+        // state because there is no "mailbox handling" phase — the
+        // agent is being fully restarted.
+        transition(
+            handle = handle,
+            next = RuntimeState.RUNNING,
+            reason = "user_injection_resume",
+            requesterSessionId = null,
+        )
+
+        val resumePrompt = "[[AKIBA_INTERNAL:USER_INJECTION_RESUME:${java.util.UUID.randomUUID()}]]"
+
+        val newJob = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+            runChildJob(sessionId, resumePrompt, entry.factory, coldStart = false)
+        }
+        handle.swapJob(newJob)
+        scheduler.register(handle) { admitted ->
+            admitted.coroutineJob.start()
+        }
+        logger.info(
+            "AgentRuntime.resumeForUserInjection: $sessionId resumed from $currentState " +
+                "on a fresh Job (user-injection)"
+        )
+        return newJob
+    }
+
+    /**
      * Return the recorded outcome of the last [transition] call
      * targeting [sessionId], or null if the runtime has not
      * driven a transition for it yet.
@@ -1044,15 +1189,13 @@ class AgentRuntime(
                 // conversation, and close_conversation fails with
                 // "caller is not a participant".
                 //
-                // Use the well-known system UUID (matching the daemon's
-                // SYSTEM_SESSION_UUID) so the participant entry is a
-                // valid session id — the string "system" would be
-                // rejected by the daemon if close_conversation tried
-                // to send a closure notification to it.
-                val systemUuid = "00000000-0000-0000-0000-000000000000"
+                // Use the well-known system UUID so the participant entry
+                // is a valid session id — the string "system" would be
+                // rejected by the daemon if close_conversation tried to
+                // send a closure notification to it.
                 ConversationRegistry.register(
                     messageId = msgId,
-                    senderSessionId = systemUuid,
+                    senderSessionId = SYSTEM_SESSION_UUID,
                     recipientSessionId = recipient,
                     inReplyTo = null,
                 )
@@ -1110,10 +1253,10 @@ class AgentRuntime(
          * NOT by exact equality — so a user that happens to type
          * the old fixed prompt will not be mis-classified as a
          * resume.
+         *
+         * The prefix / suffix constants live in [AgentConstants]
+         * (shared with [AkibaAgent] which detects the marker).
          */
-        const val STANDBY_RESUME_PROMPT_PREFIX: String =
-            "[[AKIBA_INTERNAL:STANDBY_RESUME:"
-        const val STANDBY_RESUME_PROMPT_SUFFIX: String = "]]"
 
         /**
          * Build a fresh synthetic resume marker.  Format:

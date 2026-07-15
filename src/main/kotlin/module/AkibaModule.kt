@@ -108,7 +108,7 @@ abstract class AkibaModule (
     private val configPath: String? = null,
     private val defaultConfig: Any? = null,
     val id: Int = -1,
-    protected val program: Program? = null,
+    var program: Program? = null,
     protected val properties: Map<String, String?> = mapOf(),
     consoleLogLevel: Level = Level.INFO,
     fileLogLevel: Level = Level.INFO,
@@ -236,15 +236,6 @@ abstract class AkibaModule (
             stream.map { it.fileName.toString() }.toList()
         }
     }
-
-    /**
-     * Public read-only accessor for this module's [program].
-     *
-     * Use this when code outside the module hierarchy (e.g. built-in
-     * tools) needs to inspect the current program but should not be
-     * granted `protected` access.
-     */
-    val currentProgram: Program? get() = program
 
     /**
      * Resolve the Ghidra [Program] for a given binary [targetId].

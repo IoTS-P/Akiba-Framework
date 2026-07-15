@@ -302,11 +302,8 @@ object WakeConditionRegistry {
 object BackpressureTracker {
     private val logger = LogManager.getLogger("BackpressureTracker")
 
-    /** Max pending (seen, not handled) messages before backpressure kicks in. */
-    const val BACKPRESSURE_THRESHOLD = 20
-
-    /** Messages with priority >= this bypass backpressure (emergencies). */
-    const val URGENT_PRIORITY_THRESHOLD = 8
+    // Thresholds are defined in AgentConstants.kt (shared with
+    // AgentMailboxService.kt's wake-board rendering).
 
     // sessionId → pending count (updated by applyMailboxDrain)
     private val pendingCounts = ConcurrentHashMap<String, Int>()

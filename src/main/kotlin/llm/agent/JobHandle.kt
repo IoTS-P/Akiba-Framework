@@ -124,6 +124,22 @@ class JobHandle internal constructor(
     val cancelRequested: Boolean get() = cancelRequestedAtMs != null
     val requestedCancelReason: String? get() = cancelReason
 
+    @Volatile private var _pauseRequested: Boolean = false
+
+    /** True when the user has requested this session to be paused. */
+    val pauseRequested: Boolean get() = _pauseRequested
+
+    /** Mark this handle as paused. The strategy loop will block at the
+     *  next iteration boundary until [clearPauseRequested] is called. */
+    internal fun markPauseRequested() {
+        _pauseRequested = true
+    }
+
+    /** Clear the pause flag so the strategy loop can resume. */
+    internal fun clearPauseRequested() {
+        _pauseRequested = false
+    }
+
     /** Underlying coroutine Job. */
     val coroutineJob: Job get() = job
 
@@ -138,6 +154,7 @@ class JobHandle internal constructor(
     internal fun swapJob(newJob: Job) {
         cancelRequestedAtMs = null
         cancelReason = null
+        _pauseRequested = false
         job = newJob
     }
 

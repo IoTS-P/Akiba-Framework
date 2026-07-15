@@ -2,8 +2,13 @@ package org.iotsplab.akiba.llm.tool
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import kotlinx.coroutines.*
-import org.iotsplab.akiba.module.AkibaModule
+import org.iotsplab.akiba.llm.agent.AgentModule
 import java.io.InputStream
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
 
 /**
  * Create a tool that allows the agent to execute shell commands.
@@ -43,7 +48,7 @@ import java.io.InputStream
  *        discarded.
  */
 fun RunShellTool(
-    parent: AkibaModule,
+    parent: AgentModule,
     requireConfirmation: Boolean = true,
     maxOutputChars: Int = 8000
 ): Tool = Tool(
@@ -63,7 +68,7 @@ fun RunShellTool(
         appendLine("Constraints:")
         appendLine("  - Each command requires user confirmation (execution may be denied)")
         appendLine("  - The workspace directory is EMPTY by default — no binary files are in it")
-        appendLine("  - The loaded binary is accessible ONLY via `currentProgram` in run_script")
+        appendLine("  - The loaded binary is accessible ONLY via `program` in run_script")
         appendLine("  - Do NOT use shell for: objdump, readelf, strings, nm — use run_script instead,")
         appendLine("    which has direct access to the same information via Ghidra APIs")
     },
@@ -106,35 +111,81 @@ fun RunShellTool(
         parent.workspaceDir.toFile()
     }
 
-    // User confirmation gate
+    // ---- User confirmation gate ----
+    //
+    // When [requireConfirmation] is true the tool blocks until the user
+    // approves or denies the command. Three backends are supported:
+    //
+    // 1. HTTP callback (when running in a separate worker process):
+    //    The worker POSTs to `POST /agent/internal/confirmation/request`
+    //    on the server and blocks on the HTTP response (long-poll). The
+    //    server registers the request in [ConfirmationManager] (visible to
+    //    the frontend) and suspends until the user responds via
+    //    `POST .../confirmation/respond`.
+    //
+    // 2. In-process (when running in the same process as the server):
+    //    The request is registered in [ConfirmationManager] directly and
+    //    the tool thread blocks on a CompletableDeferred (with a 5-minute
+    //    timeout) until the user responds.
+    //
+    // 3. Stdin fallback (when no session ID is available — e.g. CLI mode):
+    //    The classic y/N prompt on System.in. Used in development / testing.
+    //
     if (requireConfirmation) {
-        System.err.println()
-        System.err.println("┌─────────────────────────────────────────────────────────")
-        System.err.println("│ [run_shell] Agent wants to execute:")
-        System.err.println("│   Command: $command")
-        System.err.println("│   CWD:     ${cwd.absolutePath}")
-        System.err.println("│   Timeout: ${timeout}s")
-        System.err.println("├─────────────────────────────────────────────────────────")
-        System.err.print("│ Allow execution? [y/N]: ")
-        System.err.flush()
+        val sessionId = parent.agentSessionId
+        // Detect worker mode: the server passes its port via env var
+        // (see AgentRoutes.runManualAgentWorker).
+        val serverPort = System.getenv("AKIBA_MANUAL_AGENT_SERVER_PORT")?.toIntOrNull()
 
-        val response = try {
-            System.`in`.bufferedReader().readLine()?.trim()?.lowercase()
-        } catch (_: Exception) {
-            null
+        val approved = when {
+            // Cross-process: worker → HTTP long-poll → server → ConfirmationManager
+            !sessionId.isNullOrBlank() && serverPort != null -> {
+                requestConfirmationViaHttp(
+                    serverPort = serverPort,
+                    sessionId = sessionId,
+                    command = command,
+                    workingDirectory = cwd.absolutePath,
+                    timeout = timeout
+                )
+            }
+            // In-process: tool and HTTP server share the same JVM
+            !sessionId.isNullOrBlank() -> {
+                ConfirmationManager.requestConfirmationBlocking(
+                    sessionId = sessionId,
+                    toolName = "run_shell",
+                    command = command,
+                    workingDirectory = cwd.absolutePath,
+                    timeout = timeout
+                )
+            }
+            // Stdin fallback for CLI / dev mode
+            else -> {
+                System.err.println()
+                System.err.println("┌─────────────────────────────────────────────────────────")
+                System.err.println("│ [run_shell] Agent wants to execute:")
+                System.err.println("│   Command: $command")
+                System.err.println("│   CWD:     ${cwd.absolutePath}")
+                System.err.println("│   Timeout: ${timeout}s")
+                System.err.println("├─────────────────────────────────────────────────────────")
+                System.err.print("│ Allow execution? [y/N]: ")
+                System.err.flush()
+
+                val response = try {
+                    System.`in`.bufferedReader().readLine()?.trim()?.lowercase()
+                } catch (_: Exception) {
+                    null
+                }
+                response == "y" || response == "yes"
+            }
         }
 
-        if (response != "y" && response != "yes") {
-            System.err.println("│ ✗ Denied by user.")
-            System.err.println("└─────────────────────────────────────────────────────────")
+        if (!approved) {
             return@Tool mapper.writeValueAsString(mapOf(
                 "denied" to true,
                 "message" to "Command execution denied by user.",
                 "command" to command
             ))
         }
-        System.err.println("│ ✓ Approved.")
-        System.err.println("└─────────────────────────────────────────────────────────")
     }
 
     // Execute the command inside a coroutine scope that:
@@ -246,4 +297,57 @@ private fun drainStream(stream: InputStream, maxChars: Int): Pair<String, Boolea
         // Stream closed or IO error — expected during process kill / cancellation.
     }
     return buffer.toString() to truncated
+}
+
+/**
+ * Request user confirmation via HTTP callback to the AkibaServer.
+ *
+ * Used when the tool executes in a **separate worker process** (manual-agent
+ * mode). The worker cannot access the server's in-process [ConfirmationManager]
+ * directly, so it POSTs to the server's `POST /agent/internal/confirmation/request`
+ * endpoint. The server registers the pending request in [ConfirmationManager]
+ * (making it visible to the frontend via `GET /agent/sessions/{id}`) and
+ * **blocks the HTTP response** until the user responds via
+ * `POST .../confirmation/respond` (or the 5-minute confirmation timeout expires).
+ *
+ * This is a **long-poll** pattern: the HTTP client's timeout is set to 6 minutes
+ * (1 minute longer than the server-side confirmation timeout) to ensure the
+ * client doesn't time out before the server.
+ *
+ * @return `true` if the user approved, `false` if denied, timed out, or the
+ *         HTTP call failed.
+ */
+private fun requestConfirmationViaHttp(
+    serverPort: Int,
+    sessionId: String,
+    command: String,
+    workingDirectory: String,
+    timeout: Int
+): Boolean {
+    val mapper = jacksonObjectMapper()
+    val body = mapper.writeValueAsString(mapOf(
+        "sessionId" to sessionId,
+        "toolName" to "run_shell",
+        "command" to command,
+        "workingDirectory" to workingDirectory,
+        "timeout" to timeout
+    ))
+    return try {
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create("http://127.0.0.1:$serverPort/api/agent/internal/confirmation/request"))
+            .timeout(Duration.ofMinutes(6))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .build()
+        val response = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .build()
+            .send(request, HttpResponse.BodyHandlers.ofString())
+        if (response.statusCode() !in 200..299) return false
+        val result = mapper.readValue(response.body(), Map::class.java)
+        result["approved"] == true
+    } catch (_: Exception) {
+        // Network error, timeout, or parse failure — deny by default.
+        false
+    }
 }

@@ -13,6 +13,7 @@ import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.data.database.AgentDatabaseClient.SessionInfo
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.llm.agent.AgentMailboxService
+import org.iotsplab.akiba.llm.tool.ConfirmationManager
 import org.iotsplab.akiba.llm.agent.AgentPrompts
 import org.iotsplab.akiba.llm.agent.ModelContextLengthService
 import org.iotsplab.akiba.llm.agent.akibaAgent
@@ -21,6 +22,7 @@ import org.iotsplab.akiba.llm.client.LLMProvider
 import org.iotsplab.akiba.llm.config.LLMKeyFileStore
 import org.iotsplab.akiba.llm.memory.persistentChatMemory
 import org.iotsplab.akiba.llm.agent.AgentModule
+import org.iotsplab.akiba.llm.agent.SYSTEM_SESSION_UUID
 import org.iotsplab.akiba.llm.tool.BuiltInTools
 import org.iotsplab.akiba.llm.tool.ListModulesTool
 import org.iotsplab.akiba.llm.tool.QueryGhidraAPITool
@@ -49,6 +51,14 @@ data class CreateAgentSessionRequest(
     val binaryId: Int? = null,
     val projectName: String? = null,
     val projectMode: String? = null,
+    /**
+     * Name of a specific program (domain file) within the Ghidra project.
+     * When set together with [projectName] but without [binaryId], the
+     * session is created against an existing project+program without
+     * importing a new binary.  The first chat turn will open this program
+     * directly instead of calling `ensureProgramForBinary`.
+     */
+    val programName: String? = null,
     /** Parent session id (set by `spawn_sub_agent` when spawning children). */
     val parentSessionId: String? = null
 )
@@ -87,6 +97,40 @@ data class AgentSessionResponse(
     val closingReason: String? = null,
     /** Convenience alias for error displays. */
     val errorMessage: String? = null,
+    /**
+     * Pending human-confirmation request for this session, if any.
+     *
+     * Populated from [ConfirmationManager] when a tool (e.g. `run_shell`)
+     * is blocked waiting for the user to approve/deny an action. The
+     * frontend detects this via the existing session status poll and
+     * shows a confirmation modal. `null` when no confirmation is pending.
+     */
+    val pendingConfirmation: PendingConfirmationDto? = null,
+)
+
+/** Wire DTO for a pending confirmation request (see [ConfirmationManager]). */
+data class PendingConfirmationDto(
+    val requestId: String,
+    val toolName: String,
+    val command: String,
+    val workingDirectory: String,
+    val timeout: Int,
+    val createdAt: Long
+)
+
+/** Request body for `POST /agent/sessions/{id}/confirmation/respond`. */
+data class ConfirmationRespondRequest(
+    /** Whether the user approved the action. */
+    val approved: Boolean
+)
+
+/** Request body for `POST /agent/internal/confirmation/request` (worker → server). */
+data class InternalConfirmationRequest(
+    val sessionId: String,
+    val toolName: String,
+    val command: String,
+    val workingDirectory: String,
+    val timeout: Int
 )
 
 data class AgentMessageResponse(
@@ -106,6 +150,25 @@ data class ChatRequest(
     val systemPrompt: String? = null
 )
 
+/**
+ * Body of `POST /api/agent/sessions/{id}/inject`.
+ *
+ * Injects a user hint into a running, standby, closed, or error
+ * session via the mailbox system.  The message is delivered to the
+ * LLM as the last user message before the next LLM call.
+ */
+data class InjectRequest(
+    /** The user's hint / guidance message. */
+    val message: String,
+    /**
+     * If true, the message is delivered as a TRANSIENT user message
+     * (visible to the current LLM call but NOT persisted to chat
+     * history or compaction summaries).  If false, the message is
+     * persisted as a regular user message.
+     */
+    val transient: Boolean = false,
+)
+
 data class ManualAgentStartRequest(
     val token: String
 )
@@ -114,14 +177,16 @@ data class ManualAgentStartResponse(
     val sessionId: String,
     val content: String,
     val systemPrompt: String,
-    val username: String
+    val username: String,
+    val programName: String? = null
 )
 
 private data class ManualAgentTurnJob(
     val sessionId: String,
     val content: String,
     val systemPrompt: String,
-    val username: String
+    val username: String,
+    val programName: String? = null
 )
 
 private data class ManualAgentWorkerConfig(
@@ -259,8 +324,30 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             sessionId = job.sessionId,
             content = job.content,
             systemPrompt = job.systemPrompt,
-            username = job.username
+            username = job.username,
+            programName = job.programName
         ))
+    }
+
+    // ------ Internal: tool confirmation request (cross-process long-poll) ---
+    //
+    // Called by worker processes when a tool (e.g. run_shell) requires
+    // user confirmation. The worker makes an HTTP POST to this endpoint
+    // and blocks until the user responds (or the 5-minute timeout
+    // expires). The server registers the pending request in
+    // [ConfirmationManager] (visible to the frontend via
+    // `GET /agent/sessions/{id}`), then suspends until
+    // `POST /agent/sessions/{id}/confirmation/respond` arrives.
+    post("/agent/internal/confirmation/request") {
+        val req = call.receive<InternalConfirmationRequest>()
+        val approved = ConfirmationManager.requestConfirmation(
+            sessionId = req.sessionId,
+            toolName = req.toolName,
+            command = req.command,
+            workingDirectory = req.workingDirectory,
+            timeout = req.timeout
+        )
+        call.respond(mapOf("approved" to approved))
     }
 
     // ------ List sessions -----------------------------------------------------
@@ -287,7 +374,9 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     parentSessionId = parentSessionId
                 )
             }
-            call.respond(mapOf("sessions" to sessions.map { it.toResponse() }))
+            call.respond(mapOf("sessions" to sessions
+                .filter { it.sessionId != SYSTEM_SESSION_UUID }
+                .map { it.toResponse() }))
         } catch (e: Exception) {
             val (status, body) = errorPayload(e)
             call.respond(status, body)
@@ -306,7 +395,9 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             val children = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 AgentDatabaseClient(dbClient).getSessionChildren(id)
             }
-            call.respond(mapOf("children" to children.map { it.toResponse() }))
+            call.respond(mapOf("children" to children
+                .filter { it.sessionId != SYSTEM_SESSION_UUID }
+                .map { it.toResponse() }))
         } catch (e: Exception) {
             val (status, body) = errorPayload(e)
             call.respond(status, body)
@@ -333,7 +424,20 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             val info = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 AgentDatabaseClient(dbClient).getSession(id)
             }
-            call.respond(info.toResponse())
+            // Attach any pending human-confirmation request from the
+            // in-process ConfirmationManager so the frontend can detect
+            // it via the existing status poll without a separate endpoint.
+            val pendingConf = ConfirmationManager.getPending(id)?.let { pc ->
+                PendingConfirmationDto(
+                    requestId = pc.requestId,
+                    toolName = pc.toolName,
+                    command = pc.command,
+                    workingDirectory = pc.workingDirectory,
+                    timeout = pc.timeout,
+                    createdAt = pc.createdAt
+                )
+            }
+            call.respond(info.toResponse(pendingConf))
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             // 404 from the daemon (session not found) — surface as 404
             if (e.statusCode == HttpStatusCode.NotFound) {
@@ -357,15 +461,36 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         try {
             val info = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
-                val resolvedProjectName = req.binaryId?.let { binaryId ->
+
+                // Determine the project name and whether to create a new project.
+                //
+                // Path A: binaryId is provided → legacy flow: import binary
+                //         into a (possibly new) project on first chat turn.
+                // Path B: projectName + programName provided (no binaryId) →
+                //         open an existing project and use the specified
+                //         program directly.  No binary import needed.
+                val resolvedProjectName: String?
+                val createNewProject: Boolean
+
+                if (req.binaryId != null) {
                     val name = req.projectName?.takeIf { it.isNotBlank() }
-                        ?: "agent-${binaryId}-${System.currentTimeMillis()}"
-                    val createNew = req.projectMode != "existing"
-                    // Only bind/open the project here. Importing and auto-analyzing the
-                    // binary can take a long time, so defer that to the first chat turn.
-                    WorkspaceManager.openOrCreateInteractiveProject(name, createNew, projectDirectory)
-                    name
+                        ?: "agent-${req.binaryId}-${System.currentTimeMillis()}"
+                    resolvedProjectName = name
+                    createNewProject = req.projectMode != "existing"
+                    WorkspaceManager.openOrCreateInteractiveProject(name, createNewProject, projectDirectory)
+                } else if (req.projectName != null && req.projectName.isNotBlank()) {
+                    resolvedProjectName = req.projectName
+                    createNewProject = req.projectMode == "new"
+                    // Open the existing project so the first chat turn can
+                    // access the requested program.
+                    WorkspaceManager.openOrCreateInteractiveProject(
+                        req.projectName, createNewProject, projectDirectory
+                    )
+                } else {
+                    resolvedProjectName = null
+                    createNewProject = false
                 }
+
                 val sessionId = agentDbClient.createSession(
                     sessionName = req.sessionName ?: "Chat ${System.currentTimeMillis()}",
                     binaryId = req.binaryId,
@@ -611,8 +736,19 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             }
 
             val token = UUID.randomUUID().toString()
+            // For project-based sessions (no binaryId), try to find the
+            // program name in the project so the manual agent worker
+            // can open it.  This is a best-effort lookup — if it fails,
+            // the worker will try to auto-open the first program.
+            var programName: String? = null
+            if (sessionInfo.binaryId == null && sessionInfo.projectName != null) {
+                programName = try {
+                    findFirstProgramName(sessionInfo.projectName, call.currentUserGhidraProjectsRoot())
+                } catch (_: Exception) { null }
+            }
             ManualAgentTurnRegistry.put(token, ManualAgentTurnJob(
-                id, req.content, systemPrompt, call.currentUsernameOrDefault()
+                id, req.content, systemPrompt, call.currentUsernameOrDefault(),
+                programName
             ))
 
             val workerConfig = createManualAgentConfig(
@@ -680,6 +816,254 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         }
     }
 
+    // ------ Inject a user hint into a running/standby/closed/error session --
+    //
+    // Unlike /chat (which starts a synchronous manual agent turn),
+    // /inject sends an asynchronous mailbox message to the session.
+    // For RUNNING agents, the message is picked up by
+    // applyMailboxDrain in the next beforeIteration.  For STANDBY
+    // agents, the AgentMailboxDispatcher wakes them up.  For
+    // CLOSED/ERROR agents, the runtime restarts the session.
+    post("/agent/sessions/{id}/inject") {
+        val instance = call.requireInstanceHeader() ?: return@post
+        val id = call.parameters["id"].orEmpty()
+        if (id.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@post
+        }
+        val req = try {
+            call.receive<InjectRequest>()
+        } catch (e: Exception) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid request body: ${e.message}"))
+            return@post
+        }
+        if (req.message.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Message content is empty"))
+            return@post
+        }
+        val transient = req.transient
+
+        try {
+            val sessionInfo = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                AgentDatabaseClient(dbClient).getSession(id)
+            }
+            val binaryId = sessionInfo.binaryId
+                ?: return@post call.respond(
+                    HttpStatusCode.Conflict,
+                    mapOf("error" to "Session has no binaryId; cannot locate runtime")
+                )
+
+            // Send the mailbox message.
+            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                val mailboxService = org.iotsplab.akiba.llm.agent.AgentMailboxService(agentDbClient)
+                mailboxService.send(
+                    senderSessionId = "system",
+                    recipientSessionId = id,
+                    kind = "user-hint",
+                    subject = if (transient) "[transient]" else "[persistent]",
+                    body = req.message,
+                    priority = 10,
+                )
+            }
+
+            // Check the session's runtime state.  If it's CLOSED or
+            // ERROR, try to resume it via the runtime so the user's
+            // hint is actually processed.  If the runtime doesn't
+            // have the factory (cross-process), the hint stays in
+            // the mailbox and will be picked up the next time the
+            // owning process polls.
+            val runtimeState = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                AgentDatabaseClient(dbClient).getRuntimeState(id)?.runtimeState
+            }
+            val stateLower = runtimeState?.lowercase()
+            val resumed = if (stateLower == "closed" || stateLower == "error") {
+                try {
+                    withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                        val agentDbClient = AgentDatabaseClient(dbClient)
+                        val runtime = org.iotsplab.akiba.llm.agent.AgentRuntime.forBinary(binaryId, agentDbClient)
+                        if (runtime.canResume(id)) {
+                            runtime.resumeForUserInjection(id) != null
+                        } else {
+                            false
+                        }
+                    }
+                } catch (e: Exception) {
+                    agentRouteLogger.warn("[inject] resumeForUserInjection failed for $id: ${e.message}", e)
+                    false
+                }
+            } else {
+                false
+            }
+
+            call.respond(mapOf(
+                "status" to "sent",
+                "sessionId" to id,
+                "transient" to transient,
+                "runtimeState" to (stateLower ?: "unknown"),
+                "resumed" to resumed,
+                "hint" to if (resumed) {
+                    "Message delivered and session resumed from ${stateLower ?: "terminal"} state."
+                } else if (stateLower == "running" || stateLower == "standby" || stateLower == "msghandle") {
+                    "Message delivered. The agent will pick it up on its next iteration."
+                } else {
+                    "Message delivered to mailbox. If the session is in another process, it will be picked up when that process next polls."
+                }
+            ))
+        } catch (e: Exception) {
+            agentRouteLogger.error("[inject] failed for session $id: ${e.message}", e)
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    // ------ Pause / Resume a session -----------------------------------------
+    //
+    // The user can pause a running agent to temporarily halt its LLM
+    // loop.  The agent finishes the current iteration, then blocks
+    // before the next LLM call.  Other agents can still send messages
+    // (they accumulate in the mailbox).  Resume un-blocks the loop.
+
+    post("/agent/sessions/{id}/pause") {
+        val instance = call.requireInstanceHeader() ?: return@post
+        val id = call.parameters["id"].orEmpty()
+        if (id.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@post
+        }
+        try {
+            val sessionInfo = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                AgentDatabaseClient(dbClient).getSession(id)
+            }
+            val binaryId = sessionInfo.binaryId
+                ?: return@post call.respond(
+                    HttpStatusCode.Conflict,
+                    mapOf("error" to "Session has no binaryId; cannot locate runtime")
+                )
+
+            val paused = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                val runtime = org.iotsplab.akiba.llm.agent.AgentRuntime.forBinary(binaryId, agentDbClient)
+                runtime.pause(id)
+            }
+
+            if (paused) {
+                call.respond(mapOf("status" to "paused", "sessionId" to id))
+            } else {
+                call.respond(HttpStatusCode.Conflict, mapOf(
+                    "error" to "Session cannot be paused (not running or not in this process)"
+                ))
+            }
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    post("/agent/sessions/{id}/resume") {
+        val instance = call.requireInstanceHeader() ?: return@post
+        val id = call.parameters["id"].orEmpty()
+        if (id.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@post
+        }
+        try {
+            val sessionInfo = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                AgentDatabaseClient(dbClient).getSession(id)
+            }
+            val binaryId = sessionInfo.binaryId
+                ?: return@post call.respond(
+                    HttpStatusCode.Conflict,
+                    mapOf("error" to "Session has no binaryId; cannot locate runtime")
+                )
+
+            val resumed = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                val runtime = org.iotsplab.akiba.llm.agent.AgentRuntime.forBinary(binaryId, agentDbClient)
+                runtime.resume(id)
+            }
+
+            if (resumed) {
+                call.respond(mapOf("status" to "resumed", "sessionId" to id))
+            } else {
+                call.respond(HttpStatusCode.Conflict, mapOf(
+                    "error" to "Session cannot be resumed (not paused or not in this process)"
+                ))
+            }
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    // ------ Cancel a running manual chat turn --------------------------------
+    //
+    // When the user sends a chat message via /chat, the server spawns
+    // a child process and blocks until it finishes.  This endpoint
+    // forcibly kills that child process so the /chat call returns with
+    // an error, letting the user send a new message.
+
+    post("/agent/sessions/{id}/cancel-chat") {
+        val id = call.parameters["id"].orEmpty()
+        if (id.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@post
+        }
+        val cancelled = ManualAgentProcessRegistry.cancel(id)
+        if (cancelled) {
+            // Mark the session as closed so the frontend can recover.
+            val instance = call.instanceHeader()
+            if (instance != null) {
+                runCatching {
+                    withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                        val agentDbClient = AgentDatabaseClient(dbClient)
+                        agentDbClient.updateSession(id, status = "closed")
+                        runCatching {
+                            agentDbClient.setRuntimeState(
+                                id,
+                                org.iotsplab.akiba.llm.agent.RuntimeState.CLOSED.wire(),
+                                "user_cancelled_chat"
+                            )
+                        }
+                    }
+                }
+            }
+            call.respond(mapOf("status" to "cancelled", "sessionId" to id))
+        } else {
+            call.respond(HttpStatusCode.Conflict, mapOf(
+                "error" to "No running manual chat process for this session"
+            ))
+        }
+    }
+
+    // ------ Tool confirmation (human-in-the-loop) ---------------------------
+    //
+    // When a tool (e.g. run_shell) requires user approval, the tool
+    // registers a pending confirmation in ConfirmationManager and blocks
+    // its thread. The frontend discovers it via the `pendingConfirmation`
+    // field on `GET /agent/sessions/{id}`. The user responds by POSTing
+    // to this endpoint, which completes the deferred and unblocks the tool.
+    post("/agent/sessions/{id}/confirmation/respond") {
+        val id = call.parameters["id"].orEmpty()
+        if (id.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@post
+        }
+        val req = runCatching { call.receive<ConfirmationRespondRequest>() }
+            .getOrNull()
+        val approved = req?.approved ?: false
+
+        val delivered = ConfirmationManager.respond(id, approved)
+        call.respond(mapOf(
+            "status" to if (delivered) "delivered" else "no_pending",
+            "sessionId" to id,
+            "approved" to approved,
+            "message" to if (delivered) {
+                if (approved) "Approval delivered to the agent." else "Denial delivered to the agent."
+            } else "No pending confirmation for this session."
+        ))
+    }
+
     // ------ Delete session ----------------------------------------------------
     delete("/agent/sessions/{id}") {
         val instance = call.requireInstanceHeader() ?: return@delete
@@ -689,19 +1073,38 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             return@delete
         }
         try {
-            val killed = ManualAgentProcessRegistry.cancel(id)
             withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
-                agentDbClient.updateSession(id, status = "closed")
-                runCatching {
-                    agentDbClient.setRuntimeState(
-                        id,
-                        org.iotsplab.akiba.llm.agent.RuntimeState.CLOSED.wire(),
-                        if (killed) "manual_abort" else "manual_cancelled",
+
+                // Reject deletion of sessions that are still running.
+                // The user must wait for the flow to finish (or cancel
+                // it first) before deleting — otherwise we'd be yanking
+                // the rug out from under a live agent process.
+                val session = agentDbClient.getSession(id)
+                val status = session.status
+                val isRunning = status != "closed" && status != "error" &&
+                    status != "completed" && status != "cancelled" && status != "failed"
+                if (isRunning) {
+                    throw IllegalArgumentException(
+                        "Session is still running (status='$status'). " +
+                            "Please end the flow first before deleting."
                     )
                 }
+
+                // Hard-delete the session and all descendants.
+                val deleted = agentDbClient.deleteSession(id)
+                agentRouteLogger.info("[delete-session] hard-deleted $deleted session(s) for root=$id")
             }
-            call.respond(mapOf("message" to if (killed) "Session aborted" else "Session cancelled"))
+
+            // Cancel any lingering manual agent process and clear
+            // pending confirmations (defensive — the session should
+            // already be terminal, but just in case).
+            ManualAgentProcessRegistry.cancel(id)
+            ConfirmationManager.clear(id)
+
+            call.respond(mapOf("message" to "Session deleted"))
+        } catch (e: IllegalArgumentException) {
+            call.respond(HttpStatusCode.Conflict, mapOf("error" to e.message))
         } catch (e: Exception) {
             val (status, body) = errorPayload(e)
             call.respond(status, body)
@@ -1202,6 +1605,7 @@ private fun runManualAgentWorker(
     env["AKIBA_MANUAL_AGENT_TOKEN"] = token
     env["AKIBA_MANUAL_AGENT_SERVER_PORT"] = serverPort.toString()
     env["AKIBA_MANUAL_AGENT_SESSION_ID"] = sessionInfo.sessionId
+    sessionInfo.projectName?.let { env["AKIBA_MANUAL_AGENT_PROJECT_NAME"] = it }
     pb.redirectErrorStream(true)
     val logFile = Files.createTempFile("akiba-manual-agent-${sessionInfo.sessionId.take(8)}-", ".log")
     pb.redirectOutput(logFile.toFile())
@@ -1228,6 +1632,28 @@ private fun runManualAgentWorker(
     }
 }
 
+/** Best-effort lookup of the first program name in a Ghidra project.
+ *  Used by the manual-agent chat endpoint to pass the program name
+ *  to the worker so it can open it for tool access. */
+private fun findFirstProgramName(projectName: String, projectDir: java.nio.file.Path): String? {
+    val grpFile = projectDir.resolve("$projectName.gpr")
+    val repFile = projectDir.resolve("$projectName.rep")
+    if (!Files.isRegularFile(grpFile) || !Files.isDirectory(repFile)) return null
+    return try {
+        WorkspaceManager.openOrCreateInteractiveProject(projectName, false, projectDir)
+        val project = WorkspaceManager.project
+        project.projectData.refresh(true)
+        val first = project.projectData.rootFolder.files.firstOrNull { f ->
+            val doc = f.domainObjectClass
+            doc != null && ghidra.program.model.listing.Program::class.java.isAssignableFrom(doc)
+        }
+        WorkspaceManager.releaseActiveProject()
+        first?.name
+    } catch (_: Exception) {
+        null
+    }
+}
+
 private fun findAkibaScriptForAgent(): String {
     try {
         val source = org.iotsplab.akiba.Main::class.java.protectionDomain.codeSource
@@ -1251,7 +1677,9 @@ private fun findAkibaScriptForAgent(): String {
     return "akiba"
 }
 
-private fun SessionInfo.toResponse() = AgentSessionResponse(
+private fun SessionInfo.toResponse(
+    pendingConfirmation: PendingConfirmationDto? = null
+) = AgentSessionResponse(
     sessionId = sessionId,
     sessionName = sessionName,
     status = status,
@@ -1265,6 +1693,7 @@ private fun SessionInfo.toResponse() = AgentSessionResponse(
     runtimeState = runtimeState,
     closingReason = closingReason,
     errorMessage = if (runtimeState == "error" || status == "error") closingReason else null,
+    pendingConfirmation = pendingConfirmation,
     // token totals omitted here for performance; use GET /agent/sessions/{id}/messages
 )
 

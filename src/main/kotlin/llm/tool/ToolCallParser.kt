@@ -469,11 +469,13 @@ object ToolCallParser {
      * `scriptName = "disassemble_function"`).
      */
     private val knownScriptNames: Set<String> = setOf(
-        "group_functions", "alter_label", "set_get_comment", "binary_info",
+        "group_functions", "set_get_comment", "binary_info",
         "search_strings", "list_strings", "entry_point_context",
-        "list_functions", "get_xrefs", "read_memory_region",
-        "list_memory_segments", "alter_func_signature", "rename_function",
+        "list_functions", "get_xrefs", "read_memory",
+        "list_memory_segments", "manage_func_signature", "manage_data_type",
         "disassemble_function", "decompile_function", "find_dangerous_calls",
+        "write_memory", "search_memory", "disassemble_and_create_function",
+        "define_undefine_data", "elf_plt_got_info",
     )
 
     /**

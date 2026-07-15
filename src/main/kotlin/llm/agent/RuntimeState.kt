@@ -26,11 +26,17 @@ package org.iotsplab.akiba.llm.agent
  *                    │                               │
  *                    │ any non-terminal state       │
  *                    │ can be cancelled OR error    │
+ *                    │ can also be paused (user)    │
  *                    ▼                               ▼
  *                cancelling ──────────────────────────┘
  *                    │                               │
  *                    ▼                               ▼
  *                  closed  (terminal)        error  (terminal)
+ *
+ *  PAUSED is a user-only state: the agent loop blocks after the
+ *  current LLM response completes and waits for the user to resume.
+ *  Other agents and the system can still send messages, but they
+ *  accumulate in the mailbox until the user un-pauses.
  * ```
  *
  * `cancelling` and the terminal states (`closed` / `error`) are
@@ -49,6 +55,17 @@ enum class RuntimeState {
     /** The dispatcher started a Job to consume mailbox traffic for
      *  this session. Conceptually still inside `run()`. */
     MSGHANDLE,
+
+    /**
+     * User-requested pause: the agent loop blocks after the current
+     * LLM response completes and waits for the user to resume.
+     *
+     * Only reachable via explicit user action (API call); the automated
+     * flow never enters this state. Other agents and the system can
+     * still send mailbox messages while a session is paused, but they
+     * accumulate until the user un-pauses.
+     */
+    PAUSED,
 
     /** A parent / dispatcher is closing the session; in the grace
      *  period before hard cancel. */
@@ -71,6 +88,7 @@ enum class RuntimeState {
             "running" -> RUNNING
             "standby" -> STANDBY
             "msghandle" -> MSGHANDLE
+            "paused" -> PAUSED
             "cancelling" -> CANCELLING
             "closed" -> CLOSED
             "error" -> ERROR
@@ -94,12 +112,21 @@ enum class RuntimeState {
          *
          *  Self-transitions return false (caller should not be writing
          *  the same state twice in a row). Transitions out of a terminal
-         *  state are rejected.
+         *  state are rejected EXCEPT for `CLOSED → RUNNING` and
+         *  `ERROR → RUNNING`, which are allowed for user-injection
+         *  resume (the user sends a hint message to a finished/failed
+         *  agent and the runtime restarts it in the same session).
          */
         fun canTransition(from: RuntimeState, next: RuntimeState): Boolean = when {
             from == next -> false
-            from == CLOSED || from == ERROR -> false
+            from == CLOSED || from == ERROR -> next == RuntimeState.RUNNING
             next == CLOSED || next == ERROR -> true
+            // Any non-terminal state can be paused by the user
+            next == PAUSED -> from == RuntimeState.RUNNING ||
+                from == RuntimeState.MSGHANDLE
+            // Paused can resume back to running
+            from == PAUSED -> next == RuntimeState.RUNNING ||
+                next == RuntimeState.CANCELLING
             from == RuntimeState.RUNNING -> next == RuntimeState.STANDBY ||
                 next == RuntimeState.MSGHANDLE ||
                 next == RuntimeState.CANCELLING

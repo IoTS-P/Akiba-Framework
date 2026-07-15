@@ -453,6 +453,26 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
     }
 
     /**
+     * Hard-delete a session and all of its descendants from the database.
+     *
+     * The caller MUST ensure the session (and all children) are in a
+     * terminal state before calling this.  Dependent rows (messages,
+     * tool calls, graphs, etc.) are removed via ON DELETE CASCADE.
+     *
+     * @return number of sessions deleted (root + descendants).
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun deleteSession(sessionId: String): Int = runBlocking {
+        val response = dbClient.post("/agent/session/delete", mapOf("sessionId" to sessionId))
+        if (response.first == HttpStatusCode.OK) {
+            val node = mapper.readTree(response.second)
+            node.path("deleted").asInt(0)
+        } else {
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+        }
+    }
+
+    /**
      * Fetch the current `runtime_state` and `closing_reason`. Returns
      * null when the session does not exist. Used by the dispatcher
      * pre-flight and by JobHandle.await to seed the local state cache.
@@ -1599,6 +1619,34 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
             "limit" to limit
         )
         val response = dbClient.post("/agent/tool_call/result/find", body)
+        if (response.first == HttpStatusCode.OK)
+            mapper.readValue<List<ToolCallResultSummaryInfo>>(response.second)
+        else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    /**
+     * Search tool call results by tool name, args text, or result UUID.
+     * Unlike [findToolCallResults], this performs a case-insensitive
+     * substring search on tool args (ILIKE) and does not require a
+     * sessionId — it searches across all sessions in the current database.
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun searchToolCallResults(
+        sessionId: String? = null,
+        toolName: String? = null,
+        toolArgsContains: String? = null,
+        resultUuid: String? = null,
+        limit: Int = 20
+    ): List<ToolCallResultSummaryInfo> = runBlocking {
+        val body = mapOf(
+            "sessionId" to sessionId,
+            "toolName" to toolName,
+            "toolArgsContains" to toolArgsContains,
+            "resultUuid" to resultUuid,
+            "limit" to limit
+        )
+        val response = dbClient.post("/agent/tool_call/result/search", body)
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<List<ToolCallResultSummaryInfo>>(response.second)
         else

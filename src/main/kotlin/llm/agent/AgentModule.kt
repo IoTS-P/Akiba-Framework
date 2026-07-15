@@ -1299,36 +1299,45 @@ abstract class AgentModule(
                 logger.error("Error message: ${result.output}")
             }
             processResult(result)
-            val rootParked = agent.lifecycle == Lifecycle.STANDBY &&
-                agent.onFinalAnswer == FinalAnswerAction.PARK &&
-                (result.stopReason == StopReason.STANDBY || result.stopReason == StopReason.COMPLETED)
+            // The root "parked" (did NOT reach a truly-terminating
+            // outcome) when it is STANDBY-lifecycle and the
+            // stopReason + onFinalAnswer combination leaves the
+            // processCompletionLatch open.  In that state the in-process
+            // handle must be mirrored to STANDBY (via
+            // [markRegisteredSessionStandby]) so the mailbox dispatcher
+            // can resume it on the next wake.
+            //
+            //  - PARK + (STANDBY | COMPLETED) → parks (existing).
+            //  - EXIT + STANDBY → parks (await_condition / standby
+            //    marker).  EXIT only terminates on COMPLETED (the real
+            //    Final Answer), which is handled by isTerminatingRun
+            //    firing the hook inside runWithTermination and does NOT
+            //    reach this mark path.
+            val rootParked = agent.lifecycle == Lifecycle.STANDBY && when (agent.onFinalAnswer) {
+                FinalAnswerAction.PARK ->
+                    result.stopReason == StopReason.STANDBY ||
+                        result.stopReason == StopReason.COMPLETED
+                FinalAnswerAction.EXIT ->
+                    result.stopReason == StopReason.STANDBY
+            }
             if (rootParked && sessionId != null) {
                 rootRuntime.markRegisteredSessionStandby(
                     sessionId = sessionId,
                     reason = "root_parked:${result.stopReason.name.lowercase()}",
                 )
+                logger.info(
+                    "Session $sessionId parked (lifecycle=STANDBY, " +
+                        "onFinalAnswer=${agent.onFinalAnswer}, " +
+                        "stopReason=${result.stopReason}); the latch stays open — " +
+                        "startProcess will block until the agent is woken from standby " +
+                        "and runs a terminating turn, or until the caller cancels the agent."
+                )
             }
         }
 
-        // Diagnostic log for the "still alive in STANDBY"
-        // case — operators watching the log benefit from a
-        // single line that summarises the await outcome.  The
-        // exit reason itself is derived inside
-        // [AkibaAgent.runWithTermination] and used to fire
-        // the latch, so we no longer need to derive it here.
-        if (result != null &&
-            result.stopReason != StopReason.ERROR &&
-            result.stopReason != StopReason.MAX_ITERATIONS &&
-            agent.onFinalAnswer == FinalAnswerAction.PARK &&
-            agent.lifecycle == Lifecycle.STANDBY
-        ) {
-            logger.info(
-                "Session ${agent.sessionId} is in standby (lifecycle=${agent.lifecycle}, " +
-                    "onFinalAnswer=${agent.onFinalAnswer}); the latch stays open — " +
-                    "startProcess will block until the agent is woken from standby and " +
-                    "runs a terminating turn, or until the caller cancels the agent."
-            )
-        }
+        // (The "still alive in STANDBY" diagnostic log is now emitted
+        // inside the rootParked block above, covering both PARK and
+        // EXIT roots that parked via await_condition.)
 
         // In BOTH EXIT and PARK modes, startProcess must NOT
         // return until the root agent has reached a

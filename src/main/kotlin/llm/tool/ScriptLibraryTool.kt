@@ -489,7 +489,7 @@ private fun runLibraryScript(
                 val instance = ScriptInstance.compile(sourceWithArgs, script.className)
                 val scriptObj = instance.newInstance(
                     binaryId = parent.id,
-                    program = parent.currentProgram,
+                    program = parent.program,
                     skipDbWrite = true
                 )
                 scriptObj.startProcess(AkibaModule.DEFAULT_TIMEOUT)
@@ -560,12 +560,17 @@ private fun runLibraryScript(
         } catch (_: Exception) { }
         "Error: library script '${script.name}' compilation failed: ${e.message}"
     } catch (e: Exception) {
+        val detail = e.message ?: buildString {
+            append(e.javaClass.name)
+            val firstLine = e.stackTrace.firstOrNull()?.toString()
+            if (firstLine != null) append(" at $firstLine")
+        }
         try {
             if (executionId != null)
-                agentDbClient.updateScriptExecution(executionId, null, "failed", "${e.javaClass.simpleName}: ${e.message}")
+                agentDbClient.updateScriptExecution(executionId, null, "failed", "${e.javaClass.simpleName}: $detail")
             if (scriptDbId >= 0)
-                agentDbClient.updateScriptOutput(scriptDbId, "Error: ${e.message}", "failed")
+                agentDbClient.updateScriptOutput(scriptDbId, "Error: $detail", "failed")
         } catch (_: Exception) { }
-        "Error running library script '${script.name}': ${e.message}"
+        "Error running library script '${script.name}': $detail"
     }
 }

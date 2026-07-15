@@ -24,17 +24,9 @@ package org.iotsplab.akiba.llm.agent
  */
 object AgentPrompts {
 
-    /**
-     * Maximum number of tool calls executed sequentially in a single ReAct
-     * iteration before requesting another LLM round-trip. This is both a
-     * behavioural cap (used by [ReActStrategy]) and a value referenced inside
-     * [REACT_INSTRUCTION], so it lives here as the single source of truth.
-     */
-    const val MAX_BATCH_TOOL_CALLS: Int = 5
-
     // ============================================================
     //  System prompts
-    // ============================================================
+    //  ============================================================
 
     /**
      * Fallback system prompt used when no override or annotation is supplied.

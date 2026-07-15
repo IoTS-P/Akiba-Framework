@@ -9,6 +9,7 @@ import org.iotsplab.akiba.llm.agent.ConversationRegistry
 import org.iotsplab.akiba.llm.agent.MailboxAccessException
 import org.iotsplab.akiba.llm.agent.MessageArrived
 import org.iotsplab.akiba.llm.agent.StateChanged
+import org.iotsplab.akiba.llm.agent.SYSTEM_SESSION_UUID
 import org.iotsplab.akiba.llm.agent.TimeElapsed
 import org.iotsplab.akiba.llm.agent.WakeCondition
 import org.iotsplab.akiba.llm.agent.WakeConditionRegistry
@@ -207,12 +208,10 @@ private fun SendAgentMessageTool(
         ?: return@Tool "Error: send_agent_message has no caller sessionId; the owning " +
             "AgentModule must be initialised before this tool is invoked."
 
-    /** Well-known UUID for the reserved "system" session.  Messages
-     *  sent TO this session are always useless — the system session
-     *  is a synthetic sender for wake notifications, not a real agent
-     *  that processes mail.  Reject early so the LLM doesn't waste
-     *  tokens composing messages nobody will read. */
-    val SYSTEM_SESSION_UUID = "00000000-0000-0000-0000-000000000000"
+    // Messages sent TO the system session are always useless — it is a
+    // synthetic sender for wake notifications, not a real agent that
+    // processes mail.  Reject early so the LLM doesn't waste tokens
+    // composing messages nobody will read.
 
     // ── Batch mode ──────────────────────────────────────────────
     val operationsRaw = (args["operations"] as? String)?.takeIf { it.isNotBlank() }
@@ -356,7 +355,7 @@ private fun sendBatchMessages(
             failed++
             continue
         }
-        if (recipient == "00000000-0000-0000-0000-000000000000") {
+        if (recipient == SYSTEM_SESSION_UUID) {
             results += mapOf("index" to index, "ok" to false,
                 "error" to "cannot send to system session; use ack_agent_message for system notifications")
             failed++

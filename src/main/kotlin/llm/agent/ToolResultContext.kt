@@ -48,7 +48,7 @@ object ToolResultContext {
         )
     }
 
-    fun formatCurrentResult(raw: String, resultUuid: String, stored: StoredResult): String =
+    fun formatCurrentResult(raw: String, resultUuid: String?, stored: StoredResult): String =
         formatResultForContext(
             raw = raw,
             resultUuid = resultUuid,
@@ -87,7 +87,7 @@ object ToolResultContext {
 
     private fun formatResultForContext(
         raw: String,
-        resultUuid: String,
+        resultUuid: String?,
         stored: StoredResult,
         maxBytes: Int,
         preferredHeadBytes: Int,
@@ -96,12 +96,16 @@ object ToolResultContext {
     ): String {
         val header = buildString {
             appendLine("[Tool result ${if (historical) "historical" else "context"} view]")
-            appendLine("result_uuid: $resultUuid")
+            if (resultUuid != null) {
+                appendLine("result_uuid: $resultUuid")
+            }
             appendLine("original_bytes: ${stored.originalBytes}")
             appendLine("stored_bytes: ${stored.storedBytes}")
             appendLine("storage_policy: ${stored.storagePolicy}")
             appendLine("sha256: ${stored.sha256}")
-            appendLine("To inspect stored result, call read_history_tool_call with uuid=$resultUuid.")
+            if (resultUuid != null) {
+                appendLine("To inspect stored result, call read_history_tool_call with uuid=$resultUuid.")
+            }
         }
         return boundedHeadTail(raw, maxBytes, preferredHeadBytes, preferredTailBytes, header)
     }

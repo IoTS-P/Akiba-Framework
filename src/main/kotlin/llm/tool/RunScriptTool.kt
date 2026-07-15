@@ -36,7 +36,7 @@ import kotlin.system.measureTimeMillis
  *
  * class AnalyzeStrings : AkibaScript() {
  *     override suspend fun execute() {
- *         val program = currentProgram
+ *         val program = program
  *         if (program == null) {
  *             appendLine("No program loaded")
  *             return
@@ -55,12 +55,12 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
     description = buildString {
         appendLine("Compile and run a Kotlin script that analyzes the current binary loaded in Ghidra.")
         appendLine("The script must define a class extending AkibaScript with an execute() method.")
-        appendLine("Inside execute(), use `currentProgram` to access the Ghidra Program object,")
+        appendLine("Inside execute(), use `program` to access the Ghidra Program object,")
         appendLine("`appendOutput()`/`appendLine()` to produce text output, and `updateData()` for structured results.")
         appendLine("Each run uses an isolated ClassLoader, so class name conflicts are avoided.")
         appendLine()
         appendLine("IMPORTANT: Scripts are written in Kotlin, NOT Java or Jython.")
-        appendLine("- `currentProgram` is the loaded Ghidra Program (same as `program` in standard Ghidra scripts)")
+        appendLine("- `program` is the loaded Ghidra Program (same as `program` in standard Ghidra scripts)")
         appendLine("- All Ghidra API packages (ghidra.program.model.*, ghidra.util.*, etc.) are available")
         appendLine("- Use `appendLine(text)` instead of `println()` — println output is not captured")
         appendLine("- The execute() method is `suspend` but you can call blocking Ghidra APIs directly")
@@ -81,7 +81,7 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
         appendLine("")
         appendLine("class ListFunctions : AkibaScript() {")
         appendLine("    override suspend fun execute() {")
-        appendLine("        val fm = currentProgram!!.functionManager")
+        appendLine("        val fm = program!!.functionManager")
         appendLine("        val iter = fm.getFunctions(true)")
         appendLine("        var count = 0")
         appendLine("        while (iter.hasNext()) {")
@@ -101,9 +101,9 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
         appendLine("")
         appendLine("class DisassembleMain : AkibaScript() {")
         appendLine("    override suspend fun execute() {")
-        appendLine("        val listing = currentProgram!!.listing")
-        appendLine("        val func = currentProgram!!.functionManager.getFunctionAt(")
-        appendLine("            currentProgram!!.minAddress")
+        appendLine("        val listing = program!!.listing")
+        appendLine("        val func = program!!.functionManager.getFunctionAt(")
+        appendLine("            program!!.minAddress")
         appendLine("        ) ?: run { appendLine(\"No function at min address\"); return }")
         appendLine("        val iter = listing.getInstructions(func.body, true)")
         appendLine("        while (iter.hasNext()) {")
@@ -122,12 +122,12 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
         appendLine("class FindDangerousCalls : AkibaScript() {")
         appendLine("    override suspend fun execute() {")
         appendLine("        val dangerousFns = listOf(\"gets\", \"strcpy\", \"sprintf\", \"strcat\", \"scanf\")")
-        appendLine("        val fm = currentProgram!!.functionManager")
+        appendLine("        val fm = program!!.functionManager")
         appendLine("        val iter = fm.getFunctions(true)")
         appendLine("        while (iter.hasNext()) {")
         appendLine("            val func = iter.next()")
         appendLine("            if (func.name in dangerousFns) {")
-        appendLine("                val refs = currentProgram!!.referenceManager")
+        appendLine("                val refs = program!!.referenceManager")
         appendLine("                    .getReferencesTo(func.entryPoint)")
         appendLine($$"                appendLine(\"${func.name} @ ${func.entryPoint} — called from:\")")
         appendLine("                refs.forEach { ref ->")
@@ -255,7 +255,7 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
 
     // 3. Resolve program
     val targetProgram = if (targetId == parent.id) {
-        parent.currentProgram
+        parent.program
     } else {
         parent.getProgram(targetId)
             ?: run {

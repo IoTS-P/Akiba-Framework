@@ -17,6 +17,7 @@ import org.iotsplab.akiba.llm.agent.ModelContextLengthService
 import org.iotsplab.akiba.llm.agent.RuntimeState
 import org.iotsplab.akiba.llm.agent.ReActStrategy
 import org.iotsplab.akiba.llm.agent.ResolvedSubAgentSpec
+import org.iotsplab.akiba.llm.agent.SYSTEM_SESSION_UUID
 import org.iotsplab.akiba.llm.agent.SubAgentFactoryContext
 import org.iotsplab.akiba.llm.agent.SubAgentSpec
 import org.iotsplab.akiba.llm.agent.TemplateFactoryResolver
@@ -180,8 +181,6 @@ private fun handleSpawn(
     }
     return spawnFreeform(args, parent, parentAgent, parentSessionId, agentDbClient, mapper)
 }
-
-private const val SYSTEM_SESSION_UUID = "00000000-0000-0000-0000-000000000000"
 
 /**
  * Deliver a best-effort self-wake to the caller when `spawn_sub_agent`
