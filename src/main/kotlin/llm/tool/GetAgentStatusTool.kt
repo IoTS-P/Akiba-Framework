@@ -7,7 +7,7 @@ import org.iotsplab.akiba.data.database.AgentDatabaseClient
 //  GetAgentStatusTool — peek any visible agent's runtime state
 // ============================================================
 //
-// Companion to `spawn_sub_agent` and `await_agent`.  Lets the
+// Companion to `spawn_sub_agent` and `await_multiple_children`.  Lets the
 // calling agent poll a single target session (itself OR a direct
 // child) and read:
 //
@@ -52,10 +52,10 @@ import org.iotsplab.akiba.data.database.AgentDatabaseClient
 //     the child has actually started; this tool confirms it.
 //   - Self-query: an agent with `lifecycle=standby` checks its
 //     own `lifecycle` and recent activity to decide whether
-//     to emit the `Enter standby mode.` marker (the runtime
-//     translates that marker to `runtimeState=standby`, so the
+//     to call `await_condition` to park (the runtime
+//     translates that to `runtimeState=standby`, so the
 //     agent is effectively confirming "am I a standby agent?").
-//   - Peek progress while `await_agent` is in flight, without
+//   - Peek progress while `await_multiple_children` is in flight, without
 //     blocking.
 
 /**
@@ -68,10 +68,10 @@ fun GetAgentStatusTool(
     name = "get_agent_status",
     description = buildString {
         appendLine("Query a single agent's runtime state and aggregated counters. " +
-            "Companion to `spawn_sub_agent` / `await_agent`: lets a parent agent " +
+            "Companion to `spawn_sub_agent` / `await_multiple_children`: lets a parent agent " +
             "decide whether a child is still progressing, parked, or already " +
             "terminal, and lets a standby-capable agent check its OWN state before " +
-            "emitting the `Enter standby mode.` marker.")
+            "calling `await_condition` to park.")
         appendLine()
         appendLine("Returns, for the target session:")
         appendLine("  - `runtimeState` (running | standby | msghandle | cancelling | closed | error)")
@@ -105,7 +105,7 @@ fun GetAgentStatusTool(
         appendLine("    cannot see whether it has actually started).")
         appendLine("  - A standby-capable agent queries its OWN row to confirm its")
         appendLine("    `lifecycle` before emitting the `Enter standby mode.` marker.")
-        appendLine("  - While `await_agent` is in flight, to peek progress without blocking.")
+        appendLine("  - While `await_multiple_children` is in flight, to peek progress without blocking.")
         appendLine("  - When the caller needs to know whether to send a follow-up mailbox")
         appendLine("    message (a `closed`/`error` child cannot receive mail).")
     },

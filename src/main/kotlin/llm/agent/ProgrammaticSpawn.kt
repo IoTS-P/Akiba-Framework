@@ -57,13 +57,6 @@ data class ProgrammaticAgentSpawnResult(
  *                       STANDBY, the child parks immediately on
  *                       spawn and skips its first LLM call.
  *                       Set false to run taskPrompt on cold start.
- * @param onFinalAnswer override for the Final-Answer policy.  When
- *                       null (default), the policy is derived from
- *                       [lifecycle] (STANDBY → PARK, ONE_SHOT →
- *                       EXIT).  Set explicitly to flip the default
- *                       for this particular child (e.g. a STANDBY
- *                       root that should truly exit on Final
- *                       Answer).
  * @param taskPrompt    initial user message; the same value is
  *                       used for both the transcript and
  *                       `agent.run()`.
@@ -80,7 +73,6 @@ fun spawnChildFromAgentProgrammatically(
     depth: Int,
     lifecycle: Lifecycle = Lifecycle.ONE_SHOT,
     coldStart: Boolean = true,
-    onFinalAnswer: FinalAnswerAction? = null,
     taskPrompt: String,
     name: String? = null,
 ): ProgrammaticAgentSpawnResult {
@@ -142,14 +134,6 @@ fun spawnChildFromAgentProgrammatically(
             depth = depth,
             initialLifecycle = lifecycle,
             coldStart = coldStart,
-            // Honour the caller's explicit override when set;
-            // otherwise fall back to the same default the
-            // AkibaAgent constructor applies (STANDBY → PARK,
-            // ONE_SHOT → EXIT).  The spawn-time value and the
-            // agent's own `onFinalAnswer` are kept in lockstep by
-            // the caller convention.
-            onFinalAnswer = onFinalAnswer
-                ?: if (lifecycle == Lifecycle.STANDBY) FinalAnswerAction.PARK else FinalAnswerAction.EXIT,
             taskPrompt = taskPrompt,
             factory = factoryRef,
         )

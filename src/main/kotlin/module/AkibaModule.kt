@@ -162,20 +162,56 @@ abstract class AkibaModule (
     /**
      * Per-module workspace directory.
      *
-     * Path: `<workspaceRoot>/<ModuleClassName>/<id>/`
+     * Path: `<workspaceRoot>/<projectName>/<id>/<ModuleClassName>/`
      *
      * Modules can use this to persist intermediate results, downloaded
      * resources, temp scripts, shell command outputs, etc. The directory
      * is created lazily on first access.
      *
+     * A read-only copy of the binary file is placed at
+     * `<workspaceRoot>/<projectName>/<id>/binary` (copied once per
+     * project+id, not per module).  Each module's workspace gets a
+     * symbolic link `binary` pointing to that copy, so tools/scripts
+     * running in the workspace can access the binary via `./binary`
+     * without risking modification of the original file in
+     * `binariesRoot`.
+     *
      * The root (`workspaceRoot`) defaults to `~/.akiba/workspace` and can
      * be overridden in the main config JSON via `general.workspaceRoot`.
      */
     val workspaceDir: Path by lazy {
-        val dir = Path.of(mainConf.workspaceRoot)
-            .resolve(this.javaClass.simpleName)
+        val projectName = WorkspaceManager.projectName ?: "default"
+        val idDir = Path.of(mainConf.workspaceRoot)
+            .resolve(projectName)
             .resolve(id.toString())
+        val dir = idDir.resolve(this.javaClass.simpleName)
         if (!Files.exists(dir)) Files.createDirectories(dir)
+
+        // Provision a binary copy at the <id>/ level and symlink it
+        // into this module's workspace so shell tools / scripts can
+        // access the binary via ./binary without touching the original.
+        if (id > 0) {
+            try {
+                val binaryCopy = idDir.resolve("binary")
+                val sourceFile = usingFile
+                if (sourceFile.exists() && !Files.exists(binaryCopy)) {
+                    sourceFile.copyTo(binaryCopy.toFile())
+                }
+                val link = dir.resolve("binary")
+                if (Files.exists(binaryCopy) && !Files.exists(link)) {
+                    try {
+                        Files.createSymbolicLink(link, binaryCopy)
+                    } catch (_: java.nio.file.FileSystemException) {
+                        // Fallback: some filesystems / containers don't
+                        // support symlinks. Copy the file directly.
+                        if (!Files.exists(link)) {
+                            sourceFile.copyTo(link.toFile())
+                        }
+                    }
+                }
+            } catch (_: Exception) { /* best-effort; workspace still works without the link */ }
+        }
+
         dir
     }
 
@@ -736,6 +772,13 @@ abstract class AkibaModule (
                 runtimeReport?.recordTraceback(moduleTracebackOf(e))
                 if (hasTable)
                     updateErr("Process failed: $detail")
+                // Manual agent workers MUST propagate exceptions so the
+                // server's runManualAgentWorker detects a non-zero exit
+                // code and reports the failure.  Without this re-throw
+                // the framework swallows the error and the process exits
+                // with code 0, causing the server to see "no user message
+                // persisted" instead of the real failure.
+                if (System.getenv("AKIBA_MANUAL_AGENT") == "1") throw e
             } catch (e: OutOfMemoryError) {
                 val detail = describeModuleThrowable(e)
                 logger.error("Process out of memory: $detail")

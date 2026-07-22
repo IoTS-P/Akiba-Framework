@@ -2,6 +2,7 @@ package org.iotsplab.akiba.llm.memory
 
 import org.apache.logging.log4j.LogManager
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
+import org.iotsplab.akiba.llm.agent.LLM_RETRY_STATUS_PREFIX
 
 // ============================================================
 //  ChatMemory — interface
@@ -237,6 +238,11 @@ class PersistentChatMemory(
 
             for (i in startIdx until all.size) {
                 val msg = all[i]
+                // Skip LLM retry-status messages — they are UI-only
+                // notifications and must never enter the LLM context.
+                if (msg.role == "system" && (msg.content ?: "").startsWith(LLM_RETRY_STATUS_PREFIX)) {
+                    continue
+                }
                 val content = when (msg.role) {
                     "tool" -> msg.toolResult ?: msg.content ?: ""
                     else -> msg.content ?: ""

@@ -370,7 +370,6 @@ class AgentBuilder {
     // ---- Lifecycle / mailbox / runtime / logger / compaction ------------
 
     private var lifecycleValue: Lifecycle = Lifecycle.ONE_SHOT
-    private var onFinalAnswerValue: FinalAnswerAction? = null
     private var mailboxServiceValue: AgentMailboxService? = null
     private var loggerValue: org.apache.logging.log4j.Logger? = null
     private var runtimeHandleValue: JobHandle? = null
@@ -384,23 +383,6 @@ class AgentBuilder {
     /** Set the [Lifecycle] the agent runs with. Default [Lifecycle.ONE_SHOT]. */
     fun lifecycle(value: Lifecycle) {
         lifecycleValue = value
-    }
-
-    /**
-     * Set the [FinalAnswerAction] the agent uses when the LLM
-     * emits "Final Answer:".  When unset (default), the
-     * [AkibaAgent.onFinalAnswer] default applies: STANDBY
-     * lifecycle → PARK, ONE_SHOT lifecycle → EXIT.
-     *
-     * Most callers will not need this — the default is the
-     * right answer for the common cases.  The override is for
-     * the unusual "STANDBY root agent that should truly exit on
-     * Final Answer" case: e.g. a long-lived interactive STANDBY
-     * root that has reached the end of its conversational arc
-     * and must close so the process can exit.
-     */
-    fun onFinalAnswer(value: FinalAnswerAction) {
-        onFinalAnswerValue = value
     }
 
     /** Provide a mailbox service for inter-agent communication. */
@@ -532,8 +514,6 @@ class AgentBuilder {
             compactKeepRounds = compactKeepRoundsValue,
             errorRecoverySafetyFactor = errorRecoverySafetyFactorValue,
             lifecycle = lifecycleValue,
-            onFinalAnswer = onFinalAnswerValue
-                ?: if (lifecycleValue == Lifecycle.STANDBY) FinalAnswerAction.PARK else FinalAnswerAction.EXIT,
             mailboxService = mailboxServiceValue,
             logger = loggerValue ?: org.apache.logging.log4j.LogManager.getLogger(AkibaAgent::class.java),
             runtimeHandle = runtimeHandleValue,

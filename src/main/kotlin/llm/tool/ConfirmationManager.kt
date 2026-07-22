@@ -4,6 +4,11 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -32,6 +37,21 @@ data class PendingConfirmation(
     val workingDirectory: String,
     /** Timeout (seconds) configured for the command. */
     val timeout: Int,
+    /**
+     * Action type — tells the frontend what kind of confirmation this is,
+     * so it can render an appropriate UI (e.g. a path-access warning for
+     * workspace-outside operations vs. a generic shell-command prompt).
+     *
+     *  - `"shell_command"` — run_shell executing a command
+     *  - `"file_access"`   — a file tool accessing a path outside the workspace
+     */
+    val action: String = "shell_command",
+    /**
+     * The target path for `file_access` actions (null for `shell_command`).
+     * The frontend uses this to prominently display which file the agent
+     * wants to read/write/grep outside the workspace.
+     */
+    val targetPath: String? = null,
     /** Epoch millis when the request was created. */
     val createdAt: Long = System.currentTimeMillis()
 )
@@ -83,6 +103,8 @@ object ConfirmationManager {
         command: String,
         workingDirectory: String,
         timeout: Int,
+        action: String = "shell_command",
+        targetPath: String? = null,
         confirmationTimeoutMs: Long = DEFAULT_CONFIRMATION_TIMEOUT_MS
     ): Boolean {
         if (sessionId.isBlank()) return false
@@ -94,7 +116,9 @@ object ConfirmationManager {
             toolName = toolName,
             command = command,
             workingDirectory = workingDirectory,
-            timeout = timeout
+            timeout = timeout,
+            action = action,
+            targetPath = targetPath
         )
         val deferred = CompletableDeferred<Boolean>()
         pending[sessionId] = PendingEntry(confirmation, deferred)
@@ -134,6 +158,8 @@ object ConfirmationManager {
         command: String,
         workingDirectory: String,
         timeout: Int,
+        action: String = "shell_command",
+        targetPath: String? = null,
         confirmationTimeoutMs: Long = DEFAULT_CONFIRMATION_TIMEOUT_MS
     ): Boolean {
         if (sessionId.isBlank()) {
@@ -148,7 +174,9 @@ object ConfirmationManager {
             toolName = toolName,
             command = command,
             workingDirectory = workingDirectory,
-            timeout = timeout
+            timeout = timeout,
+            action = action,
+            targetPath = targetPath
         )
         val deferred = CompletableDeferred<Boolean>()
         pending[sessionId] = PendingEntry(confirmation, deferred)
@@ -156,6 +184,56 @@ object ConfirmationManager {
         return try {
             runBlocking {
                 withTimeout(confirmationTimeoutMs) {
+                    deferred.await()
+                }
+            }
+        } catch (_: TimeoutCancellationException) {
+            false
+        } catch (_: Exception) {
+            false
+        } finally {
+            pending.remove(sessionId)
+        }
+    }
+
+    /**
+     * Request user confirmation for a **file operation outside the workspace**.
+     *
+     * Convenience wrapper around [requestConfirmationBlocking] with
+     * `action = "file_access"` and a human-readable description built
+     * from the tool name, operation, and target path.
+     *
+     * @param sessionId        Agent session ID.
+     * @param toolName         Tool name (e.g. "read_workspace_file").
+     * @param operation        Operation verb (e.g. "read", "write", "grep").
+     * @param targetPath       The absolute path outside the workspace.
+     * @return `true` if approved, `false` if denied or timed out.
+     */
+    fun requestFileAccessConfirmationBlocking(
+        sessionId: String,
+        toolName: String,
+        operation: String,
+        targetPath: String
+    ): Boolean {
+        if (sessionId.isBlank()) return false
+
+        val requestId = UUID.randomUUID().toString()
+        val confirmation = PendingConfirmation(
+            requestId = requestId,
+            sessionId = sessionId,
+            toolName = toolName,
+            command = "$operation $targetPath",
+            workingDirectory = "(outside workspace)",
+            timeout = 0,
+            action = "file_access",
+            targetPath = targetPath
+        )
+        val deferred = CompletableDeferred<Boolean>()
+        pending[sessionId] = PendingEntry(confirmation, deferred)
+
+        return try {
+            runBlocking {
+                withTimeout(DEFAULT_CONFIRMATION_TIMEOUT_MS) {
                     deferred.await()
                 }
             }
@@ -205,3 +283,73 @@ object ConfirmationManager {
     /** Number of sessions currently awaiting confirmation. */
     fun pendingCount(): Int = pending.size
 }
+
+// ============================================================
+//  Cross-process confirmation helpers
+// ============================================================
+
+/**
+ * Request user confirmation via HTTP callback to the AkibaServer.
+ *
+ * Used when a tool executes in a **separate worker process** and needs
+ * to reach the server's [ConfirmationManager] (which lives in the
+ * server process). The worker POSTs to the server's
+ * `POST /agent/internal/confirmation/request` endpoint and blocks on
+ * the HTTP response (long-poll) until the user responds.
+ *
+ * This is a generalised version of the function that was previously
+ * in `RunShellTool.kt`. It now supports both `shell_command` and
+ * `file_access` action types.
+ *
+ * @return `true` if the user approved, `false` if denied, timed out,
+ *         or the HTTP call failed.
+ */
+fun requestConfirmationViaHttp(
+    serverPort: Int,
+    sessionId: String,
+    toolName: String,
+    command: String,
+    workingDirectory: String,
+    timeout: Int,
+    action: String = "shell_command",
+    targetPath: String? = null
+): Boolean {
+    val mapper = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
+    val bodyMap = mutableMapOf<String, Any>(
+        "sessionId" to sessionId,
+        "toolName" to toolName,
+        "command" to command,
+        "workingDirectory" to workingDirectory,
+        "timeout" to timeout,
+        "action" to action
+    )
+    if (targetPath != null) bodyMap["targetPath"] = targetPath
+    val body = mapper.writeValueAsString(bodyMap)
+    return try {
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create("http://127.0.0.1:$serverPort/api/agent/internal/confirmation/request"))
+            .timeout(Duration.ofMinutes(6))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .build()
+        val response = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .build()
+            .send(request, HttpResponse.BodyHandlers.ofString())
+        if (response.statusCode() !in 200..299) return false
+        val result = mapper.readValue(response.body(), Map::class.java)
+        result["approved"] == true
+    } catch (_: Exception) {
+        false
+    }
+}
+
+/**
+ * Detect whether the current process is a manual-agent worker and, if
+ * so, return the server's HTTP port (from the `AKIBA_MANUAL_AGENT_SERVER_PORT`
+ * environment variable set by `AgentRoutes.runManualAgentWorker`).
+ *
+ * Returns `null` when not in worker mode (tools execute in-process).
+ */
+fun detectWorkerServerPort(): Int? =
+    System.getenv("AKIBA_MANUAL_AGENT_SERVER_PORT")?.toIntOrNull()

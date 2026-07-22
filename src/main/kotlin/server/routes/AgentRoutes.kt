@@ -115,6 +115,8 @@ data class PendingConfirmationDto(
     val command: String,
     val workingDirectory: String,
     val timeout: Int,
+    val action: String = "shell_command",
+    val targetPath: String? = null,
     val createdAt: Long
 )
 
@@ -130,7 +132,11 @@ data class InternalConfirmationRequest(
     val toolName: String,
     val command: String,
     val workingDirectory: String,
-    val timeout: Int
+    val timeout: Int,
+    /** Action type: "shell_command" or "file_access". Defaults to shell_command. */
+    val action: String = "shell_command",
+    /** Target path for file_access actions. Null for shell_command. */
+    val targetPath: String? = null
 )
 
 data class AgentMessageResponse(
@@ -345,7 +351,9 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             toolName = req.toolName,
             command = req.command,
             workingDirectory = req.workingDirectory,
-            timeout = req.timeout
+            timeout = req.timeout,
+            action = req.action,
+            targetPath = req.targetPath
         )
         call.respond(mapOf("approved" to approved))
     }
@@ -434,6 +442,8 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     command = pc.command,
                     workingDirectory = pc.workingDirectory,
                     timeout = pc.timeout,
+                    action = pc.action,
+                    targetPath = pc.targetPath,
                     createdAt = pc.createdAt
                 )
             }
@@ -499,6 +509,19 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     projectName = resolvedProjectName,
                     parentSessionId = req.parentSessionId
                 )
+                // Chat sessions use a "one question → one subprocess" model.
+                // There is no agent process running between user messages, so
+                // the session starts in the "closed" (idle) state.  The
+                // /chat endpoint flips it to "running" for the duration of
+                // a single manual turn, then back to "closed" when done.
+                agentDbClient.updateSession(sessionId, status = "closed")
+                runCatching {
+                    agentDbClient.setRuntimeState(
+                        sessionId,
+                        org.iotsplab.akiba.llm.agent.RuntimeState.CLOSED.wire(),
+                        "session_created_idle",
+                    )
+                }
                 agentDbClient.getSession(sessionId)
             }
             call.respond(HttpStatusCode.Created, info.toResponse())
@@ -988,6 +1011,48 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             } else {
                 call.respond(HttpStatusCode.Conflict, mapOf(
                     "error" to "Session cannot be resumed (not paused or not in this process)"
+                ))
+            }
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    // ------ Request immediate LLM retry --------------------------------------
+    //
+    // When the LLM call fails and enters the exponential-backoff retry
+    // loop, the user can skip the remaining wait and trigger an
+    // immediate retry via this endpoint.
+
+    post("/agent/sessions/{id}/retry-now") {
+        val instance = call.requireInstanceHeader() ?: return@post
+        val id = call.parameters["id"].orEmpty()
+        if (id.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@post
+        }
+        try {
+            val sessionInfo = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                AgentDatabaseClient(dbClient).getSession(id)
+            }
+            val binaryId = sessionInfo.binaryId
+                ?: return@post call.respond(
+                    HttpStatusCode.Conflict,
+                    mapOf("error" to "Session has no binaryId; cannot locate runtime")
+                )
+
+            val applied = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                val runtime = org.iotsplab.akiba.llm.agent.AgentRuntime.forBinary(binaryId, agentDbClient)
+                runtime.retryNow(id)
+            }
+
+            if (applied) {
+                call.respond(mapOf("status" to "retry_requested", "sessionId" to id))
+            } else {
+                call.respond(HttpStatusCode.Conflict, mapOf(
+                    "error" to "Session not found in this runtime (it may be running in a different process)"
                 ))
             }
         } catch (e: Exception) {

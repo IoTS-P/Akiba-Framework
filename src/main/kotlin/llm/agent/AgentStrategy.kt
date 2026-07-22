@@ -163,21 +163,6 @@ class StrategyContext(
      */
     val lifecycle: Lifecycle = Lifecycle.ONE_SHOT,
     /**
-     * Behaviour when the LLM emits "Final Answer:".  See
-     * [FinalAnswerAction] for the semantics.  This is the
-     * strategy-facing half of [AkibaAgent.onFinalAnswer];
-     * the runtime_state half is consumed by
-     * [AgentRuntime.runChildJob] (which uses the matching
-     * value passed to [AgentRuntime.spawn]).
-     *
-     * Strategies use this to decide what `status` to write
-     * when the harness accepts a Final Answer:
-     *  - [FinalAnswerAction.EXIT]  → "closed" (true exit).
-     *  - [FinalAnswerAction.PARK]  → "standby" if
-     *    [lifecycle] is STANDBY, else "closed".
-     */
-    val finalAnswerAction: FinalAnswerAction = FinalAnswerAction.EXIT,
-    /**
      * Callback to compress [memory] in-place, persisting the
      * summary back to the underlying store (DB when
      * `agentDbClient` is set).  Provided by [AkibaAgent] via
@@ -203,6 +188,14 @@ class StrategyContext(
      * call, processes its response, then blocks before the next call.
      */
     val pauseCheckProvider: (() -> Boolean)? = null,
+
+    /**
+     * Returns `true` when the user has requested an immediate LLM retry
+     * (skipping the remaining backoff).  The [callLLM] retry loop polls
+     * this every 500ms during the backoff delay and breaks out early
+     * when it returns `true`.
+     */
+    val retryNowRequestedProvider: (() -> Boolean)? = null,
 ) {
     /** Accumulated counters during the loop. Mutable, shared across the strategy. */
     @Suppress("LeakingThis")
@@ -272,7 +265,7 @@ class StrategyContext(
      *
      * @return the completion, or null if cancelled or interrupted.
      */
-    fun callLLM(systemPrompt: String): ChatCompletion? {
+    suspend fun callLLM(systemPrompt: String): ChatCompletion? {
         fun invokeChat(): ChatCompletion {
             val baseMessages = contextMessagesProvider?.invoke() ?: memory.messages()
             val messagesForCall = baseMessages + consumeTransientMessages()
@@ -352,16 +345,50 @@ class StrategyContext(
                     retryAttempt++
 
                     val backoffLabel = formatBackoffDuration(backoffMs)
+                    val nextRetryEpoch = System.currentTimeMillis() + backoffMs
                     logger.warn(
                         "LLM call failed (retry #$retryAttempt). " +
                             "Retrying in $backoffLabel: ${initialError.message}"
                     )
 
+                    // Write a UI-visible status message so the frontend
+                    // can show "LLM timed out, retry #N in X minutes".
+                    // Uses role="system" with a sentinel prefix that
+                    // PersistentChatMemory filters out of the LLM context.
+                    if (sessionId != null && agentDbClient != null) {
+                        try {
+                            val statusContent = "$LLM_RETRY_STATUS_PREFIX retry=$retryAttempt backoffMs=$backoffMs nextRetryEpochMs=$nextRetryEpoch error=${initialError.message ?: initialError.javaClass.simpleName}"
+                            agentDbClient.appendMessages(
+                                sessionId,
+                                listOf(AgentDatabaseClient.MessageData(
+                                    role = "system",
+                                    content = statusContent,
+                                ))
+                            )
+                        } catch (_: Exception) { /* best-effort UI update */ }
+                    }
+
+                    // Wait with early-exit support: the user can request
+                    // an immediate retry via the "Retry Now" button,
+                    // which sets retryNowRequested on the JobHandle.
                     try {
-                        Thread.sleep(backoffMs)
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        stats.lastError = "LLM retry interrupted: ${initialError.message}"
+                        val retryProvider = retryNowRequestedProvider
+                        if (retryProvider != null) {
+                            // Poll every 500ms for early-exit
+                            var remaining = backoffMs
+                            while (remaining > 0 && !retryProvider()) {
+                                val step = minOf(remaining, 500L)
+                                delay(step)
+                                remaining -= step
+                            }
+                            if (retryProvider()) {
+                                logger.info("LLM retry #$retryAttempt triggered manually (early exit from ${formatBackoffDuration(backoffMs - remaining)} waited, ${formatBackoffDuration(remaining)} skipped)")
+                            }
+                        } else {
+                            delay(backoffMs)
+                        }
+                    } catch (_: kotlinx.coroutines.CancellationException) {
+                        stats.lastError = "LLM retry cancelled: ${initialError.message}"
                         logger.warn(stats.lastError)
                         return null
                     }
@@ -377,6 +404,19 @@ class StrategyContext(
                     try {
                         val result = invokeChat()
                         logger.info("LLM retry #$retryAttempt succeeded after $backoffLabel backoff")
+                        // Write a success-notice so the frontend can
+                        // clear the retry banner.
+                        if (sessionId != null && agentDbClient != null) {
+                            try {
+                                agentDbClient.appendMessages(
+                                    sessionId,
+                                    listOf(AgentDatabaseClient.MessageData(
+                                        role = "system",
+                                        content = "$LLM_RETRY_STATUS_PREFIX retry=$retryAttempt status=recovered",
+                                    ))
+                                )
+                            } catch (_: Exception) {}
+                        }
                         return result
                     } catch (retryError: Exception) {
                         stats.lastError = "${initialError.message}; retry #$retryAttempt failed: ${retryError.message}"
@@ -772,13 +812,19 @@ class ReActStrategy : AgentStrategy {
                 logger.info("[ReAct] Session resumed from pause")
             }
 
+            // Mailbox draining is framework infrastructure, not a
+            // domain-harness responsibility. Run it unconditionally
+            // before the overridable harness hook so every resumed
+            // agent marks its wake message as read.
+            val mailboxDrain = applyMailboxDrain(ctx, ctx.mailboxService)
+            ctx.applyHarnessDirective(mailboxDrain, "mailbox.drain")
             val beforeIteration = ctx.harness.beforeIteration(ctx)
             ctx.applyHarnessDirective(beforeIteration, "harness.beforeIteration")
             val beforeChat = ctx.harness.beforeChat(ctx)
             ctx.applyHarnessDirective(beforeChat, "harness.beforeChat")
             val resumeHint = if (ctx.resumedFromStandby) {
                 "[system: you are being woken from standby by new mailbox messages; " +
-                    "the default harness has drained the unread messages into this turn " +
+                    "the framework has drained the unread messages into this turn " +
                     "as user messages. Continue from where you parked — do NOT re-introduce " +
                     "yourself or restart the task.]"
             } else null
@@ -1005,7 +1051,26 @@ class ReActStrategy : AgentStrategy {
                             continue
                         }
                         ctx.stats.awaitConditionRegistered = true
-                        logger.info("[ReAct] await_condition registered — exiting loop immediately with StopReason.STANDBY")
+
+                        // Park-side gate: let the harness inspect current
+                        // state and optionally block the park.  This is
+                        // independent from validateFinalAnswer (exit gate)
+                        // because the checks differ — e.g. "children still
+                        // running" is fine for park but not for exit.
+                        val parkDirective = ctx.harness.validatePark(ctx, assistantText)
+                        ctx.applyHarnessDirective(parkDirective, "harness.validatePark")
+                        if (parkDirective.rejectPark) {
+                            // The tool has already registered the condition.
+                            // A rejected park must roll it back; otherwise the
+                            // still-running agent carries a stale condition
+                            // that may fire before its next valid park.
+                            ctx.sessionId?.let { WakeConditionRegistry.clearAll(it) }
+                            ctx.stats.awaitConditionRegistered = false
+                            logger.info("[ReAct] Harness rejected park; rolled back wake condition and continuing loop")
+                            continue
+                        }
+
+                        logger.info("[ReAct] await_condition registered — exiting loop with StopReason.STANDBY")
                         ctx.updateSessionStatus("standby")
                         val standbyResult = ctx.stats.toResult(
                             output = assistantText,
@@ -1027,51 +1092,9 @@ class ReActStrategy : AgentStrategy {
                     ctx.applyHarnessDirective(finalAnswerDirective, "harness.validateFinalAnswer")
 
                     if (!finalAnswerDirective.rejectFinalAnswer) {
-                        // LLM explicitly signaled it's done and harness accepted it.
-                        //
-                        // StopReason decision:
-                        //  - If the LLM called `await_condition` during
-                        //    this run (awaitConditionRegistered=true),
-                        //    it wants to PARK and wait for the wake
-                        //    condition.  Use [StopReason.STANDBY] so the
-                        //    runtime transitions to STANDBY (for
-                        //    lifecycle=STANDBY) or CLOSED (for ONE_SHOT).
-                        //  - Otherwise, the agent is truly done.  Use
-                        //    [StopReason.COMPLETED] with the status
-                        //    derived from [FinalAnswerAction].
-                        //
-                        // This replaces the old "Enter standby mode."
-                        // text marker: the LLM now expresses "I want
-                        // to park" by calling `await_condition` rather
-                        // than emitting a magic string.  The marker
-                        // path below is kept as a fallback for agents
-                        // that don't have the tool in their registry.
-                        if (ctx.stats.awaitConditionRegistered) {
-                            logger.info(
-                                "[ReAct] Final Answer after await_condition — " +
-                                    "exiting with StopReason.STANDBY"
-                            )
-                            ctx.updateSessionStatus("standby")
-                            val result = ctx.stats.toResult(
-                                output = finalAnswer,
-                                stopReason = StopReason.STANDBY,
-                            )
-                            ctx.transcript?.writeSessionEnd(result)
-                            return compactAndReturn(ctx, result)
-                        }
-
-                        // No await_condition: truly done.
-                        // The `status` we write depends on
-                        // [FinalAnswerAction]:
-                        //  - EXIT:  "cancelling" (two-step transition to
-                        //    "closed" via the parent's finally block).
-                        //  - PARK:  "standby" if lifecycle=STANDBY;
-                        //    "closed" if lifecycle=ONE_SHOT.
-                        val finalStatus = when (ctx.finalAnswerAction) {
-                            FinalAnswerAction.EXIT -> "cancelling"
-                            FinalAnswerAction.PARK -> if (ctx.lifecycle == Lifecycle.STANDBY) "standby" else "closed"
-                        }
-                        ctx.updateSessionStatus(finalStatus)
+                        // Final Answer is the sole exit path. Park is
+                        // exclusively requested via await_condition.
+                        ctx.updateSessionStatus("cancelling")
                         val result = ctx.stats.toResult(
                             output = finalAnswer,
                             stopReason = StopReason.COMPLETED
@@ -1094,12 +1117,9 @@ class ReActStrategy : AgentStrategy {
             }
         }
 
-        // Max iterations
+        // Max iterations: preserve long-lived STANDBY agents as a
+        // safety fallback; ONE_SHOT agents remain terminal errors.
         logger.warn("[ReAct] reached max iterations (${ctx.maxIterations})")
-        // A STANDBY agent that hits max iterations should park back to
-        // STANDBY rather than ERROR, so it can be woken again later.
-        // A ONE_SHOT agent is terminal either way, so "error" is still
-        // the right signal (the session will be closed, not resumed).
         if (ctx.lifecycle == Lifecycle.STANDBY) {
             ctx.updateSessionStatus("standby", reason = "max_iterations: ${ctx.maxIterations}")
         } else {
@@ -1248,6 +1268,10 @@ class PlanExecuteStrategy(
 
         logger.info("[PlanExec] Harness: ${ctx.harness.name}")
         ctx.applyHarnessDirective(ctx.harness.beforeRun(ctx), "harness.beforeRun")
+        // Planning performs an LLM call before executePlan reaches its
+        // per-step drain, so consume wake mail once at strategy entry.
+        val initialMailboxDrain = applyMailboxDrain(ctx, ctx.mailboxService)
+        ctx.applyHarnessDirective(initialMailboxDrain, "mailbox.drain")
 
         // Write system prompt to transcript at start
         ctx.transcript?.writeSystemPrompt(ctx.buildEffectiveSystemPrompt(PLANNING_INSTRUCTION))
@@ -1295,30 +1319,9 @@ class PlanExecuteStrategy(
                 is ExecResult.Completed -> {
                     // ── Phase 3: Reflection ────────────────────────────
                     val finalAnswer = reflect(ctx)
-                    // Same await_condition check as the ReAct path:
-                    // if the LLM registered a wake condition during
-                    // execution, park to STANDBY instead of COMPLETED.
-                    if (ctx.stats.awaitConditionRegistered) {
-                        logger.info(
-                            "[PlanExec] Final Answer after await_condition — " +
-                                "exiting with StopReason.STANDBY"
-                        )
-                        ctx.updateSessionStatus("standby")
-                        val result = ctx.stats.toResult(
-                            output = finalAnswer,
-                            stopReason = StopReason.STANDBY,
-                        )
-                        ctx.transcript?.writeSessionEnd(result)
-                        return compactAndReturn(ctx, result)
-                    }
-                    // No await_condition: truly done.
-                    //  - EXIT  → "cancelling" (two-step to "closed").
-                    //  - PARK  → "standby" if STANDBY lifecycle, else "closed".
-                    val finalStatus = when (ctx.finalAnswerAction) {
-                        FinalAnswerAction.EXIT -> "cancelling"
-                        FinalAnswerAction.PARK -> if (ctx.lifecycle == Lifecycle.STANDBY) "standby" else "closed"
-                    }
-                    ctx.updateSessionStatus(finalStatus)
+                    // Final Answer is the sole exit path. Park is
+                    // exclusively requested via await_condition.
+                    ctx.updateSessionStatus("cancelling")
                     val result = ctx.stats.toResult(
                         output = finalAnswer,
                         stopReason = StopReason.COMPLETED
@@ -1373,14 +1376,9 @@ class PlanExecuteStrategy(
         // Exceeded max replan cycles
         logger.warn("[PlanExec] Exceeded max replan cycles ($maxReplanCycles)")
         val finalAnswer = reflect(ctx)
-        // Same Final-Answer semantics as the normal Completed path —
-        // see the long comment at the `is ExecResult.Completed`
-        // branch for why we branch on `finalAnswerAction`.
-        val finalStatus = when (ctx.finalAnswerAction) {
-            FinalAnswerAction.EXIT -> "closed"
-            FinalAnswerAction.PARK -> if (ctx.lifecycle == Lifecycle.STANDBY) "standby" else "closed"
-        }
-        ctx.updateSessionStatus(finalStatus)
+        // Final Answer always requests exit; parking is handled by
+        // await_condition (or the max-iteration safety fallback).
+        ctx.updateSessionStatus("cancelling")
         val result = ctx.stats.toResult(
             output = finalAnswer,
             stopReason = StopReason.COMPLETED
@@ -1391,15 +1389,15 @@ class PlanExecuteStrategy(
 
     // ---- Phase 1: Planning ────────────────────────────────────────────
 
-    private fun createPlan(ctx: StrategyContext): List<PlanStep> {
+    private suspend fun createPlan(ctx: StrategyContext): List<PlanStep> {
         return requestPlan(ctx, PLANNING_INSTRUCTION)
     }
 
-    private fun replan(ctx: StrategyContext): List<PlanStep> {
+    private suspend fun replan(ctx: StrategyContext): List<PlanStep> {
         return requestPlan(ctx, AgentPrompts.replanPrompt())
     }
 
-    private fun requestPlan(ctx: StrategyContext, instruction: String): List<PlanStep> {
+    private suspend fun requestPlan(ctx: StrategyContext, instruction: String): List<PlanStep> {
         val beforeChat = ctx.harness.beforeChat(ctx)
         ctx.applyHarnessDirective(beforeChat, "harness.beforeChat")
         val systemPrompt = ctx.buildEffectiveSystemPrompt(
@@ -1466,7 +1464,7 @@ class PlanExecuteStrategy(
         object StandbyRequested : ExecResult()
     }
 
-    private fun executePlan(ctx: StrategyContext, plan: List<PlanStep>): ExecResult {
+    private suspend fun executePlan(ctx: StrategyContext, plan: List<PlanStep>): ExecResult {
         val logger = ctx.logger
 
         for ((stepIdx, step) in plan.withIndex()) {
@@ -1505,6 +1503,10 @@ class PlanExecuteStrategy(
                 stepIterations++
                 ctx.stats.iterations++
 
+                // Keep mailbox consumption independent from custom
+                // harness implementations, matching the ReAct path.
+                val mailboxDrain = applyMailboxDrain(ctx, ctx.mailboxService)
+                ctx.applyHarnessDirective(mailboxDrain, "mailbox.drain")
                 val beforeIteration = ctx.harness.beforeIteration(ctx)
                 ctx.applyHarnessDirective(beforeIteration, "harness.beforeIteration")
                 val beforeChat = ctx.harness.beforeChat(ctx)
@@ -1608,6 +1610,16 @@ class PlanExecuteStrategy(
                             continue
                         }
                         ctx.stats.awaitConditionRegistered = true
+
+                        val parkDirective = ctx.harness.validatePark(ctx, assistantText)
+                        ctx.applyHarnessDirective(parkDirective, "harness.validatePark")
+                        if (parkDirective.rejectPark) {
+                            ctx.sessionId?.let { WakeConditionRegistry.clearAll(it) }
+                            ctx.stats.awaitConditionRegistered = false
+                            logger.info("[PlanExec] Harness rejected park; rolled back wake condition and continuing step loop")
+                            continue
+                        }
+
                         logger.info("[PlanExec] await_condition registered — exiting immediately")
                         return ExecResult.StandbyRequested
                     }
@@ -1642,7 +1654,7 @@ class PlanExecuteStrategy(
 
     // ---- Phase 3: Reflection ──────────────────────────────────────────
 
-    private fun reflect(ctx: StrategyContext): String {
+    private suspend fun reflect(ctx: StrategyContext): String {
         val beforeChat = ctx.harness.beforeChat(ctx)
         ctx.applyHarnessDirective(beforeChat, "harness.beforeChat")
         val systemPrompt = ctx.buildEffectiveSystemPrompt(

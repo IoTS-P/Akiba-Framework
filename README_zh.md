@@ -325,7 +325,7 @@ Akiba 提供了内置的 LLM agent 基础设施，用于智能二进制分析。
 
 - `run_module` — 委托工作给另一个 AkibaModule
 - `spawn_sub_agent` — 异步生成子 LLM agent（模板或自由）
-- `await_agent` — 等待异步子 agent 达到目标状态
+- `await_multiple_children` — 等待异步子 agent 达到目标状态
 - `query_module_data` — 从数据库查询分析结果
 - `query_session_history` — 查看过去的 agent 会话
 - `query_memories` — 搜索长期记忆存储

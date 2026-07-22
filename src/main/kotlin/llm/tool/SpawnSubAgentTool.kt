@@ -10,7 +10,6 @@ import org.iotsplab.akiba.llm.agent.AgentTemplateRegistry
 import org.iotsplab.akiba.llm.agent.AgentTranscriptWriter
 import org.iotsplab.akiba.llm.agent.AkibaAgent
 import org.iotsplab.akiba.llm.agent.ConversationRegistry
-import org.iotsplab.akiba.llm.agent.FinalAnswerAction
 import org.iotsplab.akiba.llm.agent.JobHandle
 import org.iotsplab.akiba.llm.agent.Lifecycle
 import org.iotsplab.akiba.llm.agent.ModelContextLengthService
@@ -49,7 +48,8 @@ import org.iotsplab.akiba.llm.skill.SkillManager
  *     a minimal [AkibaAgent] directly, with no template
  *     validation.
  *
- * The parent typically follows up with `await_agent childId=...`
+ * The parent typically follows up with `await_condition` (using
+ * a `StateChanged` condition on the child) or `await_multiple_children`
  * to wait for a specific state.
  */
 fun SpawnSubAgentTool(
@@ -143,8 +143,9 @@ fun SpawnSubAgentTool(
             appendLine("Spawn a child LLM agent ASYNCHRONOUSLY.")
             appendLine("Returns immediately with `{childSessionId, runtimeState, lifecycle, handle, mode}` —")
             appendLine("the actual run() happens in a background coroutine on the per-binary runtime.")
-            appendLine("Use `await_agent childId=<id> until=<state> timeoutMs=<n>` to wait for the child")
-            appendLine("to reach a specific state (e.g. `closed` for one-shot, `standby` for parked).")
+            appendLine("Use `await_condition` with a `StateChanged` condition on the child, or")
+            appendLine("`await_multiple_children` to wait for it to reach a specific state")
+            appendLine("(e.g. `closed` for one-shot, `standby` for parked).")
             appendLine()
             appendLine("Mode A — template (recommended for production): set `templateId` to a recipe")
             appendLine("returned by agent_builder_alternatives; the orchestrator validates inputs and")
@@ -466,23 +467,6 @@ private fun spawnFromTemplate(
                 templateId = template.id,
                 depth = resolved.childDepth,
                 initialLifecycle = resolved.effectiveLifecycle,
-                // Match the AkibaAgent default for the template's
-                // declared lifecycle: STANDBY children park on
-                // Final Answer so they can keep accepting mail
-                // (the parent's mailbox dispatcher will wake them
-                // on demand); ONE_SHOT children exit.  A template
-                // that wants to override this can set
-                // `onFinalAnswer` explicitly on the agent it
-                // builds inside its factory — the
-                // [AkibaAgent.onFinalAnswer] field is read by the
-                // strategy for status updates; the value passed
-                // here is read by [runChildJob] for state
-                // transitions, and the two are kept in lockstep
-                // by the convention "if the agent's
-                // onFinalAnswer != lifecycle default, override
-                // here too".
-                onFinalAnswer = if (resolved.effectiveLifecycle == Lifecycle.STANDBY)
-                    FinalAnswerAction.PARK else FinalAnswerAction.EXIT,
                 taskPrompt = taskPrompt,
                 factory = factoryRef,
                 forceCompactBeforeRun = reuseSessionId != null && forceCompactBeforeRun,
@@ -499,7 +483,7 @@ private fun spawnFromTemplate(
                 "depth" to resolved.childDepth,
                 "reusedSession" to (reuseSessionId != null),
                 "forceCompactBeforeRun" to (reuseSessionId != null && forceCompactBeforeRun),
-                "nextStep" to "Use await_agent childId=$childSessionId until=<state> to wait, " +
+                "nextStep" to "Use await_multiple_children or await_condition to wait, " +
                     "or send_agent_message to push follow-up work.",
             ))
         }
@@ -592,7 +576,7 @@ private fun spawnFreeform(
             "lifecycle" to Lifecycle.ONE_SHOT.name.lowercase(),
             "runtimeState" to result.handle.state.value.wire(),
             "depth" to 1,
-            "nextStep" to "Use await_agent childId=${result.childSessionId} until=<state> to wait.",
+            "nextStep" to "Use await_multiple_children or await_condition to wait.",
         ))
     } catch (e: Exception) {
         "Error spawning freeform sub-agent: ${e.message}"
@@ -871,16 +855,6 @@ fun spawnChildFromTemplateProgrammatically(
             templateId = template.id,
             depth = depth,
             initialLifecycle = resolved.effectiveLifecycle,
-            // Match the AkibaAgent default for the template's
-            // declared lifecycle — see the long comment in the
-            // tool-path `spawnFromTemplate` above.  Programmatic
-            // host-side callers that want a STANDBY child to truly
-            // exit on Final Answer should override the agent's
-            // `onFinalAnswer` in the template's factory and pass
-            // the matching value to this spawn (the AkibaAgent
-            // default rule is: STANDBY → PARK, ONE_SHOT → EXIT).
-            onFinalAnswer = if (resolved.effectiveLifecycle == Lifecycle.STANDBY)
-                FinalAnswerAction.PARK else FinalAnswerAction.EXIT,
             taskPrompt = taskPrompt,
             factory = factoryRef,
         )

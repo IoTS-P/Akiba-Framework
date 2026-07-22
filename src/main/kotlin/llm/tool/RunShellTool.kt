@@ -4,11 +4,6 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import kotlinx.coroutines.*
 import org.iotsplab.akiba.llm.agent.AgentModule
 import java.io.InputStream
-import java.net.URI
-import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
-import java.time.Duration
 
 /**
  * Create a tool that allows the agent to execute shell commands.
@@ -67,10 +62,18 @@ fun RunShellTool(
         appendLine()
         appendLine("Constraints:")
         appendLine("  - Each command requires user confirmation (execution may be denied)")
-        appendLine("  - The workspace directory is EMPTY by default — no binary files are in it")
-        appendLine("  - The loaded binary is accessible ONLY via `program` in run_script")
+        appendLine("  - The workspace directory contains a `binary` symlink pointing to a copy of")
+        appendLine("    the analyzed binary file. You can use `./binary` to access it with tools")
+        appendLine("    like xxd, file, binwalk, etc. This copy is separate from the original —")
+        appendLine("    modifying it does NOT affect the Ghidra project's binary.")
+        appendLine("  - The loaded binary is also accessible via `program` in run_script")
         appendLine("  - Do NOT use shell for: objdump, readelf, strings, nm — use run_script instead,")
         appendLine("    which has direct access to the same information via Ghidra APIs")
+        appendLine()
+        appendLine("Working directory:")
+        appendLine("  - Relative paths resolve within the workspace (default: workspace root).")
+        appendLine("  - Absolute paths are accepted for workDir, but using a directory **outside**")
+        appendLine("    the workspace requires user confirmation before the command runs.")
     },
     parameters = listOf(
         ToolParameter(
@@ -85,8 +88,9 @@ fun RunShellTool(
         ),
         ToolParameter(
             "workDir", "string",
-            "Optional relative subdirectory within the workspace to use as CWD. " +
-                "Defaults to the workspace root.",
+            "Optional relative subdirectory within the workspace, or an absolute path. " +
+                "Defaults to the workspace root. Absolute paths outside the workspace " +
+                "require user confirmation.",
             required = false
         )
     )
@@ -103,9 +107,58 @@ fun RunShellTool(
     val workDirRel = args["workDir"] as? String
 
     // Resolve working directory
+    //
+    // Relative paths resolve within the workspace (the default). Absolute
+    // paths are accepted, but if the resolved CWD is outside the workspace
+    // boundary the user must confirm before the command can run.
     val cwd = if (workDirRel != null) {
-        parent.resolveWorkspacePath(workDirRel).toFile().also {
-            if (!it.exists()) it.mkdirs()
+        val isAbsolute = workDirRel.startsWith("/") ||
+            (workDirRel.length >= 2 && workDirRel[1] == ':') ||
+            workDirRel.startsWith("\\")
+        if (isAbsolute) {
+            val absPath = java.nio.file.Paths.get(workDirRel).normalize().toFile()
+            // Check if this is outside the workspace
+            val workspaceRoot = parent.workspaceDir.normalize()
+            val resolvedAbs = absPath.toPath().normalize()
+            if (!resolvedAbs.startsWith(workspaceRoot)) {
+                // Outside workspace — require confirmation
+                val sessionId = (parent as? org.iotsplab.akiba.llm.agent.AgentModule)?.agentSessionId
+                val serverPort = detectWorkerServerPort()
+                val approved = if (!sessionId.isNullOrBlank() && serverPort != null) {
+                    requestConfirmationViaHttp(
+                        serverPort = serverPort,
+                        sessionId = sessionId,
+                        toolName = "run_shell",
+                        command = "use CWD: ${absPath.absolutePath}",
+                        workingDirectory = "(outside workspace)",
+                        timeout = 0,
+                        action = "file_access",
+                        targetPath = absPath.absolutePath
+                    )
+                } else if (!sessionId.isNullOrBlank()) {
+                    ConfirmationManager.requestFileAccessConfirmationBlocking(
+                        sessionId = sessionId,
+                        toolName = "run_shell",
+                        operation = "use CWD",
+                        targetPath = absPath.absolutePath
+                    )
+                } else {
+                    false
+                }
+                if (!approved) {
+                    return@Tool mapper.writeValueAsString(mapOf(
+                        "denied" to true,
+                        "message" to "User denied use of working directory outside workspace: ${absPath.absolutePath}",
+                        "command" to command
+                    ))
+                }
+            }
+            if (!absPath.exists()) absPath.mkdirs()
+            absPath
+        } else {
+            parent.resolveWorkspacePath(workDirRel).toFile().also {
+                if (!it.exists()) it.mkdirs()
+            }
         }
     } else {
         parent.workspaceDir.toFile()
@@ -132,10 +185,8 @@ fun RunShellTool(
     //    The classic y/N prompt on System.in. Used in development / testing.
     //
     if (requireConfirmation) {
-        val sessionId = parent.agentSessionId
-        // Detect worker mode: the server passes its port via env var
-        // (see AgentRoutes.runManualAgentWorker).
-        val serverPort = System.getenv("AKIBA_MANUAL_AGENT_SERVER_PORT")?.toIntOrNull()
+        val sessionId = (parent as? org.iotsplab.akiba.llm.agent.AgentModule)?.agentSessionId
+        val serverPort = detectWorkerServerPort()
 
         val approved = when {
             // Cross-process: worker → HTTP long-poll → server → ConfirmationManager
@@ -143,9 +194,11 @@ fun RunShellTool(
                 requestConfirmationViaHttp(
                     serverPort = serverPort,
                     sessionId = sessionId,
+                    toolName = "run_shell",
                     command = command,
                     workingDirectory = cwd.absolutePath,
-                    timeout = timeout
+                    timeout = timeout,
+                    action = "shell_command"
                 )
             }
             // In-process: tool and HTTP server share the same JVM
@@ -155,7 +208,8 @@ fun RunShellTool(
                     toolName = "run_shell",
                     command = command,
                     workingDirectory = cwd.absolutePath,
-                    timeout = timeout
+                    timeout = timeout,
+                    action = "shell_command"
                 )
             }
             // Stdin fallback for CLI / dev mode
@@ -297,57 +351,4 @@ private fun drainStream(stream: InputStream, maxChars: Int): Pair<String, Boolea
         // Stream closed or IO error — expected during process kill / cancellation.
     }
     return buffer.toString() to truncated
-}
-
-/**
- * Request user confirmation via HTTP callback to the AkibaServer.
- *
- * Used when the tool executes in a **separate worker process** (manual-agent
- * mode). The worker cannot access the server's in-process [ConfirmationManager]
- * directly, so it POSTs to the server's `POST /agent/internal/confirmation/request`
- * endpoint. The server registers the pending request in [ConfirmationManager]
- * (making it visible to the frontend via `GET /agent/sessions/{id}`) and
- * **blocks the HTTP response** until the user responds via
- * `POST .../confirmation/respond` (or the 5-minute confirmation timeout expires).
- *
- * This is a **long-poll** pattern: the HTTP client's timeout is set to 6 minutes
- * (1 minute longer than the server-side confirmation timeout) to ensure the
- * client doesn't time out before the server.
- *
- * @return `true` if the user approved, `false` if denied, timed out, or the
- *         HTTP call failed.
- */
-private fun requestConfirmationViaHttp(
-    serverPort: Int,
-    sessionId: String,
-    command: String,
-    workingDirectory: String,
-    timeout: Int
-): Boolean {
-    val mapper = jacksonObjectMapper()
-    val body = mapper.writeValueAsString(mapOf(
-        "sessionId" to sessionId,
-        "toolName" to "run_shell",
-        "command" to command,
-        "workingDirectory" to workingDirectory,
-        "timeout" to timeout
-    ))
-    return try {
-        val request = HttpRequest.newBuilder()
-            .uri(URI.create("http://127.0.0.1:$serverPort/api/agent/internal/confirmation/request"))
-            .timeout(Duration.ofMinutes(6))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(body))
-            .build()
-        val response = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
-            .build()
-            .send(request, HttpResponse.BodyHandlers.ofString())
-        if (response.statusCode() !in 200..299) return false
-        val result = mapper.readValue(response.body(), Map::class.java)
-        result["approved"] == true
-    } catch (_: Exception) {
-        // Network error, timeout, or parse failure — deny by default.
-        false
-    }
 }

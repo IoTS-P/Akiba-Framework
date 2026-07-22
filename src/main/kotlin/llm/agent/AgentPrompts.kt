@@ -292,19 +292,6 @@ object AgentPrompts {
         Then choose EXACTLY ONE of:
         - **Action:** followed by ONE OR MORE JSON tool_call blocks (see below).
         - **Final Answer:** <your final conclusion>.
-        - **Enter standby mode.** (as the last non-blank line of your
-          response) — only valid when your lifecycle is
-          `standby`. Signals "I have nothing more to do right now;
-          park the session and wake me when a new mailbox message
-          arrives." The runtime translates this to
-          `runtime_state=standby`.
-
-        CRITICAL — THE TWO MARKERS ARE MUTUALLY EXCLUSIVE:
-        **Final Answer:** and **Enter standby mode.** MUST NOT appear
-        in the same response.  They are detected in order: Final Answer
-        takes precedence, so if you write both, the standby marker is
-        IGNORED and the session will be CLOSED (not parked).  Use one
-        or the other, never both.
 
         STOPPING RULE: as soon as you have gathered enough information to answer
         the user's question, you MUST emit **Final Answer:** as the very first
@@ -312,18 +299,16 @@ object AgentPrompts {
         output the answer body without the **Final Answer:** marker — the system
         cannot recognise an answer that lacks this prefix.
 
-        STANDBY-MODE RULE (only for `lifecycle=standby` agents): when you have
-        finished a wake cycle and want to wait for the next mailbox
-        message WITHOUT closing the session, end your response with
-        the literal line `Enter standby mode.` (capital E, lower-case
-        `standby mode`, trailing period — the exact text, no
-        preamble). The runtime will park the session to
-        `runtime_state=standby`. Do NOT emit the marker when your
-        reasoning is incomplete or you still have tools to call —
-        keep going until you either reach a real Final Answer or
-        genuinely have nothing left to do for this wake.  Do NOT
-        combine the standby marker with **Final Answer:** — they are
-        mutually exclusive (see rule above).
+        PARKING RULE (for `lifecycle=standby` agents): to park the session and
+        wait for a wake condition, call the `await_condition` tool.  The agent
+        will be parked to `runtime_state=standby` immediately after the tool
+        call succeeds — you do NOT need to also emit a Final Answer.  The
+        `condition` parameter is OPTIONAL: when omitted, the agent parks with a
+        default "wake on any new message" condition.  You may also specify a
+        structured condition (message_arrived, state_changed, time_elapsed,
+        allOf, anyOf) for finer control.  Do NOT call `await_condition` when
+        your reasoning is incomplete or you still have tools to call — keep
+        going until you genuinely have nothing left to do for this wake.
 
         Tool-call JSON block (each call is its own ```json fence):
         ```json

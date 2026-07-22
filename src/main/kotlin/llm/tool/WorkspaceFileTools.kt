@@ -3,12 +3,14 @@ package org.iotsplab.akiba.llm.tool
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.module.AkibaModule
 import java.io.IOException
+import java.nio.charset.Charset
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
+import kotlin.io.path.pathString
 
 // ============================================================
 //  WorkspaceFileTools — sandboxed file I/O for LLM agents
@@ -28,6 +30,7 @@ import java.nio.file.attribute.BasicFileAttributes
  * - `create_workspace_dir`  — create directories
  * - `move_workspace_file`   — move or rename files / directories
  * - `delete_workspace_file` — delete files or directories
+ * - `grep_workspace`       — search file contents with regex
  *
  * ```kotlin
  * override fun defineTools(): List<Tool> = BuiltInTools.all(this, agentDbClient) + WorkspaceFileTools(this)
@@ -40,6 +43,7 @@ fun WorkspaceFileTools(parent: AkibaModule): List<Tool> = listOf(
     CreateWorkspaceDirTool(parent),
     MoveWorkspaceFileTool(parent),
     DeleteWorkspaceFileTool(parent),
+    GrepWorkspaceTool(parent),
 )
 
 // ============================================================
@@ -102,6 +106,113 @@ private fun resolveAndValidateWorkspacePath(parent: AkibaModule, relativePath: S
     return resolved
 }
 
+/**
+ * Result of resolving a path that may be inside **or outside** the workspace.
+ *
+ * - When [insideWorkspace] is `true`, the path was resolved within the
+ *   workspace boundary and is safe to access without confirmation.
+ * - When [insideWorkspace] is `false`, the path resolves to a location
+ *   outside the workspace. The caller **must** request user confirmation
+ *   before performing any I/O on it.
+ */
+private data class ResolvedPath(
+    val path: Path,
+    val insideWorkspace: Boolean
+)
+
+/**
+ * Resolve an arbitrary path (relative or absolute) against the workspace.
+ *
+ * Unlike [resolveAndValidateWorkspacePath], this function **does not reject**
+ * paths outside the workspace. Instead it returns a [ResolvedPath] indicating
+ * whether the final (normalised, symlink-checked) path is inside or outside.
+ *
+ * Security checks still performed:
+ * - Reject NUL bytes
+ * - If the file exists, verify the real (symlink-resolved) path to detect
+ *   symlink escapes
+ *
+ * @param parent     The owning [AkibaModule].
+ * @param rawPath     The path string (relative to workspace, or absolute).
+ * @return The [ResolvedPath], or `null` if the path is fundamentally invalid
+ *         (blank, contains NUL bytes, or symlink-resolves to a path that
+ *         cannot be determined).
+ */
+private fun resolvePathWithBoundary(parent: AkibaModule, rawPath: String): ResolvedPath? {
+    if (rawPath.isBlank()) return null
+    if (rawPath.contains('\u0000')) return null
+
+    val workspaceRoot = parent.workspaceDir.normalize()
+    val p = rawPath.trim()
+
+    val resolved = if (p.startsWith("/") || (p.length >= 2 && p[1] == ':') || p.startsWith("\\")) {
+        // Absolute path — resolve as-is
+        java.nio.file.Paths.get(p).normalize()
+    } else {
+        // Relative path — resolve against workspace root
+        workspaceRoot.resolve(p).normalize()
+    }
+
+    var inside = resolved.startsWith(workspaceRoot)
+
+    // If the path exists, check the real (symlink-resolved) path
+    if (Files.exists(resolved)) {
+        try {
+            val realPath = resolved.toRealPath()
+            val realWorkspaceRoot = workspaceRoot.toRealPath()
+            inside = realPath.startsWith(realWorkspaceRoot)
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    return ResolvedPath(resolved, inside)
+}
+
+/**
+ * Request user confirmation for a file operation on a path outside the
+ * workspace. Works in both in-process and cross-process (worker) modes.
+ *
+ * @return `true` if the user approved, `false` if denied or timed out.
+ */
+private fun confirmFileAccess(
+    parent: AkibaModule,
+    toolName: String,
+    operation: String,
+    targetPath: Path
+): Boolean {
+    // agentSessionId is defined on the agent.AgentModule subclass, not the
+    // base module.AkibaModule. The tool's `parent` is typed as the base
+    // class, so we cast to access the session ID. If the cast fails (the
+    // module is not an agent module), auto-deny.
+    val sessionId = (parent as? org.iotsplab.akiba.llm.agent.AgentModule)?.agentSessionId
+        ?: return false
+    val serverPort = detectWorkerServerPort()
+    val pathStr = targetPath.toString()
+
+    return if (serverPort != null) {
+        // Cross-process: worker → HTTP long-poll → server → ConfirmationManager
+        requestConfirmationViaHttp(
+            serverPort = serverPort,
+            sessionId = sessionId,
+            toolName = toolName,
+            command = "$operation $pathStr",
+            workingDirectory = "(outside workspace)",
+            timeout = 0,
+            action = "file_access",
+            targetPath = pathStr
+        )
+    } else {
+        // In-process
+        ConfirmationManager.requestFileAccessConfirmationBlocking(
+            sessionId = sessionId,
+            toolName = toolName,
+            operation = operation,
+            targetPath = pathStr
+        )
+    }
+}
+
 // ============================================================
 //  read_workspace_file
 // ============================================================
@@ -114,17 +225,22 @@ private fun ReadWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
         appendLine("The workspace is an isolated sandbox where the agent can store intermediate results,")
         appendLine("notes, scripts, and other files produced during binary analysis.")
         appendLine()
+        appendLine("Paths **outside** the workspace are also accepted, but reading them requires")
+        appendLine("explicit user confirmation via the frontend. The tool will block until the user")
+        appendLine("approves or denies the access (or a 5-minute timeout expires).")
+        appendLine()
         appendLine("Parameters:")
-        appendLine("  - path:     Relative path to the file (e.g. \"notes.md\", \"output/results.json\")")
+        appendLine("  - path:     Relative path within the workspace, or an absolute path outside it")
         appendLine("  - maxChars: Maximum characters to read (default 200000). Content beyond this is truncated.")
         appendLine()
-        appendLine("Security: Only relative paths within the workspace are accepted. Absolute paths,")
-        appendLine("path traversal (..), and symlinks pointing outside the workspace are rejected.")
+        appendLine("Security: Relative paths resolve within the workspace. Absolute paths are allowed")
+        appendLine("but require user confirmation before access. NUL bytes and symlinks pointing to")
+        appendLine("indeterminate locations are rejected.")
     },
     parameters = listOf(
         ToolParameter(
             "path", "string",
-            "Relative path to the file within the workspace directory.",
+            "Relative path within the workspace, or an absolute path outside the workspace.",
             required = true
         ),
         ToolParameter(
@@ -140,13 +256,27 @@ private fun ReadWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
 
     val maxChars = (args["maxChars"] as? Number)?.toInt()?.coerceIn(1, MAX_READ_CHARS) ?: MAX_READ_CHARS
 
-    val resolvedPath = resolveAndValidateWorkspacePath(parent, pathStr)
+    val resolved = resolvePathWithBoundary(parent, pathStr)
         ?: return@Tool wsMapper.writeValueAsString(mapOf(
             "success" to false,
-            "error" to "Invalid or unsafe path: '$pathStr'. Only relative paths within the workspace are allowed. " +
-                "Absolute paths, path traversal (..), and symlinks pointing outside the workspace are rejected.",
+            "error" to "Invalid or unsafe path: '$pathStr'. NUL bytes and symlinks to indeterminate locations are rejected.",
             "workspaceDir" to parent.workspaceDir.toString()
         ))
+
+    // If the path is outside the workspace, require user confirmation
+    if (!resolved.insideWorkspace) {
+        val approved = confirmFileAccess(parent, "read_workspace_file", "read", resolved.path)
+        if (!approved) {
+            return@Tool wsMapper.writeValueAsString(mapOf(
+                "success" to false,
+                "denied" to true,
+                "error" to "User denied access to path outside workspace: $pathStr",
+                "path" to pathStr
+            ))
+        }
+    }
+
+    val resolvedPath = resolved.path
 
     if (!Files.exists(resolvedPath)) {
         return@Tool wsMapper.writeValueAsString(mapOf(
@@ -220,21 +350,25 @@ private fun WriteWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
         appendLine("   of `oldString` is replaced with `newString`. This is the recommended way to modify")
         appendLine("   a few lines, mirroring Claude Code / OpenCode / Codex edit tools.")
         appendLine()
+        appendLine("Paths **outside** the workspace are also accepted, but writing to them requires")
+        appendLine("explicit user confirmation via the frontend. The tool will block until the user")
+        appendLine("approves or denies the access (or a 5-minute timeout expires).")
+        appendLine()
         appendLine("Parameters:")
-        appendLine("  - path:       Relative path to the file within the workspace (required)")
+        appendLine("  - path:       Relative path within the workspace, or an absolute path outside it")
         appendLine("  - content:    Full text content to write / append (required for modes 1 & 2)")
         appendLine("  - append:     If true, append to the file instead of overwriting (default false)")
         appendLine("  - oldString:  Exact text to find. Must be unique in the file unless replaceAll=true")
         appendLine("  - newString:  Replacement text (default empty string = delete oldString)")
         appendLine("  - replaceAll: If true, replace every occurrence of oldString (default false)")
         appendLine()
-        appendLine("Security: Only relative paths within the workspace are accepted. Maximum content")
-        appendLine("size: 1,000,000 characters (approximately 1 MB).")
+        appendLine("Security: Relative paths resolve within the workspace. Absolute paths are allowed")
+        appendLine("but require user confirmation before access. Maximum content size: 1,000,000 characters.")
     },
     parameters = listOf(
         ToolParameter(
             "path", "string",
-            "Relative path to the file within the workspace directory.",
+            "Relative path within the workspace, or an absolute path outside the workspace.",
             required = true
         ),
         ToolParameter(
@@ -272,13 +406,32 @@ private fun WriteWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
     val newString = (args["newString"] as? String) ?: ""
     val replaceAll = args["replaceAll"] as? Boolean ?: false
 
-    val resolvedPath = resolveAndValidateWorkspacePath(parent, pathStr)
+    val resolved = resolvePathWithBoundary(parent, pathStr)
         ?: return@Tool wsMapper.writeValueAsString(mapOf(
             "success" to false,
-            "error" to "Invalid or unsafe path: '$pathStr'. Only relative paths within the workspace are allowed. " +
-                "Absolute paths, path traversal (..), and symlinks pointing outside the workspace are rejected.",
+            "error" to "Invalid or unsafe path: '$pathStr'. NUL bytes and symlinks to indeterminate locations are rejected.",
             "workspaceDir" to parent.workspaceDir.toString()
         ))
+
+    // If the path is outside the workspace, require user confirmation
+    if (!resolved.insideWorkspace) {
+        val operation = when {
+            oldString != null -> "edit"
+            args["append"] as? Boolean == true -> "append"
+            else -> "write"
+        }
+        val approved = confirmFileAccess(parent, "write_workspace_file", operation, resolved.path)
+        if (!approved) {
+            return@Tool wsMapper.writeValueAsString(mapOf(
+                "success" to false,
+                "denied" to true,
+                "error" to "User denied access to path outside workspace: $pathStr",
+                "path" to pathStr
+            ))
+        }
+    }
+
+    val resolvedPath = resolved.path
 
     // ---- Mode 3: local str_replace edit ----
     if (oldString != null) {
@@ -767,4 +920,198 @@ private fun DeleteWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
             "path" to pathStr
         ))
     }
+}
+
+// ============================================================
+//  grep_workspace
+// ============================================================
+
+/** Maximum total match output characters returned by [GrepWorkspaceTool]. */
+private const val MAX_GREP_OUTPUT_CHARS = 50_000
+
+/** Maximum number of matches returned by [GrepWorkspaceTool]. */
+private const val MAX_GREP_MATCHES = 200
+
+/** Maximum file size for grep to read (skip binary / huge files). */
+private const val MAX_GREP_FILE_SIZE: Long = 2_000_000
+
+private fun GrepWorkspaceTool(parent: AkibaModule): Tool = Tool(
+    name = "grep_workspace",
+    description = buildString {
+        appendLine("Search for a regex pattern across files in the agent's workspace directory.")
+        appendLine()
+        appendLine("Searches file contents line-by-line (like `grep -rn`). Only text files are")
+        appendLine("searched; binary files and files larger than 2 MB are skipped. Results include")
+        appendLine("the relative file path, line number, and the matching line content.")
+        appendLine()
+        appendLine("Paths **outside** the workspace are also accepted, but searching them requires")
+        appendLine("explicit user confirmation via the frontend. The tool will block until the user")
+        appendLine("approves or denies the access (or a 5-minute timeout expires).")
+        appendLine()
+        appendLine("Parameters:")
+        appendLine("  - pattern:    Regular expression to search for (Java/Kotlin regex syntax)")
+        appendLine("  - path:       Relative subdirectory or absolute path to search (default: workspace root)")
+        appendLine("  - caseInsensitive: If true, perform case-insensitive matching (default false)")
+        appendLine()
+        appendLine("Security: Relative paths resolve within the workspace. Absolute paths are allowed")
+        appendLine("but require user confirmation before access. NUL bytes and symlinks pointing to")
+        appendLine("indeterminate locations are rejected.")
+        appendLine("Maximum $MAX_GREP_MATCHES matches / $MAX_GREP_OUTPUT_CHARS characters returned.")
+    },
+    parameters = listOf(
+        ToolParameter(
+            "pattern", "string",
+            "Regular expression to search for in file contents.",
+            required = true
+        ),
+        ToolParameter(
+            "path", "string",
+            "Relative subdirectory within the workspace, or an absolute path outside it. Defaults to the workspace root.",
+            required = false
+        ),
+        ToolParameter(
+            "caseInsensitive", "boolean",
+            "If true, perform case-insensitive matching. Default false.",
+            required = false
+        )
+    ),
+    dedupStrategy = ToolDedupStrategy.RESULT_HASH,
+) { args ->
+    val patternStr = args["pattern"] as? String
+        ?: return@Tool "Error: 'pattern' parameter is required"
+
+    if (patternStr.isEmpty()) {
+        return@Tool wsMapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "Pattern must not be empty."
+        ))
+    }
+
+    val regex = try {
+        val flags = if (args["caseInsensitive"] as? Boolean == true)
+            setOf(RegexOption.IGNORE_CASE) else emptySet()
+        Regex(patternStr, flags)
+    } catch (e: Exception) {
+        return@Tool wsMapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "Invalid regex pattern: ${e.message}",
+            "pattern" to patternStr
+        ))
+    }
+
+    val pathStr = (args["path"] as? String)?.takeIf { it.isNotBlank() } ?: "."
+    val resolved = resolvePathWithBoundary(parent, pathStr)
+        ?: return@Tool wsMapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "Invalid or unsafe path: '$pathStr'. NUL bytes and symlinks to indeterminate locations are rejected.",
+            "workspaceDir" to parent.workspaceDir.toString()
+        ))
+
+    // If the path is outside the workspace, require user confirmation
+    if (!resolved.insideWorkspace) {
+        val approved = confirmFileAccess(parent, "grep_workspace", "grep", resolved.path)
+        if (!approved) {
+            return@Tool wsMapper.writeValueAsString(mapOf(
+                "success" to false,
+                "denied" to true,
+                "error" to "User denied access to path outside workspace: $pathStr",
+                "path" to pathStr
+            ))
+        }
+    }
+
+    val resolvedPath = resolved.path
+
+    if (!Files.exists(resolvedPath)) {
+        return@Tool wsMapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "Path not found: $pathStr",
+            "path" to pathStr
+        ))
+    }
+
+    if (!Files.isDirectory(resolvedPath)) {
+        return@Tool wsMapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "Path is not a directory: $pathStr. Use a directory path for grep.",
+            "path" to pathStr
+        ))
+    }
+
+    val workspaceRoot = parent.workspaceDir.normalize()
+    val matches = mutableListOf<Map<String, Any?>>()
+    var filesSearched = 0
+    var filesSkipped = 0
+    var truncated = false
+    var outputChars = 0
+
+    try {
+        Files.walkFileTree(resolvedPath, object : SimpleFileVisitor<Path>() {
+            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                // Skip files larger than the size limit
+                if (attrs.size() > MAX_GREP_FILE_SIZE) {
+                    filesSkipped++
+                    return FileVisitResult.CONTINUE
+                }
+
+                // Skip binary files by detecting NUL bytes in the first 8 KB
+                try {
+                    val probe = Files.newInputStream(file).use { it.readNBytes(8192) }
+                    if (probe.any { it == 0.toByte() }) {
+                        filesSkipped++
+                        return FileVisitResult.CONTINUE
+                    }
+                } catch (_: Exception) {
+                    filesSkipped++
+                    return FileVisitResult.CONTINUE
+                }
+
+                filesSearched++
+
+                try {
+                    val content = Files.readString(file, Charset.defaultCharset())
+                    val relPath = workspaceRoot.relativize(file.normalize()).pathString
+
+                    content.lineSequence().forEachIndexed { idx, line ->
+                        if (truncated) return@forEachIndexed
+                        if (regex.containsMatchIn(line)) {
+                            val matchEntry = mapOf<String, Any?>(
+                                "file" to relPath,
+                                "line" to (idx + 1),
+                                "content" to line.take(500)
+                            )
+                            outputChars += matchEntry.toString().length
+                            matches.add(matchEntry)
+                            if (matches.size >= MAX_GREP_MATCHES || outputChars >= MAX_GREP_OUTPUT_CHARS) {
+                                truncated = true
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                    // File could not be read as text — skip
+                    filesSkipped++
+                }
+
+                return if (truncated) FileVisitResult.TERMINATE else FileVisitResult.CONTINUE
+            }
+        })
+    } catch (e: Exception) {
+        return@Tool wsMapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "Failed to search: ${e.message}",
+            "path" to pathStr
+        ))
+    }
+
+    wsMapper.writeValueAsString(mapOf(
+        "success" to true,
+        "pattern" to patternStr,
+        "path" to pathStr,
+        "caseInsensitive" to (args["caseInsensitive"] as? Boolean == true),
+        "matchCount" to matches.size,
+        "filesSearched" to filesSearched,
+        "filesSkipped" to filesSkipped,
+        "truncated" to truncated,
+        "matches" to matches
+    ))
 }

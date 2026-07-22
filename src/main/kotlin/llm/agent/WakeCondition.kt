@@ -35,9 +35,15 @@ import java.util.concurrent.ConcurrentHashMap
 //  3. On a periodic timer (time-elapsed trigger, checked every
 //     [WakeConditionRegistry.POLL_INTERVAL_MS]).
 //
-//  Conditions are **one-shot** by default: once satisfied, they
-//  fire a wake message and are removed.  The agent can re-register
-//  a new condition after waking if it wants to wait again.
+//  Conditions are either **one-shot** or **permanent**:
+//  - One-shot (default): once satisfied, they fire a wake message
+//    and are removed.  The agent can re-register a new condition
+//    after waking if it wants to wait again.
+//  - Permanent: once satisfied, they fire a wake message but stay
+//    registered.  [reset] is called so the condition can fire
+//    again on the next occurrence (e.g. TimeElapsed resets its
+//    start clock).  Used by internal/framework conditions that
+//    must persist across multiple wake cycles.
 //
 //  ## Design notes
 //
@@ -61,6 +67,29 @@ sealed class WakeCondition {
      * Human-readable description for logging / wake message.
      */
     abstract val description: String
+
+    /**
+     * Whether this condition is one-shot (removed after firing)
+     * or permanent (stays registered, [reset] is called after
+     * firing so it can fire again).
+     *
+     * Defaults to true — conditions registered by the LLM via
+     * `await_condition` are always one-shot.  Internal/framework
+     * conditions can override this to false for recurring wakes.
+     */
+    open val oneShot: Boolean = true
+
+    /**
+     * Reset internal state after the condition has fired.
+     * Called by the registry for permanent conditions (oneShot=false)
+     * after a successful wake.  One-shot conditions never call this
+     * because they are removed immediately.
+     *
+     * Default implementation is a no-op; conditions that carry
+     * mutable state (e.g. [TimeElapsed] with its start clock)
+     * override this to re-arm themselves.
+     */
+    open fun reset() {}
 }
 
 /**
@@ -85,7 +114,7 @@ data class WakeEvalContext(
 //  Leaf conditions
 // ============================================================
 
-/** Wake when a new message arrives (optionally filtered). */
+/** Wake when an unread message is available (optionally filtered). */
 data class MessageArrived(
     val fromSessionId: String? = null,
     val kind: String? = null,
@@ -120,15 +149,38 @@ data class StateChanged(
         ctx.sessionStates[sessionId] == toState
 }
 
-/** Wake when [durationMs] has elapsed since registration. */
+/** Wake when [durationMs] has elapsed since the condition was
+ *  created (or last reset).
+ *
+ *  Carries its own [startTime] so that it is self-contained:
+ *  the registry does not need to track registration timestamps
+ *  for TimeElapsed.  After firing, [reset] moves [startTime]
+ *  to the current time so the condition can fire again after
+ *  the next [durationMs] interval (useful for permanent
+ *  recurring timers). */
 data class TimeElapsed(
     val durationMs: Long,
+    /** Mutable start clock; initialised at construction and
+     *  updated by [reset].  Using a var here is safe because
+     *  evaluation and reset happen on the dispatcher tick
+     *  thread, not concurrently. */
+    var startTime: Long = System.currentTimeMillis(),
 ) : WakeCondition() {
     override val description: String =
         "${durationMs}ms elapsed"
 
-    override fun evaluate(ctx: WakeEvalContext): Boolean =
-        (ctx.now - ctx.registeredAt) >= durationMs
+    override fun evaluate(ctx: WakeEvalContext): Boolean {
+        if ((ctx.now - startTime) < durationMs) return false
+        // Re-arm immediately when the timeout is observed.  This is
+        // required by permanent conditions and harmless for one-shot
+        // conditions, which are removed by the registry after firing.
+        startTime = ctx.now
+        return true
+    }
+
+    override fun reset() {
+        startTime = System.currentTimeMillis()
+    }
 }
 
 // ============================================================
@@ -142,6 +194,10 @@ data class AllOf(val conditions: List<WakeCondition>) : WakeCondition() {
 
     override fun evaluate(ctx: WakeEvalContext): Boolean =
         conditions.all { it.evaluate(ctx) }
+
+    override fun reset() {
+        conditions.forEach { it.reset() }
+    }
 }
 
 /** Wake when ANY sub-condition is satisfied (race). */
@@ -151,6 +207,10 @@ data class AnyOf(val conditions: List<WakeCondition>) : WakeCondition() {
 
     override fun evaluate(ctx: WakeEvalContext): Boolean =
         conditions.any { it.evaluate(ctx) }
+
+    override fun reset() {
+        conditions.forEach { it.reset() }
+    }
 }
 
 /** Wake when the sub-condition is NOT currently true. */
@@ -171,8 +231,9 @@ data class Not(val condition: WakeCondition) : WakeCondition() {
  * (targetSessionId, condition) pair.
  *
  * When a condition is satisfied, a synthetic mailbox message is
- * sent to the target agent and the condition is removed (one-shot
- * semantics).
+ * sent to the target agent.  One-shot conditions are then removed;
+ * permanent conditions have [WakeCondition.reset] called and stay
+ * registered for future fires.
  */
 object WakeConditionRegistry {
     private val logger = LogManager.getLogger("WakeConditionRegistry")
@@ -234,54 +295,51 @@ object WakeConditionRegistry {
         entries[targetSessionId]?.toList() ?: emptyList()
 
     /**
-     * Evaluate all conditions for [targetSessionId] against the
-     * given [WakeEvalContext].  Returns the list of satisfied
-     * entries (which are then removed + notified).
+     * Evaluate conditions and **atomically remove/reset** satisfied
+     * ones in the same call.  Returns the list of satisfied entries
+     * (already removed from the registry for one-shot, already reset
+     * for permanent).
      *
-     * Called by [evaluateAll] which is in turn called by the
-     * [AgentMailboxDispatcher] tick and [AgentRuntime.transition].
+     * This replaces the old peek+removeEntries split.  The split was
+     * originally intended to allow the caller to retry if the wake
+     * message send failed, but it introduced a race window where a
+     * satisfied condition stayed registered between peek and
+     * removeEntries, causing repeated fires on every tick.  The
+     * atomic approach is simpler and correct: if the wake message
+     * send fails, the agent simply won't be woken — it will stay
+     * parked and eventually be picked up by the watchdog or another
+     * wake path.  This is strictly better than repeated spurious
+     * wakes.
      */
-    fun evaluate(targetSessionId: String, ctx: WakeEvalContext): List<Entry> {
-        val list = entries[targetSessionId] ?: return emptyList()
-        val satisfied = list.filter { it.condition.evaluate(ctx) }
+    fun evaluateAndRemove(targetSessionId: String, ctx: WakeEvalContext): List<Entry> {
+        var satisfied: List<Entry> = emptyList()
+        var remaining = 0
+        entries.computeIfPresent(targetSessionId) { _, list ->
+            satisfied = list.filter { entry ->
+                entry.condition.evaluate(ctx.copy(registeredAt = entry.registeredAt))
+            }
+            if (satisfied.isNotEmpty()) {
+                // Remove only one-shot entries. Permanent entries stay
+                // registered; their condition state is re-armed after
+                // firing. Match by reference because conditions may
+                // contain mutable state used by data-class equality.
+                list.removeAll { current ->
+                    current.condition.oneShot && satisfied.any { it === current }
+                }
+                satisfied.asSequence()
+                    .filter { !it.condition.oneShot }
+                    .forEach { it.condition.reset() }
+            }
+            remaining = list.size
+            list.takeIf { it.isNotEmpty() }
+        }
         if (satisfied.isNotEmpty()) {
-            list.removeAll(satisfied)
-            if (list.isEmpty()) entries.remove(targetSessionId)
+            logger.debug(
+                "evaluateAndRemove(${targetSessionId.take(8)}): " +
+                    "fired=${satisfied.size}, remaining=$remaining"
+            )
         }
         return satisfied
-    }
-
-    /**
-     * Evaluate conditions WITHOUT removing them.  Returns the
-     * list of satisfied entries.  The caller MUST call
-     * [removeEntries] after successfully acting on them (e.g.
-     * after the synthetic wake message has been inserted);
-     * otherwise the condition stays registered and will be
-     * re-evaluated on the next tick.
-     *
-     * This split-peek-then-confirm pattern is necessary because
-     * [evaluate] removes conditions before the caller can act on
-     * them — if the action (e.g. mailbox send) fails, the
-     * condition is lost and the agent is permanently stuck in
-     * STANDBY.  Using [peek] + [removeEntries] lets the caller
-     * retry on the next tick.
-     */
-    fun peek(targetSessionId: String, ctx: WakeEvalContext): List<Entry> {
-        val list = entries[targetSessionId] ?: return emptyList()
-        return list.filter { it.condition.evaluate(ctx) }
-    }
-
-    /**
-     * Remove specific entries after they have been successfully
-     * processed.  Safe to call with entries that were already
-     * removed (no-op).  Typically called with the list returned
-     * by [peek] after each entry's wake action succeeded.
-     */
-    fun removeEntries(targetSessionId: String, toRemove: List<Entry>) {
-        if (toRemove.isEmpty()) return
-        val list = entries[targetSessionId] ?: return
-        list.removeAll(toRemove)
-        if (list.isEmpty()) entries.remove(targetSessionId)
     }
 }
 

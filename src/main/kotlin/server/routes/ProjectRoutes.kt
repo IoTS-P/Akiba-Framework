@@ -149,7 +149,12 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             }
 
             val diskProjects = WorkspaceManager.listGhidraProjects(projectDirectory)
+            val diskProjectsSet = diskProjects.toSet()
+            // Only show projects that still exist on disk.  A project may
+            // have been deleted via the DELETE endpoint but still have
+            // closed session rows in the DB — those should not appear.
             val seenProjects = (sessionCounts.keys + diskProjects).toSet()
+                .filter { it in diskProjectsSet }
 
             val result = seenProjects.map { name ->
                 // Fast file count: number of packed `.gzf` files in the project's
@@ -178,6 +183,115 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             val (status, body) = errorPayload(e)
             call.respond(status, body)
         }
+    }
+
+    /**
+     * Delete a Ghidra project from disk. Optionally also delete associated
+     * log directories by scanning each log directory's `config.json` for a
+     * matching project `name` (or `forkTo` in fork mode).
+     *
+     * Query parameter `deleteLogs=true` enables log deletion.
+     */
+    delete("/projects/{name}") {
+        val projectName = call.parameters["name"]
+            ?: return@delete call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
+        if (!isValidProjectName(projectName)) {
+            return@delete call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name: $projectName"))
+        }
+
+        val deleteLogs = call.request.queryParameters["deleteLogs"]?.equals("true", ignoreCase = true) == true
+        val projectDirectory = call.currentUserGhidraProjectsRoot()
+
+        val grpFile = projectDirectory.resolve("$projectName.gpr")
+        val repDir = projectDirectory.resolve("$projectName.rep")
+        val lockFile = projectDirectory.resolve("$projectName.lock")
+        val lockTildeFile = projectDirectory.resolve("$projectName.lock~")
+
+        if (!grpFile.isRegularFile() && !repDir.isDirectory()) {
+            return@delete call.respond(HttpStatusCode.NotFound, mapOf("error" to "Project '$projectName' not found"))
+        }
+
+        // Release the active project if it's the one being deleted.
+        try {
+            if (WorkspaceManager.isProjectInitialized &&
+                WorkspaceManager.activeProjectName == projectName) {
+                WorkspaceManager.releaseActiveProject()
+            }
+        } catch (_: Exception) { /* best-effort */ }
+
+        val deletedFiles = mutableListOf<String>()
+        val errors = mutableListOf<String>()
+
+        // Delete project files on disk.
+        for (f in listOf(grpFile, repDir, lockFile, lockTildeFile)) {
+            try {
+                if (Files.exists(f)) {
+                    if (f.isDirectory()) f.toFile().deleteRecursively()
+                    else Files.deleteIfExists(f)
+                    deletedFiles.add(f.name)
+                }
+            } catch (e: Exception) {
+                errors.add("${f.name}: ${e.message}")
+            }
+        }
+
+        // Optionally scan and delete associated log directories.
+        val deletedLogDirs = mutableListOf<String>()
+        if (deleteLogs) {
+            try {
+                val logsRoot = call.currentUserLogsRoot()
+                if (logsRoot.isDirectory()) {
+                    Files.list(logsRoot).use { stream ->
+                        stream.filter { it.isDirectory() }.forEach { logDir ->
+                            val configFile = logDir.resolve("config.json")
+                            if (configFile.isRegularFile()) {
+                                try {
+                                    val configText = Files.readString(configFile)
+                                    val mapper = com.fasterxml.jackson.databind.ObjectMapper()
+                                        .registerKotlinModule()
+                                    val rootNode = mapper.readTree(configText)
+                                    val withGhidraProject = rootNode.get("withGhidraProject")
+                                    if (withGhidraProject != null) {
+                                        val mode = withGhidraProject.get("mode")?.asText("") ?: ""
+                                        val name = withGhidraProject.get("name")?.asText("") ?: ""
+                                        val forkTo = withGhidraProject.get("forkTo")?.asText("") ?: ""
+                                        val continueLog = withGhidraProject.get("continueLog")?.asText("") ?: ""
+
+                                        val isAssociated = when {
+                                            mode == "fork" && forkTo.isNotBlank() ->
+                                                forkTo == projectName || forkTo.endsWith("/$projectName")
+                                            mode == "base" && continueLog.isNotBlank() ->
+                                                continueLog == projectName || continueLog.endsWith("/$projectName") ||
+                                                logDir.name == projectName
+                                            else ->
+                                                name == projectName || logDir.name == projectName
+                                        }
+
+                                        if (isAssociated) {
+                                            logDir.toFile().deleteRecursively()
+                                            deletedLogDirs.add(logDir.name)
+                                        }
+                                    }
+                                } catch (_: Exception) { /* skip unreadable config */ }
+                            } else if (logDir.name == projectName) {
+                                // No config.json but directory name matches — delete it.
+                                logDir.toFile().deleteRecursively()
+                                deletedLogDirs.add(logDir.name)
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                errors.add("log scan: ${e.message}")
+            }
+        }
+
+        call.respond(mapOf(
+            "message" to "Project '$projectName' deleted",
+            "deletedFiles" to deletedFiles,
+            "deletedLogDirs" to deletedLogDirs,
+            "errors" to errors
+        ))
     }
 
     /**
@@ -235,8 +349,50 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
     }
 
     /**
-     * Export a Ghidra project as a `.gar` archive.
+     * Export a project's workspace directory as a ZIP archive.
      *
+     * The workspace is organised as `<workspaceRoot>/<projectName>/<id>/<ModuleClassName>/`.
+     * This endpoint zips only the subdirectory matching the requested project name.
+     */
+    get("/projects/{name}/export_workspace") {
+        val projectName = call.parameters["name"]
+            ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
+        if (!isValidProjectName(projectName)) {
+            return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name: $projectName"))
+        }
+
+        val workspaceRoot = call.currentUserWorkspaceRoot()
+        val projectWorkspace = workspaceRoot.resolve(projectName)
+        if (!Files.exists(projectWorkspace) || !projectWorkspace.isDirectory()) {
+            return@get call.respond(HttpStatusCode.NotFound, mapOf("error" to "No workspace found for project '$projectName'"))
+        }
+
+        try {
+            val baos = ByteArrayOutputStream()
+            ZipOutputStream(baos).use { zos ->
+                Files.walk(projectWorkspace).use { stream ->
+                    stream.filter { it.isRegularFile() }.forEach { path ->
+                        val relative = projectWorkspace.relativize(path).toString().replace('\\', '/')
+                        zos.putNextEntry(ZipEntry(relative))
+                        Files.copy(path, zos)
+                        zos.closeEntry()
+                    }
+                }
+            }
+            val zipBytes = baos.toByteArray()
+            call.response.header(
+                HttpHeaders.ContentDisposition,
+                ContentDisposition.Attachment.withParameter(
+                    ContentDisposition.Parameters.FileName, "$projectName-workspace.zip"
+                ).toString()
+            )
+            call.respondBytes(zipBytes, ContentType.Application.Zip)
+        } catch (e: Exception) {
+            logger.error("[export_workspace] failed for '$projectName': ${e.message}", e)
+            call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "Failed to export workspace: ${e.message}"))
+        }
+    }
+     /*
      * The implementation mirrors Ghidra's own `ArchiveTask.writeProject`
      * (see `ghidra/app/plugin/core/archive/ArchiveTask.java` in the upstream
      * repo). The resulting layout is:

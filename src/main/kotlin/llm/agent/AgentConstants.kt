@@ -98,6 +98,18 @@ val LLM_RETRY_BACKOFF_MS: List<Long> = listOf(
     21_600_000L, // 6 hours (cap)
 )
 
+/**
+ * Prefix for LLM retry-status messages written to the agent_messages
+ * table during the unlimited retry loop in `StrategyContext.callLLM`.
+ *
+ * These messages use `role="system"` so they are visible to the
+ * frontend (via message polling) but are **filtered out** by
+ * [PersistentChatMemory] before entering the LLM context buffer.
+ *
+ * Format: `"$LLM_RETRY_STATUS_PREFIX retry=2 backoffMs=60000 nextRetryAt=..."`
+ */
+const val LLM_RETRY_STATUS_PREFIX = "__llm_retry_status__"
+
 // ----------------------------------------------------------
 // 4. Tool-call batching
 // ----------------------------------------------------------

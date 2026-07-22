@@ -586,9 +586,27 @@ fun applyMailboxDrain(
     //    messages" bug.
     val newMessageIds = newMessages.map { it.messageId }.toSet()
     val pendingLimit = maxOf(maxMessages * 8, 100)
-    val pendingMessages = mailboxService.listPending(sessionId, limit = pendingLimit)
+    val rawPendingMessages = mailboxService.listPending(sessionId, limit = pendingLimit)
         .filter { it.messageId !in newMessageIds }
         .filter { it.kind != "user-hint" }  // user-hints are auto-acked, never pending
+
+    // Synthetic wake-condition notes are scheduling signals, not
+    // actionable conversations. Show a newly drained wake note once
+    // as [NEW], then auto-ack it so it cannot reappear as [PENDING]
+    // on every ReAct iteration and misleadingly look like repeated
+    // dispatcher wake-ups. Also clean up wake notes left pending by
+    // older runs.
+    fun isSyntheticWakeNote(message: AgentDatabaseClient.MailboxMessageInfo): Boolean =
+        message.senderSessionId == SYSTEM_SESSION_UUID &&
+            message.kind == "note" &&
+            message.subject?.startsWith("wake condition:") == true
+
+    val syntheticWakeNotes = newMessages.filter(::isSyntheticWakeNote) +
+        rawPendingMessages.filter(::isSyntheticWakeNote)
+    for (message in syntheticWakeNotes.distinctBy { it.messageId }) {
+        mailboxService.ack(sessionId, message.messageId)
+    }
+    val pendingMessages = rawPendingMessages.filterNot(::isSyntheticWakeNote)
 
     // 1b. Extract user-hint messages and deliver them directly as
     //     user messages (transient or persistent), bypassing the

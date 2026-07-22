@@ -19,9 +19,9 @@ import org.iotsplab.akiba.llm.agent.RuntimeState
 //  AwaitMultipleChildrenTool — batch-wait for N child agents
 // ============================================================
 //
-// Companion to `spawn_sub_agent` and `await_agent`.  Lets a
-// parent agent fan out several sub-agents and wait for them in
-// one tool call instead of N serial `await_agent` calls.  The
+// Companion to `spawn_sub_agent`.  Lets a parent agent fan out
+// several sub-agents and wait for them in one tool call instead
+// of N serial blocking waits.  The
 // tool supports two modes:
 //
 //   - `any`  : return as soon as at least one child reaches the
@@ -42,13 +42,12 @@ import org.iotsplab.akiba.llm.agent.RuntimeState
 //   2. **Cross-process children** (registered in a different
 //      process or already closed in memory but the DB row
 //      still exists): the tool polls the DB column once per
-//      tick, same shape as `await_agent`.
+//      tick, same shape as the batch poll.
 //
 // Both stages share the same predicate and timeout.
 
 /**
- * Build the batch-await tool.  See [AwaitAgentTool] for the
- * single-child equivalent.
+ * Build the batch-await tool.
  */
 fun AwaitMultipleChildrenTool(
     parent: AgentModule,
@@ -58,8 +57,8 @@ fun AwaitMultipleChildrenTool(
     name = "await_multiple_children",
     description = buildString {
         appendLine("Wait for MULTIPLE async child agents to reach a target runtime state")
-        appendLine("in a single tool call — the LLM-friendly alternative to serial `await_agent`")
-        appendLine("calls when several sub-agents are in flight.")
+        appendLine("in a single tool call — the LLM-friendly way to wait when several")
+        appendLine("sub-agents are in flight.")
         appendLine()
         appendLine("Required:")
         appendLine("  childIds  — JSON array or comma-separated list of child sessionIds")
@@ -71,7 +70,7 @@ fun AwaitMultipleChildrenTool(
         appendLine("              'all'    : wait until EVERY child reaches the target state.")
         appendLine("              'any_idle': return as soon as any child enters STANDBY or CLOSED.")
         appendLine("              'all_idle': wait until every child is in STANDBY or CLOSED.")
-        appendLine("  until     — target state name (same enum as `await_agent`).")
+        appendLine("  until     — target state name.")
         appendLine("              Default 'closed' for `any`/`all` modes, 'idle' for `*_idle` modes.")
         appendLine("  timeoutMs — max wait for the FIRST settle. Default 600000 (10 min).")
         appendLine("              Pass 0 to wait forever.  In `all` mode the timeout is the total")
@@ -106,7 +105,7 @@ fun AwaitMultipleChildrenTool(
         ),
         ToolParameter(
             "until", "string",
-            "Target state name. Same enum as `await_agent`. Default depends on mode.",
+            "Target state name. Default depends on mode.",
             required = false,
             enum = listOf(
                 "closed", "standby", "msghandle", "cancelling", "running",
@@ -463,7 +462,7 @@ private suspend fun refresh(
 /**
  * Parse the `childIds` argument — accepts either a JSON
  * array string or a comma-separated list.  Trimmed, de-blanked.
- * Public so [AwaitAgentTool] can reuse the same normaliser if
+ * Public so callers can reuse the same normaliser if
  * we ever extend single-child mode to inherit the same parser.
  */
 internal fun parseChildIds(raw: Any?): List<String> {

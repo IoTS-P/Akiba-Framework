@@ -20,7 +20,6 @@ import org.iotsplab.akiba.module.AkibaModule
  *   (template path or freeform path)
  * - [ListSubAgentsTool] — list/search the caller's sub-agents and
  *   their runtime states (with optional status filter and recursion)
- * - [AwaitAgentTool] — wait for an async child to reach a target state
  * - [AwaitMultipleChildrenTool] — batch-wait for N child agents in
  *   one call (mode=any|all)
  * - [AgentBuilderAlternativesTool] — describe available templates
@@ -65,7 +64,6 @@ object BuiltInTools {
         RunModuleTool(parent),
         SpawnSubAgentTool(parent, agentDbClient),
         ListSubAgentsTool(parent, agentDbClient),
-        AwaitAgentTool(parent, agentDbClient),
         AwaitMultipleChildrenTool(parent, agentDbClient),
         GetAgentStatusTool(agentDbClient, parent.agentSessionId),
         AgentBuilderAlternativesTool(parent),

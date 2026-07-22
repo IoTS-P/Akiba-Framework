@@ -414,7 +414,6 @@ class BinaryAnalyst(
 |---------|------|------|
 | `run_module` | 在当前或不同二进制文件上运行另一个 AkibaModule | `className` (必需), `targetId`, `configJson`, `timeout`, `skipDbWrite` |
 | `spawn_sub_agent` | 异步生成子 LLM agent（模板路径或自由路径），立即返回 handle | `templateId` 或 `systemPrompt`+`taskPrompt`, `inputs`, `overrides`, `toolNames`, `maxIterations` |
-| `await_agent` | 等待单个子 agent 达到目标状态 | `childId` (必需), `until`, `timeoutMs`, `pollMs` |
 | `await_multiple_children` | 批量等待多个子 agent（任一完成或全部完成即返回） | `childIds` (必需), `mode` (any/all/any_idle/all_idle), `until`, `timeoutMs`, `pollMs` |
 | `query_module_data` | 从数据库查询分析结果 | `tableName` (必需), `columns` |
 | `query_session_history` | 查看过去的 agent 会话或获取消息 | `sessionId`, `binaryId`, `limit` |
@@ -440,7 +439,7 @@ class BinaryAnalyst(
 
 #### spawn_sub_agent
 
-异步生成子 LLM agent 并立即返回 handle（用于后续 `await_agent`）。
+异步生成子 LLM agent 并立即返回 handle（用于后续 `await_multiple_children`）。
 
 模板路径（推荐）：
 

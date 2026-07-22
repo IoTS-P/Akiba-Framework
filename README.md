@@ -322,7 +322,7 @@ When using `AgentModule`, the following built-in tools are automatically availab
 
 - `run_module` — Delegate work to another AkibaModule
 - `spawn_sub_agent` — Async-spawn a child LLM agent (template or freeform)
-- `await_agent` — Wait for an async child to reach a target state
+- `await_multiple_children` — Wait for async child agents to reach target states
 - `query_module_data` — Query analysis results from the database
 - `query_session_history` — Review past agent sessions
 - `query_memories` — Search the long-term memory store

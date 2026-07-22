@@ -28,69 +28,16 @@ import kotlinx.coroutines.withContext
  * orchestrators that have to decide what to do next (start a follow-up
  * agent vs. give up vs. escalate).
  *
- *  - [CLOSED]         — Final Answer with [FinalAnswerAction.EXIT]
- *                       (default for `lifecycle=ONE_SHOT`); the run
- *                       completed normally and every cleanup step
- *                       (cascade-cancel, template unregister, transcript
- *                       close, LLM client close) ran to completion.
- *  - [ERROR]          — Agent stopped with [StopReason.ERROR] or
- *                       [StopReason.MAX_ITERATIONS]; session status is
- *                       `"error"`.  Cleanup ran to completion; the
- *                       run itself just didn't finish cleanly.
- *  - [PARKED]         — `lifecycle=STANDBY` + [FinalAnswerAction.PARK]
- *                       (default for `lifecycle=STANDBY`); the agent
- *                       is alive and waiting for mailbox messages.
- *                       No cleanup was performed.  Callers of
- *                       [AgentModule.startProcess] in PARK mode
- *                       should NOT treat this as "done" — the agent
- *                       is still consuming resources, just
- *                       intentionally.
- *  - [CLEANUP_FAILED] — The run reached a truly-terminated state, but
- *                       at least one cleanup step (cascade-cancel,
- *                       template unregister, transcript close, or
- *                       LLM client close) threw.  The process is
- *                       still considered terminated (the
- *                       [OrphanReaper] is the backstop for any
- *                       children that didn't get cancelled), but
- *                       operators should look at the warning logs
- *                       for the root cause.
+ *  - [CLOSED]         — Final Answer completed normally and every cleanup
+ *                       step (cascade-cancel, template unregister,
+ *                       transcript close, LLM client close) ran to completion.
+ *  - [ERROR]          — Agent stopped with [StopReason.ERROR] or a terminal
+ *                       [StopReason.MAX_ITERATIONS]. Cleanup ran to completion;
+ *                       the run itself just didn't finish cleanly.
+ *  - [CLEANUP_FAILED] — The run reached a truly-terminated state, but at least
+ *                       one cleanup step threw. Operators should inspect logs.
  */
-enum class ProcessExitReason { CLOSED, ERROR, PARKED, CLEANUP_FAILED }
-
-/**
- * What the agent should do when the LLM emits the canonical "Final Answer:"
- * marker (the strategy's signal that the model has finished answering).
- *
- * The two modes distinguish between "I answered, but the session stays alive
- * for follow-up work" and "I answered, the session is over, release all
- * resources".  This distinction matters because the parent's
- * [AgentModule.startProcess] `finally` block uses [EXIT] vs [PARK] to decide
- * whether to release the LLM client + transcript (a STANDBY-parked agent
- * must keep them open for the next resume).
- *
- *  - [PARK]  — Final Answer parks the agent. For `lifecycle=STANDBY` the
- *    runtime_state transitions to STANDBY (the session keeps accepting
- *    mailbox messages); for `lifecycle=ONE_SHOT` it transitions to CLOSED.
- *    Either way the parent's `startProcess` `finally` block runs full
- *    resource cleanup because the run is over.  This is the default for
- *    `lifecycle=STANDBY` — a parked child that has finished its primary
- *    task but stays alive for follow-up mail.
- *
- *  - [EXIT]  — Final Answer truly terminates the agent. The runtime_state
- *    transitions to CLOSED regardless of `lifecycle`, and the parent's
- *    `startProcess` `finally` block runs full resource cleanup. The
- *    session will NOT be resumed on a later mailbox message (any future
- *    mail lands on a CLOSED session and bounces). This is the default for
- *    `lifecycle=ONE_SHOT` and is what the root agent of a manual chat
- *    session uses — it answers once and the process exits.
- *
- * Override the default when you have a STANDBY agent that should truly
- * exit on Final Answer (e.g. an interactive STANDBY root that has reached
- * the end of its conversational arc) — set `onFinalAnswer = EXIT` on the
- * agent and the framework will close the session on Final Answer instead
- * of parking it.
- */
-enum class FinalAnswerAction { PARK, EXIT }
+enum class ProcessExitReason { CLOSED, ERROR, CLEANUP_FAILED }
 
 /** The outcome of an agent run. */
 data class AgentResult(
@@ -114,13 +61,10 @@ enum class StopReason {
     /** Agent reached the maximum iteration limit. */
     MAX_ITERATIONS,
     /**
-     * Agent explicitly asked to park to STANDBY (i.e. the LLM
-     * emitted the `Enter standby mode.` marker recognised by
-     * [SharedStandbyExtractor]).  Mapped by [AgentRuntime.runChildJob]
-     * to `runtime_state='standby'` for `lifecycle=standby` children
-     * (so they keep accepting mailbox messages) and to `closed` for
-     * `lifecycle=one_shot` children (so the marker is treated as a
-     * no-op-final-answer and the session is terminated).
+     * Agent called `await_condition` to park to STANDBY.
+     * Mapped by [AgentRuntime.runChildJob] to `runtime_state='standby'`
+     * for `lifecycle=standby` children (so they keep accepting mailbox
+     * messages) and to `closed` for `lifecycle=one_shot` children.
      */
     STANDBY,
     /** Agent encountered an error. */
@@ -265,35 +209,6 @@ class AkibaAgent(
     val lifecycle: Lifecycle = Lifecycle.ONE_SHOT,
 
     /**
-     * Behaviour when the LLM emits the "Final Answer:" marker.
-     *
-     * Defaults to a sane policy derived from [lifecycle]:
-     *  - `lifecycle=STANDBY` → [FinalAnswerAction.PARK] (the agent
-     *    stays alive and accepts follow-up mailbox messages).
-     *  - `lifecycle=ONE_SHOT` → [FinalAnswerAction.EXIT] (the agent
-     *    terminates and the parent's `startProcess` `finally` block
-     *    releases resources).
-     *
-     * Override to flip the default — for example, an interactive
-     * STANDBY root that should truly close on Final Answer instead of
-     * parking, or a ONE_SHOT batch worker that should park to free up
-     * the process slot before tearing down.
-     *
-     * This value is read by:
-     *  - The strategies ([ReActStrategy], [PlanExecuteStrategy]) to
-     *    decide which `status` to write to the session row when they
-     *    detect Final Answer (`"standby"` vs `"closed"`).
-     *  - [AgentRuntime.runChildJob] to decide the next runtime_state
-     *    after a COMPLETED result (a STANDBY parent in PARK mode stays
-     *    STANDBY; in EXIT mode it goes CLOSED).
-     *  - [AgentModule.startProcess] `finally` block to decide whether
-     *    to release the LLM client and transcript (kept open for
-     *    resume when the agent parks; released on true exit).
-     */
-    val onFinalAnswer: FinalAnswerAction = if (lifecycle == Lifecycle.STANDBY)
-        FinalAnswerAction.PARK else FinalAnswerAction.EXIT,
-
-    /**
      * Mailbox service used by the default [AgentHarness.beforeIteration]
      * to drain incoming messages before each LLM call. Null disables
      * the drain.
@@ -338,16 +253,10 @@ class AkibaAgent(
      * seriality (the next module's startProcess could observe a
      * half-cancelled child tree, or a still-open LLM client).
      *
-     * Behaviour:
-     *  - For [FinalAnswerAction.EXIT] agents, [AgentModule.startProcess]
-     *    awaits this latch before returning, so the
-     *    "startProcess returned ⇒ process is fully torn down" contract
-     *    holds unconditionally.
-     *  - For [FinalAnswerAction.PARK] agents, the latch fires with
-     *    [ProcessExitReason.PARKED] inside the (no-op) cleanup, but
-     *    startProcess does NOT await it — the agent is alive and
-     *    waiting for mailbox messages, and the caller should be
-     *    able to move on.
+     * The latch is completed only for terminal runs, after cleanup.
+     * It remains open while a STANDBY agent is parked, including the
+     * MAX_ITERATIONS safety fallback, so startProcess keeps waiting
+     * until a later run truly exits.
      *
      * A fresh `AkibaAgent` is built on every [AgentModule.startProcess]
      * call (see `AgentModule.startProcess`'s `buildAgent(...)` line),
@@ -359,12 +268,10 @@ class AkibaAgent(
 
     /**
      * Termination hook — invoked once per [runWithTermination]
-     * invocation whose underlying [run] produced a "truly
-     * terminating" outcome (lifecycle=ONE_SHOT, lifecycle=STANDBY
-     * with [onFinalAnswer]=EXIT, or [StopReason.ERROR] /
-     * [StopReason.MAX_ITERATIONS]).  Skipped for STANDBY + PARK
-     * runs so the session can resume on a later mailbox
-     * message.
+     * invocation whose underlying [run] produced a truly terminating
+     * outcome. It is skipped for explicit STANDBY parks and for the
+     * STANDBY-lifecycle MAX_ITERATIONS safety fallback so the session
+     * can resume on a later mailbox message.
      *
      * The hook is the single chokepoint where every agent —
      * whether it is the root (started by [AgentModule.startProcess])
@@ -523,18 +430,9 @@ class AkibaAgent(
      * the [AgentRuntime] use so that cascade-cancel +
      * resource-release run for every agent, not just the root.
      *
-     * Behaviour matrix (the [terminationHook] fires iff the cell
-     * is `true`):
-     *
-     * | lifecycle | onFinalAnswer | stopReason        | fires |
-     * |-----------|---------------|-------------------|-------|
-     * | ONE_SHOT  | *             | COMPLETED         | true  |
-     * | ONE_SHOT  | *             | ERROR/MAX_ITERS   | true  |
-     * | STANDBY   | EXIT          | COMPLETED         | true  |
-     * | STANDBY   | EXIT          | ERROR/MAX_ITERS   | true  |
-     * | STANDBY   | PARK          | COMPLETED         | false |
-     * | STANDBY   | PARK          | STANDBY marker    | false |
-     * | STANDBY   | PARK          | ERROR/MAX_ITERS   | true  |
+     * The hook fires for COMPLETED and ERROR. MAX_ITERATIONS fires
+     * it only for ONE_SHOT agents; STANDBY and STANDBY-lifecycle
+     * MAX_ITERATIONS remain resumable and do not run cleanup.
      *
      * The hook itself is `suspend` and is invoked under
      * [NonCancellable] so that a parent-side cancellation
@@ -548,12 +446,10 @@ class AkibaAgent(
     /**
      * Like [run], but additionally fires the
      * [processCompletionLatch] **after** [terminationHook]
-     * returns — and only on a "truly terminating" outcome
-     * ([isTerminatingRun] is true).  STANDBY + PARK runs leave
-     * the latch open so the enclosing
-     * [AgentModule.startProcess]'s `await()` keeps blocking
-     * until the agent is woken by a later mailbox message and
-     * eventually runs a terminating turn.
+     * returns — and only on a truly terminating outcome
+     * ([isTerminatingRun] is true). Parked STANDBY runs leave the
+     * latch open so the enclosing [AgentModule.startProcess]'s
+     * `await()` keeps blocking until a later terminating turn.
      *
      * Latch-timing rationale: the hook is the single chokepoint
      * where every agent runs its cascade-cancel + resource
@@ -567,18 +463,9 @@ class AkibaAgent(
      * to signal its own "I am done" to its caller, not just
      * rely on the [OrphanReaper] 60s scan-tick backstop.
      *
-     * Behaviour matrix (the [terminationHook] fires iff the
-     * cell is `true`; the latch fires in the same cells):
-     *
-     * | lifecycle | onFinalAnswer | stopReason        | fires |
-     * |-----------|---------------|-------------------|-------|
-     * | ONE_SHOT  | *             | COMPLETED         | true  |
-     * | ONE_SHOT  | *             | ERROR/MAX_ITERS   | true  |
-     * | STANDBY   | EXIT          | COMPLETED         | true  |
-     * | STANDBY   | EXIT          | ERROR/MAX_ITERS   | true  |
-     * | STANDBY   | PARK          | COMPLETED         | false |
-     * | STANDBY   | PARK          | STANDBY marker    | false |
-     * | STANDBY   | PARK          | ERROR/MAX_ITERS   | true  |
+     * The latch fires in the same cases as the termination hook:
+     * COMPLETED/ERROR, plus ONE_SHOT MAX_ITERATIONS. Parked STANDBY
+     * runs keep it open.
      *
      * The hook itself is `suspend` and is invoked under
      * [NonCancellable] so that a parent-side cancellation
@@ -616,15 +503,7 @@ class AkibaAgent(
         return result
     }
 
-    /**
-     * Map an [AgentResult] + this agent's [lifecycle] / [onFinalAnswer]
-     * policy onto a [ProcessExitReason] for the
-     * [processCompletionLatch].  Only invoked from
-     * [runWithTermination] for truly-terminating runs (i.e. when
-     * [isTerminatingRun] has already returned true), so the
-     * STANDBY + PARK + COMPLETED cell of the truth table is not
-     * reachable here.
-     */
+    /** Map a terminal [AgentResult] onto [ProcessExitReason]. */
     private fun deriveExitReason(result: AgentResult): ProcessExitReason = when {
         result.stopReason == StopReason.ERROR ||
             result.stopReason == StopReason.MAX_ITERATIONS -> ProcessExitReason.ERROR
@@ -753,43 +632,12 @@ class AkibaAgent(
      * [terminationHook] for the given [stopReason].  See the
      * matrix on [runWithTermination] for the full truth table.
      */
-    private fun isTerminatingRun(stopReason: StopReason): Boolean = when {
-        stopReason == StopReason.ERROR || stopReason == StopReason.MAX_ITERATIONS ->
-            // Any lifecycle: hard error is a true exit.  Even a
-            // STANDBY+PARK agent that hit max-iterations is
-            // effectively dead — the framework cannot guarantee
-            // a clean resume after a tool-failure storm.
-            true
-        stopReason == StopReason.STANDBY ->
-            // Explicit park (await_condition / "Enter standby mode."
-            // marker) is NEVER a terminating outcome, regardless of
-            // [onFinalAnswer].  A STANDBY+EXIT root that calls
-            // `await_condition` to wait for children must park, not
-            // close — only its real Final Answer (COMPLETED) should
-            // terminate.  Without this exemption, EXIT makes
-            // `await_condition` fire the termination hook and the
-            // session is closed instead of parked (breaking the
-            // multi-agent wait-for-children flow).  This also keeps
-            // the root consistent with child agents, whose state
-            // mapping (AgentRuntime.runChildJob) already exempts
-            // STANDBY before consulting onFinalAnswer.
-            false
-        onFinalAnswer == FinalAnswerAction.EXIT ->
-            // Explicit exit policy: hook fires regardless of
-            // whether lifecycle is ONE_SHOT (default EXIT) or
-            // STANDBY+EXIT.
-            true
-        onFinalAnswer == FinalAnswerAction.PARK ->
-            // PARK policy: only fire if the underlying lifecycle
-            // is terminal (ONE_SHOT); STANDBY+PARK agents park
-            // and stay alive.
-            lifecycle == Lifecycle.ONE_SHOT
-        else ->
-            // Defensive default — should not be reachable since
-            // [onFinalAnswer] always defaults to PARK-or-EXIT in
-            // the AkibaAgent constructor.
-            lifecycle == Lifecycle.ONE_SHOT
+    private fun isTerminatingRun(stopReason: StopReason): Boolean = when (stopReason) {
+        StopReason.STANDBY -> false
+        StopReason.MAX_ITERATIONS -> lifecycle != Lifecycle.STANDBY
+        StopReason.COMPLETED, StopReason.ERROR -> true
     }
+
 
     // ---- Process lifecycle hooks ----------------------------------------
 
@@ -799,16 +647,9 @@ class AkibaAgent(
      * terminated.  Returns the [ProcessExitReason] indicating how
      * the run ended.
      *
-     * Semantics:
-     *  - For [FinalAnswerAction.EXIT] agents this returns as soon as
-     *    cascade-cancel / unregister / transcript close / LLM
-     *    client close have all run to completion.  Awaiting it is
-     *    the way to assert "the process is truly done".
-     *  - For [FinalAnswerAction.PARK] agents, [AgentModule.startProcess]
-     *    fires the latch with [ProcessExitReason.PARKED] from the
-     *    (no-op) cleanup.  Awaiting it is fine but returns quickly;
-     *    what you actually want is to NOT call this and instead
-     *    listen on the mailbox dispatcher.
+     * This returns only after cascade-cancel, unregister, transcript
+     * close and LLM client close complete. Parked STANDBY runs keep
+     * the latch open until a later terminating run.
      *
      * Note: this method is a thin wrapper over
      * [processCompletionLatch]; if you also need to wait for some
@@ -822,8 +663,8 @@ class AkibaAgent(
     /**
      * Non-blocking check — `true` when the agent's enclosing
      * [AgentModule.startProcess] has finished its `finally` block
-     * and the process is fully torn down (or parked).  Useful for
-     * orchestrators that want to poll instead of suspending.
+     * and the process is fully torn down. Parked runs return false.
+     * Useful for orchestrators that want to poll instead of suspending.
      */
     fun isProcessTerminated(): Boolean =
         processCompletionLatch.isCompleted
@@ -920,7 +761,6 @@ class AkibaAgent(
             beforeChatHook = {
                 if (autoCompact) maybeCompact()
             },
-            finalAnswerAction = onFinalAnswer,
             lifecycle = lifecycle,
             onLLMErrorHook = { info ->
                 // Keep the previous single-recovery semantics: only react to the
@@ -954,6 +794,13 @@ class AkibaAgent(
             },
             pauseCheckProvider = {
                 runtimeHandle?.pauseRequested == true
+            },
+            retryNowRequestedProvider = {
+                val handle = runtimeHandle
+                if (handle?.retryNowRequested == true) {
+                    handle.clearRetryNowRequested()
+                    true
+                } else false
             },
         )
         // Initialise the fresh LoopStats with cumulative token counts

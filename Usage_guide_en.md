@@ -418,7 +418,6 @@ When using `AgentModule`, the following built-in tools are automatically availab
 |-----------|-------------|------------|
 | `run_module` | Run another AkibaModule on current or different binary | `className` (required), `targetId`, `configJson`, `timeout`, `skipDbWrite` |
 | `spawn_sub_agent` | Async-spawn a child LLM agent (template or freeform path), returns a handle immediately | `templateId` or `systemPrompt`+`taskPrompt`, `inputs`, `overrides`, `toolNames`, `maxIterations` |
-| `await_agent` | Wait for a single child agent to reach a target state | `childId` (required), `until`, `timeoutMs`, `pollMs` |
 | `await_multiple_children` | Batch-wait for multiple child agents (any/all mode) | `childIds` (required), `mode` (any/all/any_idle/all_idle), `until`, `timeoutMs`, `pollMs` |
 | `query_module_data` | Query analysis results from the database | `tableName` (required), `columns` |
 | `query_session_history` | Review past agent sessions or get messages | `sessionId`, `binaryId`, `limit` |
@@ -445,7 +444,7 @@ Run another AkibaModule and return its result. The module must be a fully-qualif
 #### spawn_sub_agent
 
 Async-spawn a child LLM agent and return a handle immediately (use
-`await_agent` to wait for a target state).
+`await_multiple_children` to wait for a target state).
 
 Template path (recommended):
 

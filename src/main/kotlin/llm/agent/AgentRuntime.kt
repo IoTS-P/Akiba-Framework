@@ -90,21 +90,42 @@ class AgentRuntime(
         val lifecycle: Lifecycle,
         val initialTaskPrompt: String,
         val factory: suspend (JobHandle) -> AkibaAgent,
-        /**
-         * Final-Answer policy declared at spawn time.  Mirrors
-         * [AkibaAgent.onFinalAnswer] for the agent built by
-         * [factory] so [runChildJob] can decide the post-Final
-         * runtime_state without having to construct the agent
-         * (the agent doesn't exist yet at spawn time).
-         *
-         * A STANDBY child in PARK mode stays in STANDBY after
-         * Final Answer; a STANDBY child in EXIT mode (or any
-         * ONE_SHOT child) goes to CLOSED.
-         */
-        val onFinalAnswer: FinalAnswerAction,
     )
 
     private val spawnEntries = ConcurrentHashMap<String, SpawnEntry>()
+
+    /**
+     * Sessions whose terminal-transition ancestor notifications are
+     * SUPPRESSED by the caller (typically a deterministic scheduler
+     * tool like `run_linear_checkers` that already waits for each
+     * child inline and sends its own aggregate "complete" message).
+     *
+     * When a child session id is in this set,
+     * [notifyAncestorsOfChildTerminal] skips sending the per-child
+     * "child closed / child error" mailbox message to the parent.
+     * This prevents N unnecessary wake-ups when the tool is already
+     * tracking the children and will send a single summary at the
+     * end.
+     *
+     * Entries are removed automatically when [transition] processes
+     * a terminal state for the session (CLOSED / ERROR), so the set
+     * does not grow unboundedly.
+     */
+    private val suppressedAncestorNotifications = ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Suppress the default "child terminal" mailbox notification for
+     * [childSessionId].  Call this BEFORE spawning the child (or
+     * immediately after, before it reaches a terminal state).
+     *
+     * The suppression is one-shot: it is automatically cleared when
+     * the child transitions to CLOSED or ERROR.  If the child is
+     * reused (e.g. a retry in the same session), the caller must
+     * re-suppress before each run.
+     */
+    fun suppressAncestorNotification(childSessionId: String) {
+        suppressedAncestorNotifications.add(childSessionId)
+    }
 
     // Monotonic counter for StateTransition.transitionId.
     private val transitionSeq = AtomicLong(0)
@@ -166,14 +187,6 @@ class AgentRuntime(
          * ONE_SHOT.  Default true.
          */
         coldStart: Boolean = true,
-        /**
-         * Final-Answer policy for the child.  See
-         * [FinalAnswerAction].  The default (EXIT) matches
-         * [AkibaAgent]'s default for `lifecycle=ONE_SHOT`; STANDBY
-         * callers should pass `PARK` explicitly so a parked child
-         * stays STANDBY after Final Answer instead of going CLOSED.
-         */
-        onFinalAnswer: FinalAnswerAction = FinalAnswerAction.EXIT,
         taskPrompt: String,
         factory: suspend (JobHandle) -> AkibaAgent,
         forceCompactBeforeRun: Boolean = false,
@@ -226,7 +239,6 @@ class AgentRuntime(
             lifecycle = initialLifecycle,
             initialTaskPrompt = taskPrompt,
             factory = factory,
-            onFinalAnswer = onFinalAnswer,
         )
 
         scheduler.register(handle) { admitted ->
@@ -284,7 +296,6 @@ class AgentRuntime(
     fun registerRootStandbySession(
         sessionId: String,
         lifecycle: Lifecycle,
-        onFinalAnswer: FinalAnswerAction,
         taskPrompt: String,
         factory: suspend (JobHandle) -> AkibaAgent,
     ): JobHandle {
@@ -309,7 +320,6 @@ class AgentRuntime(
             lifecycle = lifecycle,
             initialTaskPrompt = taskPrompt,
             factory = factory,
-            onFinalAnswer = onFinalAnswer,
         )
         try {
             agentDbClient.setRuntimeState(sessionId, RuntimeState.RUNNING.wire())
@@ -471,37 +481,13 @@ class AgentRuntime(
 
             val result = agent.runWithTermination(taskPrompt)
 
-            // Map StopReason + lifecycle + onFinalAnswer to the
-            // next runtime_state.
-            //
-            // The "Enter standby mode." marker is unambiguous: it
-            // always means "park" for STANDBY children, "close" for
-            // ONE_SHOT children (the marker is treated as a no-op
-            // final answer when the session is terminal anyway).
-            //
-            // Final Answer is more nuanced and depends on the
-            // declared [FinalAnswerAction]:
-            //  - STANDBY lifecycle + FinalAnswerAction.PARK →
-            //    STANDBY (park; the session keeps accepting mail).
-            //  - STANDBY lifecycle + FinalAnswerAction.EXIT →
-            //    CLOSED (the root STANDBY agent explicitly opted
-            //    into true exit; its resources will be released
-            //    by the parent AgentModule's startProcess() finally
-            //    block).
-            //  - ONE_SHOT lifecycle (regardless of action) →
-            //    CLOSED (the session is terminal; PARK collapses
-            //    to the same end state as EXIT).
-            val entry = spawnEntries[sessionId]
-            val onFinalAnswer = entry?.onFinalAnswer ?: FinalAnswerAction.EXIT
+            // Map StopReason to runtime state: await_condition and
+            // STANDBY-lifecycle iteration exhaustion park; Final Answer
+            // closes; remaining failures become ERROR.
             val nextState = when {
                 result.stopReason == StopReason.STANDBY && lifecycle == Lifecycle.STANDBY -> RuntimeState.STANDBY
                 result.stopReason == StopReason.STANDBY -> RuntimeState.CLOSED
-                result.stopReason == StopReason.COMPLETED && lifecycle == Lifecycle.STANDBY && onFinalAnswer == FinalAnswerAction.PARK ->
-                    RuntimeState.STANDBY
                 result.stopReason == StopReason.COMPLETED -> RuntimeState.CLOSED
-                // A STANDBY agent that hit max iterations should park
-                // back to STANDBY so it can be woken again later, rather
-                // than being terminally marked ERROR and stuck.
                 result.stopReason == StopReason.MAX_ITERATIONS && lifecycle == Lifecycle.STANDBY -> RuntimeState.STANDBY
                 else -> RuntimeState.ERROR
             }
@@ -649,6 +635,25 @@ class AgentRuntime(
             return false
         }
         logger.info("AgentRuntime.resume: $sessionId resumed")
+        return true
+    }
+
+    /**
+     * Request an immediate LLM retry for a session that is currently
+     * in the backoff delay between retry attempts.
+     *
+     * Sets the [JobHandle.retryNowRequested] flag, which the [callLLM]
+     * retry loop polls every 500ms.  When the flag is seen, the loop
+     * breaks out of the remaining [delay] and immediately retries the
+     * LLM call.
+     *
+     * @return `true` if the request was applied, `false` if the session
+     *   was not found.
+     */
+    fun retryNow(sessionId: String): Boolean {
+        val handle = handles[sessionId] ?: return false
+        handle.markRetryNowRequested()
+        logger.info("AgentRuntime.retryNow: $sessionId — manual retry requested")
         return true
     }
 
@@ -1042,10 +1047,17 @@ class AgentRuntime(
         // with 403 Forbidden and the parent agent is never woken.
         // (CLOSED is not in the daemon's terminal check, but we send
         // before the flip for consistency and forward-safety.)
-        if (next == RuntimeState.ERROR) {
+        // Check whether the caller (typically a deterministic
+        // scheduler tool) has suppressed the default per-child
+        // ancestor notification for this session.  Suppression is
+        // one-shot: clear it now so a reused session (retry in the
+        // same session) gets normal notifications unless the caller
+        // re-suppresses before the next run.
+        val suppressed = suppressedAncestorNotifications.remove(handle.sessionId)
+        if (next == RuntimeState.ERROR && !suppressed) {
             notifyAncestorsOfChildTerminal(handle, reason, isError = true)
         }
-        if (next == RuntimeState.CLOSED) {
+        if (next == RuntimeState.CLOSED && !suppressed) {
             notifyAncestorsOfChildTerminal(handle, reason, isError = false)
         }
         handle.updateState(next)

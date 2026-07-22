@@ -49,21 +49,39 @@ interface AgentHarness {
         assistantText: String,
         finalAnswer: String
     ): AgentHarnessDirective = AgentHarnessDirective.None
+
+    /**
+     * Called when the LLM invokes `await_condition` and the strategy
+     * is about to park the agent into STANDBY.
+     *
+     * This is the park-side counterpart of [validateFinalAnswer].
+     * Domain harnesses can inspect current state (e.g. pending
+     * sends, live children) to decide whether parking is safe at
+     * this point.  Return a directive with [AgentHarnessDirective.rejectPark]
+     * set to `true` to block the park — the strategy will inject
+     * the directive's user messages and continue the loop so the
+     * LLM can fix the issue before re-attempting.
+     *
+     * Default implementation allows parking unconditionally.
+     */
+    fun validatePark(
+        ctx: StrategyContext,
+        assistantText: String,
+    ): AgentHarnessDirective = AgentHarnessDirective.None
 }
 
 object DefaultAgentHarness : AgentHarness {
     override val name: String = "DefaultAgentHarness"
-
-    // Drain is best-effort; null service or zero unread messages
-    // returns None, matching the no-op default.
-    override fun beforeIteration(ctx: StrategyContext): AgentHarnessDirective =
-        applyMailboxDrain(ctx, ctx.mailboxService)
 }
 
 data class AgentHarnessDirective(
     val userMessages: List<String> = emptyList(),
     val systemPromptAppend: String? = null,
     val rejectFinalAnswer: Boolean = false,
+    /** When `true`, blocks the agent from parking to STANDBY via
+     *  `await_condition`.  The strategy injects the directive's
+     *  user messages and continues the loop. */
+    val rejectPark: Boolean = false,
     val blockCurrentAction: Boolean = false,
     val skipCurrentAction: Boolean = false,
     /**
@@ -81,7 +99,7 @@ data class AgentHarnessDirective(
 ) {
     val isEmpty: Boolean
         get() = userMessages.isEmpty() && systemPromptAppend.isNullOrBlank() &&
-            !rejectFinalAnswer && !blockCurrentAction && !skipCurrentAction &&
+            !rejectFinalAnswer && !rejectPark && !blockCurrentAction && !skipCurrentAction &&
             !forceCompaction
 
     companion object {
@@ -97,6 +115,12 @@ data class AgentHarnessDirective(
             AgentHarnessDirective(
                 userMessages = listOf(reason),
                 rejectFinalAnswer = true
+            )
+
+        fun rejectPark(reason: String): AgentHarnessDirective =
+            AgentHarnessDirective(
+                userMessages = listOf(reason),
+                rejectPark = true
             )
 
         fun blockAction(reason: String): AgentHarnessDirective =

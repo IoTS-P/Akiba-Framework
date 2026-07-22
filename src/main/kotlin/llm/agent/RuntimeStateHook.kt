@@ -17,7 +17,7 @@ import org.apache.logging.log4j.LogManager
 // Hooks are the gate, not a notification channel.  If the
 // orchestrator wants to react to a denied transition, it should
 // check the structured outcome of the originating tool call
-// (e.g. `await_agent` returning `lastError="denied: ..."`) — the
+// (e.g. `await_multiple_children` returning `lastError="denied: ..."`) — the
 // hook deliberately does NOT push messages or signals to the
 // affected agent.
 //

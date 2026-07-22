@@ -278,7 +278,7 @@ abstract class AgentModule(
      * Built-in tools include:
      * - `run_module` — delegate work to another AkibaModule
      * - `spawn_sub_agent` — spawn a child LLM agent (template or freeform)
-     * - `await_agent` — wait for an async child to reach a target state
+     * - `await_multiple_children` — wait for async child agents to reach target states
      * - `query_module_data` — query analysis results from the database
      * - `query_session_history` — review past agent sessions
      * - `query_memories` — search the long-term memory store
@@ -931,18 +931,12 @@ abstract class AgentModule(
                     depth = spec.depth,
                     lifecycle = spec.lifecycle,
                     coldStart = spec.coldStart,
-                    // Forward the spec-level override; null here
-                    // means "derive from lifecycle" (STANDBY →
-                    // PARK, ONE_SHOT → EXIT) inside
-                    // `spawnChildFromAgentProgrammatically`.
-                    onFinalAnswer = spec.onFinalAnswer,
                     taskPrompt = spec.taskPrompt,
                     name = spec.name,
                 )
                 logger.info(
                     "AgentModule sub-agent startup: spawned ${spec.name} " +
-                        "(lifecycle=${spec.lifecycle}, depth=${spec.depth}, " +
-                        "onFinalAnswer=${spec.onFinalAnswer ?: "default"})"
+                        "(lifecycle=${spec.lifecycle}, depth=${spec.depth})"
                 )
             } catch (e: Exception) {
                 logger.error(
@@ -1180,7 +1174,6 @@ abstract class AgentModule(
                 rootRuntime.registerRootStandbySession(
                     sessionId = sessionId,
                     lifecycle = agent.lifecycle,
-                    onFinalAnswer = agent.onFinalAnswer,
                     taskPrompt = "<root-direct-run>",
                 ) { _ -> agent }
                 logger.info("Registered root standby session $sessionId with AgentRuntime for mailbox resume")
@@ -1299,27 +1292,12 @@ abstract class AgentModule(
                 logger.error("Error message: ${result.output}")
             }
             processResult(result)
-            // The root "parked" (did NOT reach a truly-terminating
-            // outcome) when it is STANDBY-lifecycle and the
-            // stopReason + onFinalAnswer combination leaves the
-            // processCompletionLatch open.  In that state the in-process
-            // handle must be mirrored to STANDBY (via
-            // [markRegisteredSessionStandby]) so the mailbox dispatcher
-            // can resume it on the next wake.
-            //
-            //  - PARK + (STANDBY | COMPLETED) → parks (existing).
-            //  - EXIT + STANDBY → parks (await_condition / standby
-            //    marker).  EXIT only terminates on COMPLETED (the real
-            //    Final Answer), which is handled by isTerminatingRun
-            //    firing the hook inside runWithTermination and does NOT
-            //    reach this mark path.
-            val rootParked = agent.lifecycle == Lifecycle.STANDBY && when (agent.onFinalAnswer) {
-                FinalAnswerAction.PARK ->
-                    result.stopReason == StopReason.STANDBY ||
-                        result.stopReason == StopReason.COMPLETED
-                FinalAnswerAction.EXIT ->
-                    result.stopReason == StopReason.STANDBY
-            }
+            // The root parks on an explicit await_condition or on the
+            // MAX_ITERATIONS safety fallback for STANDBY agents.
+            // Final Answer always terminates.
+            val rootParked = agent.lifecycle == Lifecycle.STANDBY &&
+                (result.stopReason == StopReason.STANDBY ||
+                    result.stopReason == StopReason.MAX_ITERATIONS)
             if (rootParked && sessionId != null) {
                 rootRuntime.markRegisteredSessionStandby(
                     sessionId = sessionId,
@@ -1327,7 +1305,6 @@ abstract class AgentModule(
                 )
                 logger.info(
                     "Session $sessionId parked (lifecycle=STANDBY, " +
-                        "onFinalAnswer=${agent.onFinalAnswer}, " +
                         "stopReason=${result.stopReason}); the latch stays open — " +
                         "startProcess will block until the agent is woken from standby " +
                         "and runs a terminating turn, or until the caller cancels the agent."
@@ -1335,33 +1312,17 @@ abstract class AgentModule(
             }
         }
 
-        // (The "still alive in STANDBY" diagnostic log is now emitted
-        // inside the rootParked block above, covering both PARK and
-        // EXIT roots that parked via await_condition.)
+        // The "still alive in STANDBY" diagnostic is emitted inside
+        // rootParked for both await_condition and MAX_ITERATIONS parks.
 
-        // In BOTH EXIT and PARK modes, startProcess must NOT
-        // return until the root agent has reached a
-        // "truly-terminating" state.
+        // startProcess must not return until the root reaches a truly
+        // terminating state. The completion latch fires only after the
+        // termination hook and cleanup finish. Explicit STANDBY and the
+        // STANDBY-lifecycle MAX_ITERATIONS fallback keep the latch open
+        // for a later wake cycle.
         //
-        // The [processCompletionLatch] is fired inside
-        // [AkibaAgent.runWithTermination] AFTER the agent's
-        // [terminationHook] returns.  The hook fires only on
-        // truly-terminating runs (see the truth table on
-        // [runWithTermination]):
-        //  - ONE_SHOT (any onFinalAnswer) + COMPLETED/ERROR/MAX_ITERS
-        //  - STANDBY + EXIT + COMPLETED/ERROR/MAX_ITERS
-        //  - STANDBY + PARK + ERROR/MAX_ITERS  (PARK + COMPLETED
-        //    does NOT fire — the agent is alive awaiting mailbox)
-        //
-        // The exit reason the latch carries is derived by
-        // [AkibaAgent.deriveExitReason] from `result` + the
-        // agent's policy; this block no longer needs to
-        // duplicate that mapping.
-        //
-        // Why "always await" rather than "await only in EXIT":
-        // the previous design fired the latch in PARK mode with
-        // [ProcessExitReason.PARKED] and skipped the await.  The
-        // problem is that an external caller (e.g. a test
+        // The latch is intentionally not completed for parked runs.
+        // Otherwise an external caller (e.g. a test
         // harness, an integration script) that wraps
         // `startProcess` in `runBlocking` and then calls
         // `awaitProcessExit()` would see the latch already
@@ -1427,19 +1388,13 @@ abstract class AgentModule(
      * Suspend until this module's [startProcess] `finally` block
      * has finished every cleanup step (cascade-cancel, template
      * unregister, transcript close, LLM client close) and the
-     * agent's process is fully terminated (or parked).
+     * agent's process is fully terminated. Parked STANDBY runs keep
+     * waiting until a later terminating wake cycle.
      *
      * This is the module-level mirror of
      * [AkibaAgent.awaitProcessExit]; for an orchestrator that
      * holds the [AgentModule] reference but not the [AkibaAgent]
-     * itself, this is the cleaner call site:
-     *
-     * ```kotlin
-     * runBlocking {
-     *     module.startProcess()         // returns immediately for PARK,
-     *     module.awaitProcessExit()      // or after full teardown for EXIT
-     * }
-     * ```
+     * itself, this is the cleaner call site.
      *
      * Returns `null` if [startProcess] has not been called yet
      * (no agent instance to await on).
@@ -1454,8 +1409,8 @@ abstract class AgentModule(
     /**
      * Non-blocking check — `true` when the module's [startProcess]
      * has finished its `finally` block and the underlying agent
-     * has reached a terminal or parked state.  Useful for
-     * orchestrators that want to poll instead of suspending.
+     * has reached a terminal state. Parked runs return false.
+     * Useful for orchestrators that want to poll instead of suspending.
      */
     fun isProcessTerminated(): Boolean =
         agent?.processCompletionLatch?.isCompleted == true

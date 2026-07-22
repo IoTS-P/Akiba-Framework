@@ -232,7 +232,7 @@ object AgentBuilderComponents {
             capabilities = setOf("SPAWN_AGENT", "RECURSIVE"),
             childEligible = false,
             description = "Spawn a child LLM agent (template path or freeform path). " +
-                "Returns a handle immediately; use await_agent to wait. Reserved for parent use."
+                "Returns a handle immediately; use await_multiple_children to wait. Reserved for parent use."
         ),
         ToolDescriptor(
             name = "query_module_data",

@@ -292,7 +292,7 @@ class AgentWatchdog(
                 appendLine("  2. Have you collected and reviewed all results?")
                 appendLine("  3. Is there any remaining work that requires action?")
                 appendLine()
-                appendLine("If all work is complete, emit 'All tasks completed.' and close. " +
+                appendLine("If all work is complete, emit a Final Answer with your summary and close. " +
                     "If you need to spawn more sub-agents, do so now — otherwise the watchdog " +
                     "will keep waking you.")
             }
@@ -304,7 +304,7 @@ class AgentWatchdog(
                 appendLine("Wake-up #$count. Please check whether all work is complete:")
                 appendLine("  - Review sub-agent results if you haven't already.")
                 appendLine("  - If more work is needed, spawn sub-agents or send messages.")
-                appendLine("  - If everything is done, emit 'All tasks completed.' and close.")
+                appendLine("  - If everything is done, emit a Final Answer with your summary and close.")
             }
         }
 

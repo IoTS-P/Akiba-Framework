@@ -129,6 +129,16 @@ class JobHandle internal constructor(
     /** True when the user has requested this session to be paused. */
     val pauseRequested: Boolean get() = _pauseRequested
 
+    /**
+     * Set when the user requests an immediate LLM retry (skipping the
+     * remaining backoff delay).  The [callLLM] retry loop checks this
+     * flag and breaks out of [delay] early when set.
+     */
+    @Volatile private var _retryNowRequested: Boolean = false
+    val retryNowRequested: Boolean get() = _retryNowRequested
+    internal fun markRetryNowRequested() { _retryNowRequested = true }
+    internal fun clearRetryNowRequested() { _retryNowRequested = false }
+
     /** Mark this handle as paused. The strategy loop will block at the
      *  next iteration boundary until [clearPauseRequested] is called. */
     internal fun markPauseRequested() {
@@ -155,6 +165,7 @@ class JobHandle internal constructor(
         cancelRequestedAtMs = null
         cancelReason = null
         _pauseRequested = false
+        _retryNowRequested = false
         job = newJob
     }
 

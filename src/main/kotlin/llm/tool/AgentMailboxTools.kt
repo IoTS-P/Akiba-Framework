@@ -136,8 +136,8 @@ private fun SendAgentMessageTool(
             "Standby sessions remain reachable until the dispatcher transitions them to " +
             "`completed`.")
         appendLine("  - Active (running) sessions cannot be messaged either: they are " +
-            "still running their own loop; use `await_agent` (or `spawn_sub_agent` + " +
-            "`await_agent`) to wait. Mailbox is for *follow-up* work after the recipient " +
+            "still running their own loop; use `await_multiple_children` (or `spawn_sub_agent` + " +
+            "`await_multiple_children`) to wait. Mailbox is for *follow-up* work after the recipient " +
             "has parked itself.")
         appendLine()
         appendLine("Replies use `kind=reply` plus `in_reply_to_message_id=<messageId>` so the " +
@@ -1162,11 +1162,16 @@ private fun AwaitConditionTool(
     description = buildString {
         appendLine("Declare a composable wake condition and register it with the framework.")
         appendLine()
-        appendLine("After calling this tool, produce a Final Answer to park. The framework will")
+        appendLine("Calling this tool parks the agent into STANDBY immediately. The framework will")
         appendLine("wake you when the condition is satisfied (a synthetic message will be sent")
         appendLine("to your mailbox, and the dispatcher will resume you from standby).")
         appendLine()
-        appendLine("Condition types (pass exactly one of the type parameters):")
+        appendLine("The `condition` parameter is OPTIONAL. When omitted (or empty), the agent")
+        appendLine("parks with a default MessageArrived condition — it will be woken by ANY new")
+        appendLine("mailbox message. This is the simplest way to park: just call await_condition")
+        appendLine("with no arguments.")
+        appendLine()
+        appendLine("Condition types (pass exactly one of the type keys):")
         appendLine("  - message_arrived: wake when a new message arrives (optionally from a")
         appendLine("      specific sender, of a specific kind, or with minPriority).")
         appendLine("  - state_changed: wake when a specific agent reaches a specific state")
@@ -1178,6 +1183,9 @@ private fun AwaitConditionTool(
         appendLine("  - anyOf: wake when ANY listed condition is satisfied (race/first-to-finish).")
         appendLine()
         appendLine("Examples:")
+        appendLine("  # Park and wait for ANY new message (simplest form):")
+        appendLine("  await_condition()")
+        appendLine()
         appendLine("  # Wait for agent X to finish:")
         appendLine("  {\"condition\": {\"state_changed\": {\"sessionId\": \"<X>\", \"toState\": \"closed\"}}}")
         appendLine("  # Shorthand (condition wrapper omitted — also accepted):")
@@ -1220,19 +1228,24 @@ private fun AwaitConditionTool(
     // entire args map as the condition.
     val CONDITION_KEYS = setOf("message_arrived", "state_changed", "time_elapsed", "allOf", "anyOf")
 
+    // The condition parameter is optional.  When omitted (or empty),
+    // the agent parks with a default MessageArrived (no filter) — it
+    // will be woken by any new mailbox message.
     @Suppress("UNCHECKED_CAST")
-    val condRaw = args["condition"] as? Map<String, Any?>
+    val condRaw: Map<String, Any?>? = args["condition"] as? Map<String, Any?>
         ?: args.keys.find { it in CONDITION_KEYS }?.let { args as Map<String, Any?> }
-        ?: return@Tool "Error: 'condition' is required and must be a JSON object. " +
-            "Pass either {\"condition\": {\"state_changed\": {...}}} or the shorthand " +
-            "{\"state_changed\": {...}}."
 
-    val condition = try {
-        parseWakeCondition(condRaw)
-            ?: return@Tool "Error: could not parse condition. Expected one of: " +
-                "message_arrived, state_changed, time_elapsed, allOf, anyOf"
-    } catch (e: IllegalArgumentException) {
-        return@Tool "Error: ${e.message}"
+    val condition = if (condRaw == null || condRaw.isEmpty()) {
+        // Empty condition → default: wake on any new message.
+        MessageArrived()
+    } else {
+        try {
+            parseWakeCondition(condRaw)
+                ?: return@Tool "Error: could not parse condition. Expected one of: " +
+                    "message_arrived, state_changed, time_elapsed, allOf, anyOf"
+        } catch (e: IllegalArgumentException) {
+            return@Tool "Error: ${e.message}"
+        }
     }
 
     val condId = WakeConditionRegistry.register(

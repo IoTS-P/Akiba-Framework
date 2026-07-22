@@ -48,14 +48,6 @@ package org.iotsplab.akiba.llm.agent
  *                     standby).  Only meaningful when
  *                     [lifecycle] == STANDBY; ignored for ONE_SHOT.
  *                     Default true.
- * @param onFinalAnswer [FinalAnswerAction] applied at the spawn
- *                     layer.  When null, the runtime derives the
- *                     default from [lifecycle] (STANDBY → PARK,
- *                     ONE_SHOT → EXIT).  Set explicitly when the
- *                     parent wants a STANDBY child to truly exit
- *                     on Final Answer (the "STANDBY root that
- *                     ends" case) or a ONE_SHOT child to park
- *                     (rare).
  * @param taskPrompt   initial user message — same value is used for
  *                     both the transcript and the first `agent.run()`.
  * @param agentFactory builds the [AkibaAgent].  Called once with
@@ -67,7 +59,6 @@ data class ProgrammaticSubAgentSpec(
     val depth: Int = 1,
     val lifecycle: Lifecycle = Lifecycle.STANDBY,
     val coldStart: Boolean = true,
-    val onFinalAnswer: FinalAnswerAction? = null,
     val taskPrompt: String,
     val agentFactory: (JobHandle) -> AkibaAgent,
 )
@@ -92,15 +83,6 @@ class ProgrammaticSubAgentBuilder(private val name: String) {
     var lifecycle: Lifecycle = Lifecycle.STANDBY
     /** When true (default) the child skips its initial LLM call and parks. */
     var coldStart: Boolean = true
-    /**
-     * Optional override for the child's Final-Answer policy.
-     * When unset (default) the runtime derives the policy from
-     * [lifecycle] — STANDBY → PARK, ONE_SHOT → EXIT.  Set
-     * explicitly when the parent wants to flip the default
-     * (e.g. a STANDBY child that should truly exit on Final
-     * Answer).
-     */
-    var onFinalAnswer: FinalAnswerAction? = null
     var taskPrompt: String = ""
     private var agentFactory: ((JobHandle) -> AkibaAgent)? = null
 
@@ -123,7 +105,6 @@ class ProgrammaticSubAgentBuilder(private val name: String) {
         depth = depth,
         lifecycle = lifecycle,
         coldStart = coldStart,
-        onFinalAnswer = onFinalAnswer,
         taskPrompt = taskPrompt,
         agentFactory = requireNotNull(agentFactory) {
             "subAgent('$name'): buildAgent { ... } is required"

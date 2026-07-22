@@ -452,7 +452,7 @@ object ToolCallParser {
         "run_script", "script_library", "query_ghidra_api", "run_shell",
         "query_module_data", "query_session_history", "query_memories",
         "read_history_tool_call", "list_modules", "run_module",
-        "spawn_sub_agent", "await_agent", "await_multiple_children",
+        "spawn_sub_agent", "await_multiple_children",
         "get_agent_status", "agent_builder_alternatives",
         "search_skill", "read_skill", "send_agent_message",
         "read_agent_messages", "ack_agent_message", "close_conversation",
@@ -570,15 +570,22 @@ object ToolCallParser {
     /**
      * Heuristic: does any value in [map] look like a tool_call JSON?
      *
-     * Walks the parameter map one level deep and also serialises the
-     * whole map back to JSON to catch deeply-nested cases. Used by
-     * [ScriptLibraryTool.runLibraryScript] to detect the LLM passing
-     * `{"tool_call": {...}}` as a script's runtime parameter — the
-     * script will receive that as a literal value instead of being
-     * executed as a real tool call.
+     * Walks the parameter map one level deep to catch deeply-nested
+     * cases. Used by [ScriptLibraryTool.runLibraryScript] to detect
+     * the LLM passing `{"tool_call": {...}}` as a script's runtime
+     * parameter — the script will receive that as a literal value
+     * instead of being executed as a real tool call.
      *
      * Returns the first inferred tool name found, or `null` if the
      * parameters look like ordinary key/value arguments.
+     *
+     * IMPORTANT: we only check individual **values** in the map, NOT
+     * the serialised map itself.  Re-serialising the whole map would
+     * cause false positives when a script's legitimate parameters
+     * happen to share key names with a tool's argument schema (e.g.
+     * `{"action": "search", "keyword": "..."}` is both a valid
+     * `query_ghidra_api` call AND a valid `manage_data_type` script
+     * parameter set).
      */
     fun parametersLookLikeToolCall(map: Map<String, Any?>): String? {
         for ((_, value) in map) {
@@ -590,7 +597,6 @@ object ToolCallParser {
                     ?.let { return it }
             }
         }
-        // Last-resort: serialise the whole map and re-check.
-        return looksLikeToolCallJson(mapper.writeValueAsString(map))
+        return null
     }
 }
