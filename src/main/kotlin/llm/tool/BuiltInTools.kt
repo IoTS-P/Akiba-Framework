@@ -33,6 +33,8 @@ import org.iotsplab.akiba.module.AkibaModule
  * - [SearchSkillTool] / [ReadSkillTool] — discover installed skills and read skill files
  * - [QueryGhidraAPITool] — search and read Ghidra API documentation
  * - [RunShellTool] — execute shell commands in the module workspace
+ * - [AskUserChoiceTool] — ask the user to pick one of several values
+ *   (with an optional custom free-form answer)
  * - [WorkspaceFileTools] — read/write/list/move/delete files within the
  *   module workspace (sandboxed, path-traversal-safe)
  *
@@ -78,7 +80,8 @@ object BuiltInTools {
         ReadSkillTool(username),
         RunScriptTool(parent, agentDbClient),
         QueryGhidraAPITool(),
-        RunShellTool(parent)
+        RunShellTool(parent),
+        AskUserChoiceTool(parent)
     ) + WorkspaceFileTools(parent)
 
     /**

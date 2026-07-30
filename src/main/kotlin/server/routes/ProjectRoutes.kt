@@ -188,9 +188,13 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
     /**
      * Delete a Ghidra project from disk. Optionally also delete associated
      * log directories by scanning each log directory's `config.json` for a
-     * matching project `name` (or `forkTo` in fork mode).
+     * matching project `name` (or `forkTo` in fork mode), the project's
+     * agent session trees, and/or its workspace directory.
      *
-     * Query parameter `deleteLogs=true` enables log deletion.
+     * Query parameters (all optional, default false):
+     *  - `deleteLogs`           delete associated log directories
+     *  - `deleteAgentSessions`  delete all agent session trees of the project
+     *  - `deleteWorkspace`      delete `<workspaceRoot>/<projectName>/`
      */
     delete("/projects/{name}") {
         val projectName = call.parameters["name"]
@@ -200,6 +204,8 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
         }
 
         val deleteLogs = call.request.queryParameters["deleteLogs"]?.equals("true", ignoreCase = true) == true
+        val deleteAgentSessions = call.request.queryParameters["deleteAgentSessions"]?.equals("true", ignoreCase = true) == true
+        val deleteWorkspace = call.request.queryParameters["deleteWorkspace"]?.equals("true", ignoreCase = true) == true
         val projectDirectory = call.currentUserGhidraProjectsRoot()
 
         val grpFile = projectDirectory.resolve("$projectName.gpr")
@@ -286,10 +292,52 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             }
         }
 
+        // Optionally delete the project's workspace directory
+        // (<workspaceRoot>/<projectName>/).  The root comes from
+        // server-side per-user config (never from the request) and
+        // projectName already passed isValidProjectName, so the
+        // resolved path cannot escape the workspace root.
+        var deletedWorkspace = false
+        if (deleteWorkspace) {
+            try {
+                val projectWorkspace = call.currentUserWorkspaceRoot().resolve(projectName)
+                if (projectWorkspace.isDirectory()) {
+                    projectWorkspace.toFile().deleteRecursively()
+                    deletedWorkspace = true
+                }
+            } catch (e: Exception) {
+                errors.add("workspace: ${e.message}")
+            }
+        }
+
+        // Optionally delete every agent session TREE associated with
+        // this project: the daemon recursively walks parent_session_id
+        // from every project-matching root (children don't carry the
+        // project_name themselves), and dependent rows go away via
+        // ON DELETE CASCADE.
+        var deletedAgentSessions = 0
+        if (deleteAgentSessions) {
+            val instance = call.instanceHeader()
+            if (instance == null) {
+                errors.add("agent sessions: no instance selected — skipped")
+            } else {
+                try {
+                    withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                        deletedAgentSessions = AgentDatabaseClient(dbClient)
+                            .deleteSessionsByProject(projectName)
+                    }
+                } catch (e: Exception) {
+                    errors.add("agent sessions: ${e.message}")
+                }
+            }
+        }
+
         call.respond(mapOf(
             "message" to "Project '$projectName' deleted",
             "deletedFiles" to deletedFiles,
             "deletedLogDirs" to deletedLogDirs,
+            "deletedAgentSessions" to deletedAgentSessions,
+            "deletedWorkspace" to deletedWorkspace,
             "errors" to errors
         ))
     }

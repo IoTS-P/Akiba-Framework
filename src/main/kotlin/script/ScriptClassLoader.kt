@@ -113,10 +113,23 @@ class ScriptClassLoader private constructor(
         } else {
             constructor.newInstance(binaryId) as AkibaScript
         }.apply {
+            // Always set the binary ID via reflection. The no-arg
+            // constructor path leaves it as -1 (the AkibaModule default),
+            // which causes workspaceDir to resolve to the wrong path.
+            // The `id` field is a Kotlin `val` but is mutable at the
+            // JVM level via reflection.
+            try {
+                val idField = findFieldInHierarchy(scriptClass, "id")
+                if (idField != null) {
+                    idField.isAccessible = true
+                    idField.setInt(this, binaryId)
+                }
+            } catch (_: Exception) {
+                // Best-effort: if the field is truly immutable (e.g.
+                // a Java final field), workspaceDir will fall back to
+                // the -1 directory. This is a known limitation.
+            }
             if (program != null) {
-                // The `program` field is declared on AkibaModule, not on the
-                // immediate supertype of the script class (which is AkibaScript).
-                // Walk the class hierarchy until we find it.
                 val field = findFieldInHierarchy(scriptClass, "program")
                     ?: throw NoSuchFieldException(
                         "Field 'program' not found in class hierarchy of ${scriptClass.name}"

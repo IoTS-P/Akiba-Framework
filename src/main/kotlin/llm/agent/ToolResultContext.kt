@@ -5,12 +5,12 @@ import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
 object ToolResultContext {
-    const val CURRENT_CONTEXT_MAX_BYTES = 8_000
-    const val CURRENT_HEAD_BYTES = 6_000
-    const val CURRENT_TAIL_BYTES = 2_000
-    const val HISTORICAL_CONTEXT_MAX_BYTES = 2_000
-    const val HISTORICAL_HEAD_BYTES = 1_500
-    const val HISTORICAL_TAIL_BYTES = 500
+    const val CURRENT_CONTEXT_MAX_BYTES = 40_000
+    const val CURRENT_HEAD_BYTES = 35_000
+    const val CURRENT_TAIL_BYTES = 5_000
+    const val HISTORICAL_CONTEXT_MAX_BYTES = 5_000
+    const val HISTORICAL_HEAD_BYTES = 4_000
+    const val HISTORICAL_TAIL_BYTES = 1_000
     const val STORED_MAX_BYTES = 100 * 1024
     const val STORED_HEAD_BYTES = 70 * 1024
     const val STORED_TAIL_BYTES = 30 * 1024
@@ -73,14 +73,14 @@ object ToolResultContext {
                     appendLine("]")
                     if (uuid != null) appendLine("To inspect stored result, call read_history_tool_call with uuid=$uuid.")
                 }
-                val compacted = boundedHeadTail(
+                val outcome = boundedHeadTail(
                     text = message.content,
                     maxBytes = HISTORICAL_CONTEXT_MAX_BYTES,
                     preferredHeadBytes = HISTORICAL_HEAD_BYTES,
                     preferredTailBytes = HISTORICAL_TAIL_BYTES,
                     prefix = prefix
                 )
-                message.copy(content = compacted)
+                message.copy(content = outcome.result)
             }
         }
     }
@@ -94,7 +94,27 @@ object ToolResultContext {
         preferredTailBytes: Int,
         historical: Boolean
     ): String {
+        // ── Unified truncation warning ──────────────────────────────────
+        // Whether the tool itself truncated the result (stored.truncated)
+        // or the context-view budget will truncate it below, the LLM sees
+        // the SAME prominent marker.  This is the single chokepoint that
+        // makes "⚠️ TRUNCATED" appear for EVERY tool and EVERY script
+        // without each one having to implement it individually.
+        //
+        // The warning is placed at the VERY TOP of the header so the LLM
+        // cannot miss it (earlier per-tool implementations buried it as a
+        // JSON field that the model frequently ignored).
+        val toolSelfTruncated = stored.truncated
         val header = buildString {
+            if (toolSelfTruncated) {
+                appendLine("⚠️ TRUNCATED: The tool itself truncated this result before returning.")
+                appendLine("  original_bytes=${stored.originalBytes}, stored_bytes=${stored.storedBytes}")
+                appendLine("  The content below may be incomplete. Do NOT assume it is the full output.")
+                if (resultUuid != null) {
+                    appendLine("  To retrieve the stored (possibly larger) snapshot, call read_history_tool_call with uuid=$resultUuid.")
+                }
+                appendLine()
+            }
             appendLine("[Tool result ${if (historical) "historical" else "context"} view]")
             if (resultUuid != null) {
                 appendLine("result_uuid: $resultUuid")
@@ -107,28 +127,60 @@ object ToolResultContext {
                 appendLine("To inspect stored result, call read_history_tool_call with uuid=$resultUuid.")
             }
         }
-        return boundedHeadTail(raw, maxBytes, preferredHeadBytes, preferredTailBytes, header)
+        val outcome = boundedHeadTail(raw, maxBytes, preferredHeadBytes, preferredTailBytes, header)
+        // If boundedHeadTail had to cut the text further (context budget),
+        // the marker it inserts already carries the ⚠️ TRUNCATED wording
+        // (see boundedHeadTail).  No extra work needed here.
+        return outcome.result
     }
 
+    /**
+     * Result of [boundedHeadTail]: the formatted string plus a flag
+     * indicating whether the [text] had to be trimmed to fit [maxBytes].
+     */
+    private data class HeadTailOutcome(
+        val result: String,
+        val truncated: Boolean,
+    )
+
+    /**
+     * Fit `prefix + text` into [maxBytes] (UTF-8).  When the text fits
+     * entirely, returns it verbatim with `truncated=false`.  Otherwise a
+     * head/tail snapshot is taken with a prominent `⚠️ TRUNCATED` marker
+     * between the two halves so the LLM cannot overlook the cut.
+     */
     private fun boundedHeadTail(
         text: String,
         maxBytes: Int,
         preferredHeadBytes: Int,
         preferredTailBytes: Int,
         prefix: String
-    ): String {
+    ): HeadTailOutcome {
         val prefixBytes = byteSize(prefix)
-        if (prefixBytes >= maxBytes) return takeUtf8Prefix(prefix, maxBytes)
+        if (prefixBytes >= maxBytes) {
+            return HeadTailOutcome(takeUtf8Prefix(prefix, maxBytes), truncated = true)
+        }
         val remaining = maxBytes - prefixBytes
-        if (byteSize(text) <= remaining) return prefix + text
+        if (byteSize(text) <= remaining) {
+            return HeadTailOutcome(prefix + text, truncated = false)
+        }
 
-        val marker = "\n... [omitted ${byteSize(text)} original bytes; showing head/tail] ...\n"
+        val originalTextBytes = byteSize(text)
+        val marker = buildString {
+            appendLine()
+            append("⚠️ TRUNCATED: ${originalTextBytes} original bytes in this section; ")
+            append("only head + tail shown below. ")
+            append("The middle portion was omitted to fit the context budget.")
+            appendLine()
+            appendLine()
+        }
         val markerBytes = byteSize(marker)
         val contentBudget = (remaining - markerBytes).coerceAtLeast(0)
         val headBudget = minOf(preferredHeadBytes, (contentBudget * 3) / 4)
         val tailBudget = minOf(preferredTailBytes, contentBudget - headBudget)
         val adjustedHead = (contentBudget - tailBudget).coerceAtLeast(0)
-        return prefix + takeUtf8Prefix(text, adjustedHead) + marker + takeUtf8Suffix(text, tailBudget)
+        val result = prefix + takeUtf8Prefix(text, adjustedHead) + marker + takeUtf8Suffix(text, tailBudget)
+        return HeadTailOutcome(result, truncated = true)
     }
 
     fun byteSize(text: String): Int = text.toByteArray(StandardCharsets.UTF_8).size

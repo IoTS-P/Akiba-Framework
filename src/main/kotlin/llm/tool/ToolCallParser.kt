@@ -52,6 +52,32 @@ object ToolCallParser {
         return text.trim()
     }
 
+    /** Opening think tag at the very start of the text (leading whitespace allowed). */
+    private val leadingThinkOpen = Regex("""(?is)^\s*<\s*think(?:ing)?\s*[^>]*>""")
+
+    /** Any closing think tag. */
+    private val thinkClose = Regex("""(?is)<\s*/\s*think(?:ing)?\s*>""")
+
+    /**
+     * If [text] STARTS with an opening think tag (`<think>` /
+     * `<thinking>`, attributes tolerated), return only the visible
+     * body AFTER the matching close tag.  When the block is still
+     * UNCLOSED (the model was interrupted mid-reasoning), the whole
+     * output is reasoning and there is no body — returns "".
+     * Text not starting with a think tag is returned unchanged.
+     *
+     * Distinct from [stripThinking], which removes COMPLETE think
+     * blocks anywhere in the text but keeps the text of an unclosed
+     * block (only stripping the tag itself) — exactly the wrong
+     * behaviour for a mid-reasoning interruption, where the
+     * reasoning would leak into the visible body.
+     */
+    fun stripLeadingThoughtBlock(text: String): String {
+        val open = leadingThinkOpen.find(text) ?: return text
+        val close = thinkClose.find(text, open.range.last + 1) ?: return ""
+        return text.substring(close.range.last + 1).trim()
+    }
+
     /**
      * Try to parse a tool call from the assistant's text response.
      *
@@ -131,6 +157,31 @@ object ToolCallParser {
             .distinctBy { it.second.name + "\u0000" + it.second.argumentsJson }
             .sortedBy { it.first.first }
             .map { it.second }
+    }
+
+    /**
+     * Detect whether [text] was cut off INSIDE a fenced tool_call
+     * JSON block — i.e. the last ```json / ```tool_call fence opens
+     * a JSON object whose braces never balance.
+     *
+     * Such a truncation CANNOT be continued seamlessly: a model
+     * that emits only the missing tail leaves two unparseable
+     * halves, so the retry instruction must demand a fresh complete
+     * block.  A truncation anywhere else (plain prose, or a fence
+     * that was opened but whose JSON hasn't started yet) is safe
+     * to continue and only needs the weaker "keep going" hint.
+     */
+    fun endsWithTruncatedToolCall(text: String): Boolean {
+        val lastFence = codeBlockStart.findAll(text).lastOrNull() ?: return false
+        val braceStart = text.indexOf('{', lastFence.range.last + 1)
+        // Fence opened but no JSON yet — continuing is safe (the
+        // model can simply write the whole object and close the
+        // fence; the completed block is well-formed).
+        if (braceStart < 0) return false
+        val (jsonStr, _) = extractBalancedJsonWithEnd(text, braceStart)
+        // Opening brace present but braces never balance → the
+        // stream died inside the tool_call JSON.
+        return jsonStr == null
     }
 
     /**

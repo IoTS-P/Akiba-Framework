@@ -473,6 +473,31 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
     }
 
     /**
+     * Hard-delete every session TREE rooted at a session whose
+     * `project_name` matches [projectName].  Child sessions do not
+     * inherit the parent's `project_name` (their column is NULL),
+     * so the daemon walks `parent_session_id` recursively from
+     * every project-matching root and deletes the whole tree.
+     * Dependent rows (messages, tool calls, graphs, etc.) are
+     * removed via ON DELETE CASCADE.
+     *
+     * Used by the Projects page "delete project" flow when the user
+     * opts into removing the project's agent sessions as well.
+     *
+     * @return number of sessions deleted (roots + descendants).
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun deleteSessionsByProject(projectName: String): Int = runBlocking {
+        val response = dbClient.post("/agent/session/delete-by-project", mapOf("projectName" to projectName))
+        if (response.first == HttpStatusCode.OK) {
+            val node = mapper.readTree(response.second)
+            node.path("deleted").asInt(0)
+        } else {
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+        }
+    }
+
+    /**
      * Fetch the current `runtime_state` and `closing_reason`. Returns
      * null when the session does not exist. Used by the dispatcher
      * pre-flight and by JobHandle.await to seed the local state cache.
@@ -1657,7 +1682,7 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
     fun getToolCallResult(
         resultUuid: String,
         offset: Int = 0,
-        limit: Int = 8000,
+        limit: Int = 40000,
         grep: String? = null,
         around: Int = 3
     ): ToolCallResultInfo = runBlocking {

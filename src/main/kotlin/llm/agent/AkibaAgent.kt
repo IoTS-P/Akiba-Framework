@@ -132,8 +132,17 @@ class AkibaAgent(
      */
     @Volatile var maxIterations: Int = 10,
 
-    /** Session ID for database persistence (optional). */
-    val sessionId: String? = null,
+    /**
+     * Session ID for database persistence (optional).  May be left
+     * null by spawn factories (e.g. `ProgrammaticSpawn.agentFactory`
+     * only receives a `JobHandle` and therefore cannot know the
+     * freshly created child session id at construction time) — the
+     * runtime injects it via [AgentRuntime.runChildJob] in that
+     * case; see the `internal set` property below.  Without the id
+     * the streaming-chunk publisher has nothing to key on and the
+     * child never gets a live view in the UI.
+     */
+    sessionId: String? = null,
 
     /** Whether to inject memory context into the system prompt. */
     val enrichSystemPromptWithMemory: Boolean = true,
@@ -179,13 +188,11 @@ class AkibaAgent(
     val compactKeepRounds: Int = 2,
 
     /**
-     * Safety factor applied when adjusting the effective context cap after a
-     * successful [onLLMErrorHook] recovery. The new cap is set to
-     * `currentPostCompactionTokens * errorRecoverySafetyFactor`, giving the
-     * next iteration a margin of `1 - errorRecoverySafetyFactor` against the
-     * post-compaction size that the provider actually accepted. Lower values
-     * compact more aggressively (less risk of re-hitting the limit, at the
-     * cost of more frequent compactions); 0.85 is a balanced default.
+     * Safety factor applied to the observed context-window lower bound
+     * ([ContextLengthObserver]) when deriving the compaction cap/target
+     * for models with an unknown context window. The margin
+     * `1 - errorRecoverySafetyFactor` covers output tokens and estimation
+     * error against the largest prompt the provider has actually accepted.
      */
     val errorRecoverySafetyFactor: Double = 0.85,
 
@@ -372,6 +379,18 @@ class AkibaAgent(
      */
     val scratchpadRegistry: ScratchpadRegistry = ScratchpadRegistry(),
 ) {
+
+    /**
+     * Session ID for database persistence (optional at
+     * construction).  The setter is `internal` so the framework can
+     * inject the freshly-created child session id after a spawn
+     * factory returns (see [AgentRuntime.runChildJob]) — factories
+     * only receive a `JobHandle` and cannot know it up front.
+     * Without the id the streaming-chunk publisher has nothing to
+     * key on and the agent never gets a live view in the UI.
+     */
+    var sessionId: String? = sessionId
+        internal set
 
     init {
         // Install the default termination hook when the caller did
@@ -721,8 +740,9 @@ class AkibaAgent(
             // we still write the marker with a generic label.
             val wakeSenders = try {
                 val mb = mailboxService
-                if (mb != null && sessionId != null) {
-                    val unread = mb.peek(sessionId, limit = 10, includeRead = false)
+                val sid = sessionId
+                if (mb != null && sid != null) {
+                    val unread = mb.peek(sid, limit = 10, includeRead = false)
                     if (unread.isNotEmpty()) {
                         unread
                     } else null
@@ -774,7 +794,17 @@ class AkibaAgent(
                     return@StrategyContext false
                 }
                 val compacted = autoCompact && compact()
-                if (compacted) adjustEffectiveContextCap()
+                compacted
+            },
+            onContextOverflowHook = { consecutive ->
+                // Emergency path for repeated context-length rejections;
+                // forceCompactForOverflow falls back to LLM-free round
+                // dropping when compact() itself cannot run.
+                logger.warn(
+                    "onContextOverflowHook: $consecutive consecutive context-overflow " +
+                        "rejections — attempting emergency compaction."
+                )
+                val compacted = autoCompact && forceCompactForOverflow()
                 compacted
             },
             agentDbClient = agentDbClient,
@@ -825,59 +855,41 @@ class AkibaAgent(
 
     // ---- Context compaction ----------------------------------------------
 
-    /**
-     * Effective compaction cap in tokens. When non-null, overrides the default
-     * `contextLength * compactThreshold` ceiling used by [maybeCompact]. The
-     * value is only ever lowered (monotonic) and is set when an LLM call
-     * fails and the [onLLMErrorHook] recovery retry succeeds: we now know the
-     * post-compaction size is what the provider accepts, so we use a fraction
-     * of that as the next compaction trigger to avoid hitting the limit again.
-     */
-    private var effectiveMaxTokens: Int? = null
-
-    /**
-     * Lower [effectiveMaxTokens] based on the current post-compaction size.
-     * Called only when an [onLLMErrorHook] recovery successfully unblocks an LLM call.
-     * The new cap is `currentTokens * errorRecoverySafetyFactor`, capped below
-     * the previous effective cap (so repeated failures keep tightening the
-     * budget monotonically).
-     */
-    private fun adjustEffectiveContextCap() {
-        val postSize = memory.messages().sumOf { client.estimateTokenCount(it.content) }
-        val candidate = (postSize.toDouble() * errorRecoverySafetyFactor).toInt().coerceAtLeast(1)
-        val previous = effectiveMaxTokens
-        val next = if (previous == null || candidate < previous) candidate else previous
-        if (next != previous) {
-            effectiveMaxTokens = next
-            logger.warn(
-                "Lowered effective context cap after a successful error-recovery compaction: " +
-                    "${previous ?: "<unset>"} -> $next tokens " +
-                    "(post-compaction size=$postSize, safetyFactor=$errorRecoverySafetyFactor). " +
-                    "Subsequent iterations will compact earlier to avoid re-hitting the provider limit."
-            )
-        }
-    }
-
-    // ---- Context compaction ----------------------------------------------
-
     private fun contextMessages(): List<AgentChatMessage> =
         ToolResultContext.compactHistoricalToolMessages(memory.messages())
 
+    /** Estimated token count of the current conversation memory. */
+    private fun currentContextTokens(): Int =
+        memory.messages().sumOf { client.estimateTokenCount(it.content) }
+
+    /**
+     * The observed-proven safe size for this model ([ContextLengthObserver]
+     * lower bound × [errorRecoverySafetyFactor]), or null when nothing has
+     * been observed yet. Used ONLY as the compaction TARGET after a
+     * suspected overflow — never as a pre-emptive cap: capping at the
+     * bound would lock exploration (context never grows past it → no
+     * larger prompt is ever attempted → the bound can never rise), and a
+     * 1M-window model would get stuck at whatever size was observed first.
+     */
+    private fun observedCap(): Int? =
+        ContextLengthObserver.bound(client.config.provider, client.config.modelName)
+            ?.let { (it * errorRecoverySafetyFactor).toInt().coerceAtLeast(1) }
+
     /**
      * Compact the conversation history if the estimated token count exceeds
-     * the effective cap. The default cap is
-     * `contextLength * compactThreshold`; after a successful [onLLMErrorHook]
-     * recovery the cap may be lowered via [adjustEffectiveContextCap] so
-     * the threshold is hit earlier next time, avoiding repeat LLM rejections.
+     * the effective cap (`contextLength * compactThreshold`).
+     *
+     * Disabled when the model's window is unknown — pre-emptive compaction
+     * at the observed bound would freeze exploration (see [observedCap]).
+     * Unknown models instead rely on the reactive path: grow freely until
+     * the provider rejects, then compact down to the proven-safe size.
      *
      * @return true if compaction was performed.
      */
     fun maybeCompact(): Boolean {
         val limit = contextLength ?: return false
-        val defaultMax = (limit * compactThreshold).toInt()
-        val maxTokens = effectiveMaxTokens ?: defaultMax
-        val currentMsgs = memory.messages()
-        val currentTokens = currentMsgs.sumOf { client.estimateTokenCount(it.content) }
+        val maxTokens = (limit * compactThreshold).toInt()
+        val currentTokens = currentContextTokens()
         if (currentTokens <= maxTokens) return false
         return compact()
     }
@@ -918,7 +930,15 @@ class AkibaAgent(
         val oldRounds = rounds.dropLast(compactKeepRounds)
         val keptRounds = rounds.takeLast(compactKeepRounds)
 
-        // 4. Build messages for the compression LLM call
+        // 4. Prune bulky tool outputs in the rounds being summarised
+        // (opencode-style): preserve the newest ~PRUNE_PROTECT_TOKENS of
+        // tool output, replace older ones with a placeholder.  This is
+        // what makes a SINGLE compression request fit the provider
+        // window even when the overall context is already over the
+        // limit — no multi-round compression needed.
+        val prunedOldRounds = pruneToolOutputs(oldRounds)
+
+        // 5. Build messages for the compression LLM call
         val compressMessages = mutableListOf<AgentChatMessage>()
         if (existingSummary != null) {
             compressMessages.add(
@@ -928,9 +948,9 @@ class AkibaAgent(
                 )
             )
         }
-        oldRounds.flatten().forEach { compressMessages.add(it) }
+        prunedOldRounds.flatten().forEach { compressMessages.add(it) }
 
-        // 5. Call LLM to generate the summary
+        // 6. Single summary pass
         val completion = client.chat(
             systemPrompt = COMPRESSION_PROMPT,
             messages = compressMessages,
@@ -967,7 +987,134 @@ class AkibaAgent(
         return true
     }
 
+    /**
+     * Emergency context reduction for repeated provider context-length
+     * rejections (`StrategyContext.onContextOverflowHook`). Tries the
+     * normal summarising [compact] first; when that fails (the
+     * summarisation request itself may be over the limit) or has nothing
+     * to summarise, falls back to [dropOldestRounds], which shrinks the
+     * context WITHOUT any LLM call.
+     *
+     * When an observed bound exists for this model ([observedCap]), the
+     * reduction keeps dropping rounds until the context fits under it —
+     * the proven-safe size. The bound itself is never lowered here:
+     * failures may be transient, so the cap stays dynamic.
+     *
+     * @return true if the context was actually reduced.
+     */
+    fun forceCompactForOverflow(): Boolean {
+        var reduced = try {
+            compact()
+        } catch (e: Exception) {
+            logger.warn(
+                "Summarising compact() failed during overflow recovery " +
+                    "(${e.message}); falling back to wholesale round drop.", e
+            )
+            false
+        }
+        val target = observedCap()
+        if (target != null) {
+            // Drop rounds until the context fits the proven-safe size.
+            var guard = 0
+            while (currentContextTokens() > target && guard++ < 20) {
+                if (!dropOldestRounds()) break
+                reduced = true
+            }
+        } else if (!reduced) {
+            reduced = dropOldestRounds()
+        }
+        return reduced
+    }
+
+    /**
+     * Drop all but the most recent [compactKeepRounds] rounds WITHOUT
+     * summarising — fallback for [compact] when even the summarisation
+     * request is over-length. Keeps leading system messages, the latest
+     * `<previous_summary>` (if any) and the recent rounds; a context note
+     * tells the model older tool results must be re-fetched.
+     *
+     * @return true if any rounds were dropped.
+     */
+    private fun dropOldestRounds(): Boolean {
+        val allMsgs = memory.messages()
+        if (allMsgs.isEmpty()) return false
+
+        val summaryMsg = allMsgs.firstOrNull {
+            it.role == "system" && it.content.contains("<previous_summary>")
+        }
+        val conversation = allMsgs.filter { it !== summaryMsg }
+        val systemMsgs = conversation.takeWhile { it.role == "system" }
+        val nonSystem = conversation.drop(systemMsgs.size)
+        val rounds = groupIntoRounds(nonSystem)
+        if (rounds.size <= compactKeepRounds) return false
+
+        val keptRounds = rounds.takeLast(compactKeepRounds)
+        val droppedCount = rounds.size - keptRounds.size
+
+        memory.clear()
+        systemMsgs.forEach { memory.add(it) }
+        summaryMsg?.let { memory.add(it) }
+        memory.addSystemMessage(
+            "(Context note: the oldest $droppedCount conversation rounds were dropped " +
+                "WITHOUT summarisation because the provider rejected the prompt for " +
+                "exceeding the model's context length. Details from those rounds are " +
+                "lost; re-run any tool whose result you need again.)"
+        )
+        keptRounds.flatten().forEach { memory.add(it) }
+        logger.warn(
+            "Emergency context drop: discarded $droppedCount oldest rounds " +
+                "(no summary), kept ${keptRounds.size} round(s)."
+        )
+        return true
+    }
+
     // ---- Compaction helpers ----------------------------------------------
+
+    /**
+     * Replace tool outputs in [rounds] with a short placeholder, walking
+     * from NEWEST to oldest and preserving the most recent
+     * [PRUNE_PROTECT_TOKENS] tokens' worth of tool output (opencode-style
+     * pruning). Tool-call names/ids/args are kept intact — only the
+     * bulky result text is pruned, and the placeholder notes the
+     * original size so the model can re-run the tool if needed.
+     */
+    private fun pruneToolOutputs(
+        rounds: List<List<AgentChatMessage>>
+    ): List<List<AgentChatMessage>> {
+        val flat = rounds.flatten()
+        var budget = PRUNE_PROTECT_TOKENS
+        var prunedCount = 0
+        var prunedTokens = 0
+        // Decide keep/prune per message, from newest to oldest.
+        val keep = BooleanArray(flat.size) { true }
+        for (i in flat.indices.reversed()) {
+            val m = flat[i]
+            if (m.role != "tool") continue
+            val tokens = client.estimateTokenCount(m.content)
+            if (budget > 0) {
+                budget -= tokens
+            } else {
+                keep[i] = false
+                prunedCount++
+                prunedTokens += tokens
+            }
+        }
+        if (prunedCount == 0) return rounds
+        logger.info("Pruned $prunedCount tool output(s) (~$prunedTokens tokens) before compaction summary")
+        val prunedFlat = flat.mapIndexed { i, m ->
+            if (keep[i]) m else m.copy(
+                content = "[tool output pruned — original ~${m.content.length} chars; re-run ${m.toolName ?: "the tool"} if you need it again]"
+            )
+        }
+        // Rebuild the original round structure.
+        val out = mutableListOf<List<AgentChatMessage>>()
+        var idx = 0
+        for (round in rounds) {
+            out.add(prunedFlat.subList(idx, idx + round.size))
+            idx += round.size
+        }
+        return out
+    }
 
     private fun groupIntoRounds(msgs: List<AgentChatMessage>): List<List<AgentChatMessage>> {
         val rounds = mutableListOf<MutableList<AgentChatMessage>>()

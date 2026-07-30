@@ -57,8 +57,85 @@ object LLMClientFactory {
         logger.info("Registered LLM client factory for provider: $provider")
     }
 
+    // ---- Live-client registry (for force-close on shutdown) ------------
+
+    /**
+     * Weak set of every [AkibaLLMClient] currently alive in this JVM.
+     *
+     * Motivation: `AbstractLangChainAdapter.close()` is what actually
+     * releases the underlying JDK `HttpClient` connection pool (default
+     * keep-alive 1200 s, exactly the "20-30 minute freeze" the user
+     * reported).  But `close()` is only invoked if the agent that owns
+     * the client reaches its cleanup path — and on JVM shutdown / a
+     * crash-loop restart, that path is skipped.  Without a registry,
+     * there is no way to force-close every active client at once
+     * before exit, and the lingering keep-alive connections hold the
+     * provider's per-IP connection budget hostage across restarts.
+     *
+     * Uses weak references so a leaked client doesn't prevent GC
+     * (which would itself leak connections).
+     */
+    private val liveClients: MutableSet<AkibaLLMClient> =
+        java.util.Collections.synchronizedSet(
+            java.util.Collections.newSetFromMap(java.util.WeakHashMap())
+        )
+
+    init {
+        Runtime.getRuntime().addShutdownHook(Thread({
+            val size = liveClients.size
+            if (size > 0) {
+                closeAllLiveClients("JVM shutdown hook")
+            }
+        }, "akiba-llm-client-shutdown"))
+    }
+
+    /**
+     * Number of clients currently tracked.  Exposed for diagnostics
+     * (e.g. an admin endpoint that reports how many LLM connections
+     * are open) and for the `/agent/internal/llm/close-all` route.
+     */
+    fun liveClientCount(): Int = liveClients.size
+
+    /**
+     * Force-close every client currently in [liveClients].
+     *
+     * Safe to call from arbitrary threads; each client's `close()` is
+     * expected to be idempotent.  Individual failures are logged at
+     * WARN and do not prevent the remaining clients from being closed.
+     *
+     * Called automatically from a JVM shutdown hook; can also be
+     * invoked manually before a rolling restart via the internal
+     * route `POST /agent/internal/llm/close-all`.
+     *
+     * @return the number of clients that were closed successfully.
+     */
+    fun closeAllLiveClients(reason: String = "manual"): Int {
+        // Snapshot to avoid ConcurrentModificationException — clients
+        // may be added/removed while we're iterating.
+        val snapshot = synchronized(liveClients) { liveClients.toList() }
+        if (snapshot.isEmpty()) {
+            logger.info("closeAllLiveClients($reason): no live clients to close")
+            return 0
+        }
+        logger.warn("closeAllLiveClients($reason): force-closing ${snapshot.size} live LLM client(s)")
+        var closed = 0
+        for (client in snapshot) {
+            try {
+                client.close()
+                closed++
+            } catch (e: Exception) {
+                logger.warn("closeAllLiveClients: failed to close ${client.javaClass.simpleName}: ${e.message}")
+            }
+        }
+        logger.warn("closeAllLiveClients($reason): closed $closed/${snapshot.size} clients")
+        return closed
+    }
+
     /**
      * Create an [AkibaLLMClient] from the given [config].
+     *
+     * The returned client is registered in [liveClients] so it can be
+     * force-closed on JVM shutdown / via [closeAllLiveClients].
      *
      * @throws IllegalArgumentException if no factory is registered for the provider.
      */
@@ -69,7 +146,9 @@ object LLMClientFactory {
                     "Available: ${registry.keys}"
             )
         logger.info("Creating LLM client: provider=${config.provider.displayName}, model=${config.modelName}")
-        return factory(config)
+        val client = factory(config)
+        liveClients.add(client)
+        return client
     }
 
     /**

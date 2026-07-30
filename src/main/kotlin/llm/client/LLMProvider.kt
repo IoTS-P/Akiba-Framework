@@ -156,5 +156,14 @@ data class ChatChunk(
     val tokenUsage: TokenUsage? = null,
 
     /** Finish reason – only present in the final chunk. */
-    val finishReason: String? = null
+    val finishReason: String? = null,
+
+    /**
+     * Native tool calls returned by the provider.  Only present in the
+     * final chunk ([isComplete] == true) — langchain4j's streaming API
+     * only exposes the fully-assembled tool call list at completion,
+     * not incrementally, so intermediate chunks always have an empty
+     * list here.
+     */
+    val toolCalls: List<NativeToolCall> = emptyList()
 )

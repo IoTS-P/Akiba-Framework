@@ -116,6 +116,15 @@ object AkibaServer {
 
         initServerLogger(config)
 
+        // Publish the HTTP port to a well-known file so every
+        // co-located worker JVM (manual-agent, workflow module
+        // process, ...) can discover where to push its live LLM
+        // streaming chunks — env vars only reach workers this
+        // process spawns directly, the file reaches every launch
+        // path.  Also marks this JVM as the in-process server so
+        // its own chunk publishes stay in memory.
+        org.iotsplab.akiba.llm.agent.StreamingChunkPusher.publishServerPortFile(config.port)
+
         embeddedServer(Netty, config.port, config.host) {
             install(ContentNegotiation) {
                 jackson {

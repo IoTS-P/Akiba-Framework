@@ -7,13 +7,13 @@ fun ReadHistoryToolCallTool(agentDbClient: AgentDatabaseClient): Tool = Tool(
     description = buildString {
         appendLine("Read a stored historical tool-call result by result UUID.")
         appendLine("Use this when an observation says its full stored result can be inspected with read_history_tool_call.")
-        appendLine("Returns at most 8000 characters per call. Use offset/limit for paging or grep/around for targeted lookup.")
+        appendLine("Returns at most 40000 characters per call. Use offset/limit for paging or grep/around for targeted lookup.")
     },
     parameters = listOf(
         ToolParameter("uuid", "string", "The result_uuid shown in a tool observation.", required = false),
         ToolParameter("resultUuid", "string", "Alias for uuid.", required = false),
         ToolParameter("offset", "integer", "Character offset into the stored result. Default 0.", required = false),
-        ToolParameter("limit", "integer", "Maximum characters to return, capped at 8000. Default 8000.", required = false),
+        ToolParameter("limit", "integer", "Maximum characters to return, capped at 40000. Default 40000.", required = false),
         ToolParameter("grep", "string", "Optional case-insensitive text to search for; returns nearby lines instead of offset paging.", required = false),
         ToolParameter("around", "integer", "Number of context lines around a grep match. Default 3.", required = false)
     )
@@ -22,7 +22,7 @@ fun ReadHistoryToolCallTool(agentDbClient: AgentDatabaseClient): Tool = Tool(
         ?: (args["resultUuid"] as? String)
         ?: return@Tool "Tool argument error for 'read_history_tool_call': missing required parameter 'uuid'."
     val offset = (args["offset"] as? Number)?.toInt() ?: 0
-    val limit = (args["limit"] as? Number)?.toInt() ?: 8000
+    val limit = (args["limit"] as? Number)?.toInt() ?: 40000
     val grep = args["grep"] as? String
     val around = (args["around"] as? Number)?.toInt() ?: 3
 

@@ -391,6 +391,17 @@ class AgentRuntime(
         }
         try {
             val agent = factory(handle)
+            // Inject the child session id when the factory left it
+            // null.  Factories (e.g. ProgrammaticSpawn.agentFactory)
+            // only receive the JobHandle at build time and cannot
+            // know the freshly-created session id — without it the
+            // streaming-chunk publisher in AgentStrategy has nothing
+            // to key on, so the child never gets a live view in the
+            // UI (this was the "root streams but sub-agents don't"
+            // bug).
+            if (agent.sessionId == null) {
+                agent.sessionId = sessionId
+            }
             val lifecycle = try {
                 agent.lifecycle
             } catch (e: Exception) {

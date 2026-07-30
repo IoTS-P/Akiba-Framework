@@ -146,13 +146,33 @@ abstract class AgentModule(
     dbClient = dbClient
 ) {
 
-    /** The agent session ID (created during [startProcess]). */
+    /**
+     * The agent session ID (created during [startProcess]).
+     *
+     * Setter is `protected` (not `internal`) because subclasses that
+     * live in a different Gradle module — most notably the
+     * `AkibaUtils` module's manual-agent flow — need to assign the
+     * sessionId they received via the worker handshake.  Keeping the
+     * setter `internal` would block that, which silently broke the
+     * `read_workspace_file` / `write_workspace_file` confirmation
+     * flow (the tools' `confirmFileAccess` helper returns `false`
+     * when this is null, auto-denying the access without ever
+     * showing the user a modal).
+     */
     var agentSessionId: String? = null
-        internal set
+        protected set
 
-    /** The agent instance (created during [startProcess]). */
+    /**
+     * The agent instance (created during [startProcess]).
+     *
+     * Setter is `protected` for the same reason as [agentSessionId]:
+     * subclasses in other Gradle modules (manual-agent workers) must
+     * be able to publish the agent instance they built locally so
+     * tools that read `parent.agent` (e.g. `spawn_sub_agent`,
+     * `agent_builder_alternatives`) can find it.
+     */
     var agent: AkibaAgent? = null
-        internal set
+        protected set
 
     /** The result of the agent run. */
     var agentResult: AgentResult? = null

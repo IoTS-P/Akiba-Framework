@@ -45,7 +45,7 @@ import java.io.InputStream
 fun RunShellTool(
     parent: AgentModule,
     requireConfirmation: Boolean = true,
-    maxOutputChars: Int = 8000
+    maxOutputChars: Int = 40000
 ): Tool = Tool(
     name = "run_shell",
     description = buildString {

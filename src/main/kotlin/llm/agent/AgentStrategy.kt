@@ -4,6 +4,7 @@ import org.apache.logging.log4j.LogManager
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.client.AkibaLLMClient
 import org.iotsplab.akiba.llm.client.ChatCompletion
+import org.iotsplab.akiba.llm.client.NativeToolCall
 import org.iotsplab.akiba.llm.memory.AgentChatMessage
 import org.iotsplab.akiba.llm.memory.ChatMemory
 import org.iotsplab.akiba.llm.memory.MemoryManager
@@ -11,7 +12,11 @@ import org.iotsplab.akiba.llm.memory.MemoryType
 import org.iotsplab.akiba.llm.memory.MemoryScope
 import org.iotsplab.akiba.llm.tool.ToolCallParser
 import org.iotsplab.akiba.llm.tool.ToolRegistry
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.iotsplab.akiba.llm.agent.ToolResultDuplicateSeverity
 import java.util.UUID
 import kotlin.system.measureTimeMillis
@@ -123,9 +128,25 @@ class StrategyContext(
      */
     val onLLMErrorHook: ((LLMErrorInfo) -> Boolean)? = null,
     /**
+     * Optional hook invoked when the provider rejects the request with a
+     * context-length overflow [CONTEXT_OVERFLOW_COMPACT_THRESHOLD] times
+     * in a row (see [ContextOverflowDetector]). This is the escape hatch
+     * for models whose context window is unknown to
+     * `ModelContextLengthService`: without it the unlimited retry loop
+     * spins forever on a request the provider can never accept.
+     *
+     * Implementations should compact memory — ideally with a fallback
+     * that shrinks the context WITHOUT an LLM call (the summarising call
+     * itself may be over the limit) — and return true when the context
+     * was reduced. May fire repeatedly (each time the overflow persists,
+     * compact deeper). After [MAX_FAILED_OVERFLOW_COMPACTIONS]
+     * consecutive `false` reports the retry loop aborts (returns null).
+     */
+    val onContextOverflowHook: ((consecutiveOverflows: Int) -> Boolean)? = null,
+    /**
      * Deprecated — no longer used to cap retries.  Retained for
      * backward-compatible constructor signatures.  The callLLM
-     * retry loop is now unlimited with exponential backoff (see
+     * retry loop is now unlimited with backoff (see
      * [LLM_RETRY_BACKOFF_MS]).
      */
     val maxLLMErrorRetries: Int = 1,
@@ -249,9 +270,10 @@ class StrategyContext(
      * Call the LLM with the current conversation history.
      *
      * On failure (timeout or any other error), the call is retried
-     * indefinitely with an exponential backoff schedule (see
-     * [LLM_RETRY_BACKOFF_MS]: 30s, 1min, 2min, 5min, 15min, 30min,
-     * 1h, 2h, 4h, 6h, then 6h for all subsequent attempts).
+     * indefinitely with a backoff schedule (see
+     * [LLM_RETRY_BACKOFF_MS]: 2min for retries 1-5, 3min for retries
+     * 6-10, then from retry 11 the interval starts at 5min and grows
+     * by 2min for each subsequent retry).
      *
      * If [onLLMErrorHook] is provided, it is invoked **once** before
      * the retry loop starts, so it can compact memory as a recovery
@@ -265,16 +287,398 @@ class StrategyContext(
      *
      * @return the completion, or null if cancelled or interrupted.
      */
-    suspend fun callLLM(systemPrompt: String): ChatCompletion? {
-        fun invokeChat(): ChatCompletion {
-            val baseMessages = contextMessagesProvider?.invoke() ?: memory.messages()
-            val messagesForCall = baseMessages + consumeTransientMessages()
-            return client.chat(
+    /**
+     * Start a coroutine that periodically writes a "LLM still working"
+     * progress heartbeat to `agent_messages`.  The heartbeat lets the
+     * frontend render "agent still working on LLM (Ns elapsed)" so the
+     * user knows the agent hasn't frozen — critical for long-form
+     * generations that take 60+ seconds.
+     *
+     * Returns a [Job] that the caller must cancel when the LLM call
+     * completes (success or failure).  The coroutine is started with
+     * [Dispatchers.IO] so daemon HTTP writes don't block the caller.
+     *
+     * The heartbeat writes a system message with the
+     * [LLM_PROGRESS_PREFIX] sentinel, which `PersistentChatMemory`
+     * filters out of the LLM context (same as retry-status rows).
+     * Failures are swallowed — heartbeat is best-effort UI feedback.
+     */
+    private fun startProgressHeartbeat(): kotlinx.coroutines.Job? {
+        if (sessionId == null || agentDbClient == null) return kotlinx.coroutines.Job()
+        val sid = sessionId
+        val adb = agentDbClient
+        val startedAt = System.currentTimeMillis()
+        return kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            while (true) {
+                kotlinx.coroutines.delay(LLM_PROGRESS_HEARTBEAT_MS)
+                val elapsed = System.currentTimeMillis() - startedAt
+                try {
+                    adb?.appendMessages(
+                        sid,
+                        listOf(AgentDatabaseClient.MessageData(
+                            role = "system",
+                            content = "$LLM_PROGRESS_PREFIX elapsedMs=$elapsed status=in_flight",
+                        ))
+                    )
+                } catch (_: Exception) { /* best-effort */ }
+            }
+        }
+    }
+
+    /** Cancel [heartbeatJob] and write the final "done" progress row. */
+    private suspend fun stopProgressHeartbeat(heartbeatJob: kotlinx.coroutines.Job?, succeeded: Boolean) {
+        heartbeatJob?.cancel()
+        if (sessionId == null || agentDbClient == null) return
+        try {
+            agentDbClient.appendMessages(
+                sessionId,
+                listOf(AgentDatabaseClient.MessageData(
+                    role = "system",
+                    content = "$LLM_PROGRESS_PREFIX status=${if (succeeded) "done" else "failed"}",
+                ))
+            )
+        } catch (_: Exception) { /* best-effort */ }
+    }
+
+    /**
+     * Invoke the LLM **via streaming**, accumulating chunks into a single
+     * [ChatCompletion].  Falls back to the non-streaming [AkibaLLMClient.chat]
+     * when the provider reports no streaming support.
+     *
+     * Why streaming: the user's bug report was "agent appears frozen for
+     * 18-30 minutes when generating a long response".  Non-streaming
+     * `chat()` gives no signal until the entire response is assembled
+     * server-side, so a slow generation looks identical to a hang.
+     * Streaming surfaces incremental chunks — we can both (a) write
+     * progress previews to `agent_messages` so the frontend sees the
+     * response being built, and (b) apply a tight **per-chunk timeout**
+     * so a stalled stream is detected within 30 s instead of 120 s.
+     *
+     * Tool calls: langchain4j's streaming API assembles the full
+     * tool-call list only at completion time, so we surface them on
+     * the final chunk and copy into the resulting [ChatCompletion].
+     */
+    private suspend fun invokeChatStreaming(systemPrompt: String): ChatCompletion {
+        val baseMessages = contextMessagesProvider?.invoke() ?: memory.messages()
+        val messagesForCall = baseMessages + consumeTransientMessages()
+        val tools = if (toolRegistry.isEmpty()) null else toolRegistry.toJsonSchemas()
+
+        if (!client.supportsStreaming()) {
+            logger.info("[StreamingDiag] client reports no streaming support — falling back to non-streaming chat (session=$sessionId)")
+            return client.chat(systemPrompt = systemPrompt, messages = messagesForCall, tools = tools)
+        }
+        logger.info("[StreamingDiag] invokeChatStreaming starting (session=$sessionId, provider=${client.config.provider}, model=${client.config.modelName})")
+
+        val textBuffer = StringBuilder()
+        var finalChunk: org.iotsplab.akiba.llm.client.ChatChunk? = null
+
+        // ---------------------------------------------------------------
+        // Streaming progress writer — runs in its own coroutine so the
+        // Flow consumer is NEVER blocked by a slow daemon HTTP call.
+        //
+        // The bug this fixes: previously we called
+        // `agentDbClient.appendMessages(...)` inline inside `collect { }`.
+        // That call uses `runBlocking` under the hood, so it *blocks the
+        // current thread* instead of suspending the coroutine.  During
+        // that block, langchain4j's streaming producer kept firing
+        // `onPartialResponse`, but our `chatStream` channel (capacity=64)
+        // would fill up and `trySend` would silently drop chunks.  The
+        // result was the user-observed "preview shows the first 1-2
+        // chars, then everything dumps at once" — the Flow only saw a
+        // tiny prefix plus the final drain.
+        //
+        // We instead share state via atomics and let a *separate*
+        // coroutine write the progress rows every ~3 s.  The consumer
+        // coroutine only ever touches cheap in-memory state, so the
+        // producer is never back-pressured.
+        // ---------------------------------------------------------------
+        val chunkCountAtomic = java.util.concurrent.atomic.AtomicInteger(0)
+        val byteCountAtomic  = java.util.concurrent.atomic.AtomicInteger(0)
+        val latestPreviewRef = java.util.concurrent.atomic.AtomicReference<String>("")
+        val streamFinishedRef = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        val progressWriterJob: kotlinx.coroutines.Job? =
+            if (sessionId != null && agentDbClient != null) {
+                val sid = sessionId
+                val adb = agentDbClient
+                kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    while (!streamFinishedRef.get()) {
+                        kotlinx.coroutines.delay(3_000)
+                        if (streamFinishedRef.get()) break
+                        val cc = chunkCountAtomic.get()
+                        val bc = byteCountAtomic.get()
+                        val pv = latestPreviewRef.get()
+                        try {
+                            adb?.appendMessages(
+                                sid,
+                                listOf(AgentDatabaseClient.MessageData(
+                                    role = "system",
+                                    content = "$LLM_PROGRESS_PREFIX status=in_flight chunkCount=$cc byteCount=$bc preview=${pv.take(80)}",
+                                ))
+                            )
+                        } catch (_: Exception) { /* best-effort */ }
+                    }
+                }
+            } else null
+
+        var firstChunkLogged = false
+        try {
+            client.chatStream(
                 systemPrompt = systemPrompt,
                 messages = messagesForCall,
-                tools = if (toolRegistry.isEmpty()) null else toolRegistry.toJsonSchemas()
+                tools = tools,
+            ).collect { chunk ->
+                if (chunk.isComplete) {
+                    finalChunk = chunk
+                    logger.info("[StreamingDiag] terminal chunk received (session=$sessionId, totalChunks=${chunkCountAtomic.get()}, totalBytes=${byteCountAtomic.get()})")
+                    // Push the terminal chunk so SSE subscribers see
+                    // `done: true` and close the stream cleanly.
+                    if (sessionId != null) {
+                        StreamingChunkPusher.publish(
+                            sessionId = sessionId,
+                            delta = "",
+                            chunkCount = chunkCountAtomic.get(),
+                            byteCount = byteCountAtomic.get(),
+                            done = true,
+                            error = null,
+                        )
+                    }
+                } else {
+                    if (!firstChunkLogged) {
+                        firstChunkLogged = true
+                        logger.info("[StreamingDiag] first chunk received (session=$sessionId, deltaLen=${chunk.delta.length})")
+                    }
+                    textBuffer.append(chunk.delta)
+                    val cc = chunkCountAtomic.incrementAndGet()
+                    val bc = byteCountAtomic.addAndGet(chunk.delta.length)
+                    // Cheap, non-blocking — just update the AtomicReference
+                    // for the writer coroutine to pick up on its next tick.
+                    latestPreviewRef.set(textBuffer.toString().takeLast(120).replace("\n", " "))
+                    // Push this chunk to the SSE bus so the frontend sees
+                    // the response grow token-by-token.  This call is
+                    // fire-and-forget (in-process: bus trySend; cross-
+                    // process: HTTP sendAsync with 2s timeout).
+                    if (sessionId != null) {
+                        StreamingChunkPusher.publish(
+                            sessionId = sessionId,
+                            delta = chunk.delta,
+                            chunkCount = cc,
+                            byteCount = bc,
+                            done = false,
+                            error = null,
+                        )
+                    } else {
+                        if (cc == 1) {
+                            logger.warn("[StreamingDiag] sessionId is NULL — chunks will NOT be pushed to SSE (this is why the bubble is empty)")
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // On streaming failure we surface the error to the caller
+            // (the retry loop in [callLLM] will catch and retry).
+            // Notify stream subscribers so the frontend can mark the
+            // bubble as interrupted.
+            if (sessionId != null) {
+                StreamingChunkPusher.publish(
+                    sessionId = sessionId,
+                    delta = "",
+                    chunkCount = chunkCountAtomic.get(),
+                    byteCount = byteCountAtomic.get(),
+                    done = true,
+                    error = e.message ?: e.javaClass.simpleName,
+                )
+            }
+            val partial = textBuffer.toString()
+            if (partial.isNotBlank()) {
+                // FIRST try to salvage the buffer: the provider may
+                // have finished generating (Final Answer or complete
+                // tool calls) but never closed the connection — the
+                // 45 s stall budget then fired on an idle-but-complete
+                // stream.  Discarding that and regenerating from
+                // scratch would waste the whole response.
+                tryRecoverCompletedStream(
+                    partial,
+                    chunkCountAtomic.get(),
+                    byteCountAtomic.get(),
+                )?.let { return it }
+                // Genuinely truncated.  Preserve the partial output so
+                // the work isn't lost, but strip reasoning markup
+                // first: an interruption that happened INSIDE a
+                // <think> block has no visible body worth saving at
+                // all, and completed think blocks are noise in the
+                // retry's context (they also inflate the apparent
+                // output length).
+                val partialBody = ToolCallParser.stripThinking(
+                    ToolCallParser.stripLeadingThoughtBlock(partial)
+                )
+                if (partialBody.isNotBlank()) {
+                    // Write the partial into chat memory (persistent →
+                    // also lands in the DB) with the interrupted-
+                    // partial marker, followed by an explicit
+                    // continuation instruction.  The retry loop's next
+                    // invokeChatStreaming call rebuilds its message
+                    // list from THIS memory, so the model sees both:
+                    // its own interrupted partial answer AND the rule
+                    // for how to continue.  The instruction depends on
+                    // WHERE the stream was cut:
+                    //  - Inside a tool_call JSON block: the tail is
+                    //    unparseable, and a model that seamlessly
+                    //    continues would emit only the missing
+                    //    remainder — two broken halves.  Demand a
+                    //    fresh, complete block.
+                    //  - Anywhere else (plain prose): continuing is
+                    //    safe and saves tokens, so only the weaker
+                    //    "keep going, don't repeat yourself" hint.
+                    // The frontend renders the partial dimmed and
+                    // hides the instruction row.
+                    val truncatedInToolCall = ToolCallParser.endsWithTruncatedToolCall(partialBody)
+                    val instruction = if (truncatedInToolCall) {
+                        "The previous assistant message was interrupted WHILE a " +
+                            "tool_call JSON block was being emitted. The truncated JSON is " +
+                            "invalid and CANNOT be completed by writing only the missing " +
+                            "tail — that would leave two unparseable halves. You MUST " +
+                            "re-emit the ENTIRE tool call as a single complete JSON block. " +
+                            "The text before the truncated block remains valid and may be " +
+                            "referenced or reused."
+                    } else {
+                        "The previous assistant message was interrupted mid-stream " +
+                            "(connection stalled) but NOT inside a tool call. Continue the " +
+                            "response seamlessly from exactly where it stopped, preserving " +
+                            "structure and intent — do not repeat the already-generated " +
+                            "content. (If your next output is a tool_call, always emit it " +
+                            "as one complete JSON block.)"
+                    }
+                    runCatching {
+                        memory.addAssistantMessage(INTERRUPTED_PARTIAL_PREFIX + partialBody)
+                        memory.add("user", RETRY_INSTRUCTION_PREFIX + instruction)
+                    }.onFailure { memErr ->
+                        logger.warn("[StreamingDiag] failed to persist interrupted partial (session=$sessionId): ${memErr.message}")
+                    }
+                    logger.info("[StreamingDiag] interrupted partial persisted (session=$sessionId, partialChars=${partialBody.length}, truncatedInToolCall=$truncatedInToolCall)")
+                }
+            }
+            throw e
+        } finally {
+            streamFinishedRef.set(true)
+            progressWriterJob?.cancel()
+        }
+
+        val final = finalChunk
+            ?: throw org.iotsplab.akiba.llm.client.LLMTimeoutException(
+                "Streaming completed without a final chunk (model=${client.config.modelName})"
+            )
+        return ChatCompletion(
+            content = textBuffer.toString(),
+            tokenUsage = final.tokenUsage,
+            model = client.config.modelName,
+            finishReason = final.finishReason,
+            toolCalls = final.toolCalls,
+        )
+    }
+
+    /**
+     * Attempt to salvage a stalled stream whose buffered text already
+     * looks COMPLETE.  Observed in production: the provider finishes
+     * generating a long response but never closes the connection, so
+     * the 45 s per-chunk stall budget fires on an idle-but-complete
+     * stream.  Rather than discarding the buffer and regenerating
+     * from scratch, run the same parsing the normal path would apply
+     * (mirroring the ReAct loop's extraction order):
+     *
+     *  1. Final Answer marker present → return a plain completion;
+     *     the strategy loop's own Final-Answer check terminates the
+     *     iteration normally.
+     *  2. Complete text-embedded tool call(s) → return them as
+     *     native tool calls so the loop executes them exactly as if
+     *     the provider had finished cleanly.  A truncated trailing
+     *     call is NOT parsed (`ToolCallParser` requires balanced
+     *     JSON), so only genuinely complete calls are executed; the
+     *     loop's next iteration lets the model re-emit anything
+     *     that was cut off.
+     *
+     * Returns null when the buffer looks genuinely truncated — the
+     * caller then persists the partial and retries.  On success a
+     * final CLEAN done chunk is published first, so the frontend
+     * clears the interrupted marker and swaps the bubble for the
+     * canonical flow.
+     */
+    private fun tryRecoverCompletedStream(
+        partial: String,
+        chunkCount: Int,
+        byteCount: Int,
+    ): ChatCompletion? {
+        // Strip reasoning markup: a stream interrupted INSIDE a
+        // <think> block has no visible body at all (nothing to
+        // salvage), and completed think blocks would only add noise
+        // to the Final-Answer / tool-call parsing below.
+        val stripped = ToolCallParser.stripThinking(
+            ToolCallParser.stripLeadingThoughtBlock(partial)
+        )
+        if (stripped.isBlank()) return null
+
+        fun publishRecoveredDone() {
+            if (sessionId != null) {
+                StreamingChunkPusher.publish(
+                    sessionId = sessionId,
+                    delta = "",
+                    chunkCount = chunkCount,
+                    byteCount = byteCount,
+                    done = true,
+                    error = null,
+                )
+            }
+        }
+
+        val finalAnswer = SharedFinalAnswerExtractor.extract(stripped)
+        if (finalAnswer != null) {
+            logger.info("[StreamingDiag] stream stalled but a Final Answer is present — recovering without regeneration (session=$sessionId, chars=${partial.length})")
+            publishRecoveredDone()
+            return ChatCompletion(
+                content = partial,
+                tokenUsage = null,
+                model = client.config.modelName,
+                finishReason = "stop",
+                toolCalls = emptyList(),
             )
         }
+
+        val toolCalls = ToolCallParser.parseAll(stripped)
+        if (toolCalls.isNotEmpty()) {
+            logger.info("[StreamingDiag] stream stalled but ${toolCalls.size} complete tool call(s) parsed — executing them instead of regenerating (session=$sessionId, chars=${partial.length})")
+            publishRecoveredDone()
+            return ChatCompletion(
+                content = partial,
+                tokenUsage = null,
+                model = client.config.modelName,
+                finishReason = "tool_calls",
+                toolCalls = toolCalls.map {
+                    NativeToolCall(id = it.callId, name = it.name, argumentsJson = it.argumentsJson)
+                },
+            )
+        }
+        return null
+    }
+
+    /**
+     * Record the prompt size of a successful LLM call into
+     * [ContextLengthObserver], raising the model's empirically-proven
+     * context-window lower bound. Prefers the provider-reported input
+     * token count; falls back to the local estimate.
+     */
+    private fun recordObservedPromptTokens(completion: ChatCompletion) {
+        try {
+            val promptTokens = completion.tokenUsage?.inputTokenCount
+                ?: (contextMessagesProvider?.invoke() ?: memory.messages())
+                    .sumOf { client.estimateTokenCount(it.content) }
+            ContextLengthObserver.recordSuccess(
+                client.config.provider, client.config.modelName, promptTokens
+            )
+        } catch (_: Exception) { /* best-effort observation */ }
+    }
+
+    suspend fun callLLM(systemPrompt: String): ChatCompletion? {
+        suspend fun invokeChat(): ChatCompletion = invokeChatStreaming(systemPrompt)
 
         return try {
             cancellationReasonProvider?.invoke()?.let { reason ->
@@ -288,9 +692,14 @@ class StrategyContext(
                 logger.warn(stats.lastError)
                 return null
             }
+            val heartbeat = startProgressHeartbeat()
             try {
-                invokeChat()
+                val r = invokeChat()
+                stopProgressHeartbeat(heartbeat, succeeded = true)
+                recordObservedPromptTokens(r)
+                r
             } catch (initialError: Exception) {
+                stopProgressHeartbeat(heartbeat, succeeded = false)
                 stats.lastError = initialError.message
                 logger.warn("LLM chat failed: ${initialError.message}")
 
@@ -326,13 +735,25 @@ class StrategyContext(
                     }
                 }
 
-                // ---- Unlimited retry loop with exponential backoff ----
+                // ---- Unlimited retry loop with backoff ----
                 // Both timeouts and other errors trigger retries.  The
-                // backoff schedule grows roughly exponentially (30s →
-                // 1min → 2min → 5min → … → 6h), capping at 6h for
-                // truly prolonged outages.  The loop only exits on
-                // success, cancellation, or thread interruption.
+                // backoff schedule is 2min for retries 1-5, 3min for
+                // retries 6-10, then from retry 11 it starts at 5min and
+                // grows by 2min for each subsequent retry.  The loop only
+                // exits on success, cancellation, or thread interruption.
                 var retryAttempt = 0
+                // Context-overflow tracking: consecutive provider
+                // context-length rejections (ContextOverflowDetector —
+                // regex on the error text first, then structured checks;
+                // the initial error counts as the first). At
+                // CONTEXT_OVERFLOW_COMPACT_THRESHOLD the overflow hook
+                // compacts the context; other errors reset the count.
+                var consecutiveOverflows =
+                    if (ContextOverflowDetector.isContextOverflow(initialError)) 1 else 0
+                var failedOverflowCompactions = 0
+                // Set after a successful overflow compaction: retry
+                // promptly instead of waiting out the full backoff.
+                var retryImmediately = false
                 while (true) {
                     // Check cancellation before sleeping
                     cancellationReasonProvider?.invoke()?.let { reason ->
@@ -341,7 +762,17 @@ class StrategyContext(
                         return null
                     }
 
-                    val backoffMs = LLM_RETRY_BACKOFF_MS.getOrElse(retryAttempt) { LLM_RETRY_BACKOFF_MS.last() }
+                    // Beyond the explicit list (retry 11+), the backoff
+                    // continues to grow by 2 minutes per retry starting
+                    // from 5 minutes at retry 11.
+                    val backoffMs = if (retryImmediately) {
+                        retryImmediately = false
+                        5_000L
+                    } else LLM_RETRY_BACKOFF_MS.getOrElse(retryAttempt) {
+                        val beyond = retryAttempt - LLM_RETRY_BACKOFF_MS.size
+                        // retry 11 = 5min (300_000ms); each step beyond adds 2min (120_000ms)
+                        300_000L + beyond * 120_000L
+                    }
                     retryAttempt++
 
                     val backoffLabel = formatBackoffDuration(backoffMs)
@@ -401,8 +832,11 @@ class StrategyContext(
                         return null
                     }
 
+                    val retryHeartbeat = startProgressHeartbeat()
                     try {
                         val result = invokeChat()
+                        stopProgressHeartbeat(retryHeartbeat, succeeded = true)
+                        recordObservedPromptTokens(result)
                         logger.info("LLM retry #$retryAttempt succeeded after $backoffLabel backoff")
                         // Write a success-notice so the frontend can
                         // clear the retry banner.
@@ -419,8 +853,64 @@ class StrategyContext(
                         }
                         return result
                     } catch (retryError: Exception) {
+                        stopProgressHeartbeat(retryHeartbeat, succeeded = false)
                         stats.lastError = "${initialError.message}; retry #$retryAttempt failed: ${retryError.message}"
                         logger.warn("LLM retry #$retryAttempt failed: ${retryError.message}", retryError)
+
+                        // ---- Context-overflow emergency compaction ----
+                        // After CONTEXT_OVERFLOW_COMPACT_THRESHOLD
+                        // consecutive context-length rejections, compact
+                        // the context and retry promptly (see hook docs).
+                        if (ContextOverflowDetector.isContextOverflow(retryError)) {
+                            consecutiveOverflows++
+                            if (consecutiveOverflows >= CONTEXT_OVERFLOW_COMPACT_THRESHOLD) {
+                                val compacted = try {
+                                    onContextOverflowHook?.invoke(consecutiveOverflows) == true
+                                } catch (hookErr: Exception) {
+                                    logger.warn("onContextOverflowHook threw: ${hookErr.message}", hookErr)
+                                    false
+                                }
+                                if (compacted) {
+                                    failedOverflowCompactions = 0
+                                    retryImmediately = true
+                                    logger.warn(
+                                        "Context overflow persisted across $consecutiveOverflows " +
+                                            "consecutive rejections — context compacted, retrying promptly."
+                                    )
+                                    // UI-visible status so the frontend shows
+                                    // "compacted" rather than endless retrying.
+                                    if (sessionId != null && agentDbClient != null) {
+                                        try {
+                                            agentDbClient.appendMessages(
+                                                sessionId,
+                                                listOf(AgentDatabaseClient.MessageData(
+                                                    role = "system",
+                                                    content = "$LLM_RETRY_STATUS_PREFIX retry=$retryAttempt action=context-compacted",
+                                                ))
+                                            )
+                                        } catch (_: Exception) { /* best-effort UI update */ }
+                                    }
+                                } else {
+                                    failedOverflowCompactions++
+                                    logger.warn(
+                                        "Overflow compaction could not shrink the context " +
+                                            "(attempt $failedOverflowCompactions/$MAX_FAILED_OVERFLOW_COMPACTIONS)."
+                                    )
+                                    if (failedOverflowCompactions >= MAX_FAILED_OVERFLOW_COMPACTIONS) {
+                                        stats.lastError =
+                                            "Unrecoverable context overflow: the provider keeps " +
+                                                "rejecting the prompt for exceeding the model's context " +
+                                                "length and compaction cannot shrink it further. " +
+                                                "Last error: ${retryError.message}"
+                                        logger.error(stats.lastError)
+                                        return null
+                                    }
+                                }
+                            }
+                        } else {
+                            consecutiveOverflows = 0
+                            failedOverflowCompactions = 0
+                        }
                         // Continue the loop for the next retry with longer backoff.
                     }
                 }
@@ -1827,7 +2317,7 @@ private fun LoopStats.toResult(output: String, stopReason: StopReason): AgentRes
  *   placeholder if null/blank.
  * @param memory the child's [ChatMemory] — the last assistant turn and any
  *   preceding tool results are extracted from here.
- * @param maxChars hard cap on the output size (default 8000, leaving room
+ * @param maxChars hard cap on the output size (default 40000, leaving room
  *   for the surrounding envelope text and the parent's own context).
  * @param stopReason the resulting [StopReason]; included for downstream
  *   consumers that switch on it.

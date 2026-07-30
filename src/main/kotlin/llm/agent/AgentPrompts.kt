@@ -245,7 +245,7 @@ object AgentPrompts {
         </analysis_strategy>
     """.trimIndent()
 
-    /** System prompt used for the one-shot context compression LLM call. */
+    /** System prompt used for context compression LLM calls (single-shot or chained per-chunk). */
     val COMPRESSION_PROMPT = """
         You are a context compression assistant. Your task is to summarize the provided conversation history into a concise, structured summary.
 

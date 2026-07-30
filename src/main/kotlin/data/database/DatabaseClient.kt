@@ -13,6 +13,7 @@ import com.fasterxml.jackson.module.kotlin.readValue
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.HttpRequestRetry
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.websocket.WebSockets
 import io.ktor.client.plugins.websocket.pingInterval
@@ -95,6 +96,26 @@ class DatabaseClient(
                     cause is java.io.IOException
                 }
                 exponentialDelay()
+            }
+            install(HttpTimeout) {
+                // Without an explicit timeout, Ktor's HttpClient waits
+                // **forever** for the daemon to respond.  That was the
+                // root cause of the "agent appears to hang permanently
+                // with no retry notice" bug: when the daemon stalled
+                // (network half-open, daemon thread deadlock, extreme
+                // GC pause, …), every `appendMessages` /
+                // `updateSession` / `getMessages` call from inside a
+                // manual-agent worker or runtime agent would block
+                // forever, so the LLM retry-status write never
+                // reached the DB and the frontend saw only silence.
+                //
+                // The daemon is local (127.0.0.1) so these budgets are
+                // generous; failure means the daemon is genuinely
+                // unresponsive, and the worker should surface that
+                // instead of hanging.
+                connectTimeoutMillis = 5_000        // 5s to establish TCP
+                socketTimeoutMillis  = 30_000       // 30s between bytes
+                requestTimeoutMillis = 60_000       // 60s for the whole call
             }
         }
 

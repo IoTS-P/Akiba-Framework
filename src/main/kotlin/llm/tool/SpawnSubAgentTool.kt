@@ -333,18 +333,30 @@ private fun spawnFromTemplate(
     }
 
     return try {
+        // NOTE: do NOT wrap this in `llmClient.use { ... }`.  The block
+        // below only *registers* the child agent — `runtime.spawn` is
+        // asynchronous and returns immediately, while the factory that
+        // actually uses the client runs later in the child's own
+        // coroutine.  If we used `use`, the block would exit before
+        // the child even made its first LLM call, and `use` would
+        // close the client (and the underlying JDK HttpClient's
+        // connection pool) out from under the child.
+        //
+        // Ownership instead transfers to the child AkibaAgent — its
+        // `close()` (invoked via `defaultTerminate()` / the runtime's
+        // cleanup path) is what closes the client at end of life.
         val llmClient = LLMClientFactory.create(llmConfig)
-        llmClient.use { client ->
+        run {
             val childName = name ?: "${template.id}-${System.nanoTime()}"
             val childSessionId = try {
                 if (reuseSessionId != null) {
                     val session = agentDbClient.getSession(reuseSessionId)
                     if (session.parentSessionId != parentSessionId) {
-                        return@use "Error: reuseSessionId '$reuseSessionId' is not a direct child of caller session '$parentSessionId'"
+                        return@run "Error: reuseSessionId '$reuseSessionId' is not a direct child of caller session '$parentSessionId'"
                     }
                     val state = agentDbClient.getRuntimeState(reuseSessionId)?.runtimeState?.lowercase()
                     if (state != RuntimeState.ERROR.wire()) {
-                        return@use "Error: reuseSessionId '$reuseSessionId' must be in runtime_state=error before retry; current=$state"
+                        return@run "Error: reuseSessionId '$reuseSessionId' must be in runtime_state=error before retry; current=$state"
                     }
                     reuseSessionId
                 } else {
@@ -357,7 +369,7 @@ private fun spawnFromTemplate(
                     )
                 }
             } catch (e: Exception) {
-                return@use "Error: failed to ${if (reuseSessionId != null) "reuse" else "create"} child session: ${e.message}"
+                return@run "Error: failed to ${if (reuseSessionId != null) "reuse" else "create"} child session: ${e.message}"
             }
 
             val childMemory = persistentChatMemory(agentDbClient, childSessionId, maxMessages = 0)
@@ -381,7 +393,7 @@ private fun spawnFromTemplate(
                 inputs = resolved.resolvedInputs,
                 appliedOverrides = resolved.appliedOverrides,
                 resolvedToolNames = resolved.resolvedToolNames,
-                llmClient = client,
+                llmClient = llmClient,
                 childSessionId = childSessionId,
                 childName = childName,
                 template = template,
@@ -413,7 +425,7 @@ private fun spawnFromTemplate(
                 )
                 childTranscript.writeUserMessage("[spawn_sub_agent failed before child run]\n$err")
                 childTranscript.close()
-                return@use mapper.writeValueAsString(mapOf(
+                return@run mapper.writeValueAsString(mapOf(
                     "status" to "error",
                     "mode" to "template",
                     "templateId" to template.id,
@@ -779,7 +791,15 @@ fun spawnChildFromTemplateProgrammatically(
     val llmConfig = parent.resolveLLMConfigInternal()
     val llmClient = LLMClientFactory.create(llmConfig)
 
-    return llmClient.use { client ->
+    // NOTE: see the matching comment in `spawnFromTemplate` — do NOT
+    // wrap this in `llmClient.use { ... }`.  `runtime.spawn` is
+    // asynchronous, the child uses the client later in its own
+    // coroutine, and `use` would close the client's JDK HttpClient
+    // before the child even makes its first LLM call.  Ownership
+    // transfers to the child AkibaAgent whose `close()` (invoked
+    // via `defaultTerminate()` / the runtime's cleanup path) closes
+    // the client at end of life.
+    return run {
         val childName = name ?: "${template.id}-${System.nanoTime()}"
         val childSessionId = agentDbClient.createSession(
             sessionName = "sub-agent::$childName",
@@ -803,7 +823,7 @@ fun spawnChildFromTemplateProgrammatically(
             inputs = resolved.resolvedInputs,
             appliedOverrides = resolved.appliedOverrides,
             resolvedToolNames = resolved.resolvedTools,
-            llmClient = client,
+            llmClient = llmClient,
             childSessionId = childSessionId,
             childName = childName,
             template = template,

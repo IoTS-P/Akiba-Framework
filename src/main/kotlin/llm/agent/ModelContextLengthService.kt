@@ -63,10 +63,15 @@ object ModelContextLengthService {
     /**
      * Get the maximum context window (in tokens) for the given provider + model.
      *
-     * Returns null when the provider is not mapped or the model is not found.
+     * Mapped providers search only their own catalog section; unmapped
+     * providers (OPEN_AI_COMPATIBLE, OLLAMA) fall back to matching the
+     * model name across the WHOLE catalog — the provider prefix is only
+     * a key namespace, it does not affect the fetched data.
+     *
+     * Returns null when the model is not found (or data is unavailable).
      */
     fun getContextLength(provider: LLMProvider, modelName: String): Int? {
-        val mapped = mapProvider(provider) ?: return null
+        val mapped = mapProvider(provider)
         return lookupWithRefresh(mapped, modelName)?.contextLength
     }
 
@@ -74,7 +79,7 @@ object ModelContextLengthService {
      * Get the maximum output length (in tokens) for the given provider + model.
      */
     fun getOutputLength(provider: LLMProvider, modelName: String): Int? {
-        val mapped = mapProvider(provider) ?: return null
+        val mapped = mapProvider(provider)
         return lookupWithRefresh(mapped, modelName)?.outputLength
     }
 
@@ -85,8 +90,11 @@ object ModelContextLengthService {
     /**
      * Look up model metadata, refreshing the local cache if the file is
      * stale or the model is not found.
+     *
+     * @param mappedProvider Catalog key prefix (e.g. "openai"), or null
+     *        to search the whole catalog by model name alone.
      */
-    private fun lookupWithRefresh(mappedProvider: String, modelName: String): ModelMetadata? {
+    private fun lookupWithRefresh(mappedProvider: String?, modelName: String): ModelMetadata? {
         val (data, fileDatetime, stale) = loadModelInfoFile()
 
         // Try searching with current data
@@ -96,7 +104,7 @@ object ModelContextLengthService {
         // Not found — check if the file is missing or stale, then re-fetch
         val needsFetch = fileDatetime == null || stale
         if (needsFetch) {
-            logger.info("Model metadata stale or missing for $mappedProvider/$modelName, fetching fresh data")
+            logger.info("Model metadata stale or missing for ${mappedProvider ?: "*"}/$modelName, fetching fresh data")
             val freshData = try {
                 runBlocking { fetchAndSave() }
             } catch (e: Exception) {
@@ -107,7 +115,7 @@ object ModelContextLengthService {
         }
 
         // File is recent but model not in it
-        logger.debug("Model $mappedProvider/$modelName not found in fresh metadata")
+        logger.debug("Model ${mappedProvider ?: "*"}/$modelName not found in fresh metadata")
         return null
     }
 
@@ -187,12 +195,17 @@ object ModelContextLengthService {
         }
     }
 
-    /** Search for a model in the given data map. */
+    /**
+     * Search for a model in the given data map. When [mappedProvider]
+     * is null, matches by model name across ALL provider prefixes
+     * (for OpenAI-compatible gateways whose upstream is unknown).
+     */
     private fun lookupIn(
         data: Map<String, ModelMetadata>,
-        mappedProvider: String,
+        mappedProvider: String?,
         modelName: String
     ): ModelMetadata? {
+        if (mappedProvider == null) return lookupByModelName(data, modelName)
         val prefix = "$mappedProvider/"
 
         // 1. Exact match
@@ -212,6 +225,27 @@ object ModelContextLengthService {
         }
         reverseMatch?.let { return data[it] }
 
+        return null
+    }
+
+    /**
+     * Catalog-wide lookup by model name alone, for providers without a
+     * mapped prefix (OPEN_AI_COMPATIBLE gateways, OLLAMA). Prefers the
+     * strongest match: exact model-part match, then contains, then
+     * reverse-contains.
+     */
+    private fun lookupByModelName(data: Map<String, ModelMetadata>, modelName: String): ModelMetadata? {
+        // 1. Exact match on the part after "<provider>/"
+        data.entries.firstOrNull { it.key.substringAfter("/") == modelName }
+            ?.let { return it.value }
+        // 2. Key contains modelName (case-insensitive)
+        data.entries.firstOrNull { it.key.contains(modelName, ignoreCase = true) }
+            ?.let { return it.value }
+        // 3. modelName contains the key's model part
+        data.entries.firstOrNull {
+            val modelPart = it.key.substringAfter("/")
+            modelPart.isNotEmpty() && modelName.contains(modelPart, ignoreCase = true)
+        }?.let { return it.value }
         return null
     }
 

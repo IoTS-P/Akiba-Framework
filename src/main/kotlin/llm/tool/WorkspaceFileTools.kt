@@ -230,12 +230,22 @@ private fun ReadWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
         appendLine("approves or denies the access (or a 5-minute timeout expires).")
         appendLine()
         appendLine("Parameters:")
-        appendLine("  - path:     Relative path within the workspace, or an absolute path outside it")
-        appendLine("  - maxChars: Maximum characters to read (default 200000). Content beyond this is truncated.")
+        appendLine("  - path:       Relative path within the workspace, or an absolute path outside it")
+        appendLine("  - maxChars:   Maximum characters to read (default 200000). Content beyond this is truncated.")
+        appendLine("  - startLine:  1-based line number to start reading from (inclusive). If omitted, start from line 1.")
+        appendLine("  - endLine:    1-based line number to stop reading at (inclusive). If omitted, read to end of file.")
+        appendLine("                Use startLine/endLine to read a slice of a large file without loading it entirely.")
+        appendLine("                NOTE: This tool ONLY accepts the parameters listed above. Do NOT pass 'offset',")
+        appendLine("                'limit', 'line', 'lines', 'from', 'to', or any other parameter name — they will be")
+        appendLine("                ignored and the full file will be returned with a warning.")
         appendLine()
         appendLine("Security: Relative paths resolve within the workspace. Absolute paths are allowed")
         appendLine("but require user confirmation before access. NUL bytes and symlinks pointing to")
         appendLine("indeterminate locations are rejected.")
+        appendLine()
+        appendLine("Truncation: If the 'truncated' field is true, the content was cut off. A prominent")
+        appendLine("'⚠️ TRUNCATED' marker is also injected at the top of the result by the framework's")
+        appendLine("unified truncation handling. Never assume truncated content is the complete file.")
     },
     parameters = listOf(
         ToolParameter(
@@ -247,6 +257,17 @@ private fun ReadWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
             "maxChars", "integer",
             "Maximum characters to read. Default 200000. If the file is larger, content is truncated.",
             required = false
+        ),
+        ToolParameter(
+            "startLine", "integer",
+            "1-based line number to start reading from (inclusive). If omitted, start from line 1. " +
+                "Use with endLine to read a slice of a large file.",
+            required = false
+        ),
+        ToolParameter(
+            "endLine", "integer",
+            "1-based line number to stop reading at (inclusive). If omitted, read to end of file.",
+            required = false
         )
     ),
     dedupStrategy = ToolDedupStrategy.RESULT_HASH,
@@ -255,6 +276,34 @@ private fun ReadWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
         ?: return@Tool "Error: 'path' parameter is required"
 
     val maxChars = (args["maxChars"] as? Number)?.toInt()?.coerceIn(1, MAX_READ_CHARS) ?: MAX_READ_CHARS
+    val startLine = (args["startLine"] as? Number)?.toInt()?.coerceAtLeast(1)
+    val endLine = (args["endLine"] as? Number)?.toInt()?.coerceAtLeast(1)
+    val useLineRange = startLine != null || endLine != null
+    val start = startLine ?: 1
+    val end = endLine ?: Int.MAX_VALUE
+
+    // ── Detect unrecognized parameters ────────────────────────────────
+    // The LLM may pass parameters like "offset", "limit", "line", "lines",
+    // "from", "to", etc. instead of the correct "startLine" / "endLine".
+    // These are silently ignored, causing the tool to return the full file
+    // — which is wasteful and misleading. We detect this and emit a warning.
+    val validReadParams = setOf("path", "maxChars", "startLine", "endLine")
+    val extraParams = args.keys - validReadParams
+    val paramWarning = if (extraParams.isNotEmpty()) {
+        "WARNING: Unrecognized parameters ${extraParams.joinToString { "'$it'" }}. " +
+            "This tool only accepts 'path', 'maxChars', 'startLine', and 'endLine'. " +
+            "To read a slice of a large file, use startLine and endLine (1-based, inclusive), " +
+            "NOT offset/limit/line/from/to. " +
+            "Since no valid startLine/endLine was provided, the FULL file content is returned below."
+    } else null
+
+    if (useLineRange && start > end) {
+        return@Tool wsMapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "startLine ($start) must be <= endLine ($end).",
+            "path" to pathStr
+        ))
+    }
 
     val resolved = resolvePathWithBoundary(parent, pathStr)
         ?: return@Tool wsMapper.writeValueAsString(mapOf(
@@ -295,18 +344,75 @@ private fun ReadWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
     }
 
     try {
-        val content = Files.readString(resolvedPath)
-        val truncated = content.length > maxChars
-        val resultContent = if (truncated) content.substring(0, maxChars) else content
+        val fullContent = Files.readString(resolvedPath)
+        val totalLines = fullContent.lineSequence().count()
 
-        wsMapper.writeValueAsString(mapOf(
-            "success" to true,
-            "path" to pathStr,
-            "absolutePath" to resolvedPath.toString(),
-            "size" to content.length,
-            "truncated" to truncated,
-            "content" to resultContent
-        ))
+        if (useLineRange) {
+            // Line-range mode: extract lines [start, end] (1-based, inclusive)
+            val lines = fullContent.lineSequence().toList()
+            val actualStart = start.coerceAtMost(lines.size + 1)
+            val actualEnd = end.coerceAtMost(lines.size)
+            if (actualStart > lines.size) {
+                return@Tool wsMapper.writeValueAsString(mapOf(
+                    "success" to true,
+                    "path" to pathStr,
+                    "absolutePath" to resolvedPath.toString(),
+                    "totalLines" to totalLines,
+                    "startLine" to start,
+                    "endLine" to end,
+                    "linesReturned" to 0,
+                    "content" to "",
+                    "truncated" to false,
+                    "message" to "startLine ($start) exceeds total lines ($totalLines). No content returned."
+                ))
+            }
+            val slice = lines.subList(actualStart - 1, actualEnd).joinToString("\n")
+            val truncated = slice.length > maxChars
+            val resultContent = if (truncated) slice.substring(0, maxChars) else slice
+
+            // NOTE: The prominent ⚠️ TRUNCATED warning is injected uniformly
+            // by ToolResultContext.formatCurrentResult for ALL tool outputs,
+            // so we only set the boolean metadata here.  The LLM still gets
+            // the structured `truncated` field for programmatic checks.
+            val result = mutableMapOf<String, Any?>(
+                "success" to true,
+                "path" to pathStr,
+                "absolutePath" to resolvedPath.toString(),
+                "totalLines" to totalLines,
+                "startLine" to actualStart,
+                "endLine" to actualEnd,
+                "linesReturned" to (actualEnd - actualStart + 1),
+                "truncated" to truncated,
+                "content" to resultContent
+            )
+
+            wsMapper.writeValueAsString(result)
+        } else {
+            // Full read mode (original behavior)
+            val truncated = fullContent.length > maxChars
+            val resultContent = if (truncated) fullContent.substring(0, maxChars) else fullContent
+
+            // NOTE: The prominent ⚠️ TRUNCATED warning is injected uniformly
+            // by ToolResultContext.formatCurrentResult for ALL tool outputs.
+            // We only set the boolean metadata + an advisory `warning` here.
+            val result = mutableMapOf<String, Any?>(
+                "success" to true,
+                "path" to pathStr,
+                "absolutePath" to resolvedPath.toString(),
+                "size" to fullContent.length,
+                "totalLines" to totalLines,
+                "truncated" to truncated,
+                "content" to resultContent
+            )
+            if (paramWarning != null) {
+                result["warning"] = paramWarning
+            } else if (!truncated && totalLines > 500) {
+                result["warning"] = "This file has $totalLines lines. To read a specific section, " +
+                    "use startLine and endLine parameters (1-based, inclusive) to avoid loading the entire file."
+            }
+
+            wsMapper.writeValueAsString(result)
+        }
     } catch (e: Exception) {
         wsMapper.writeValueAsString(mapOf(
             "success" to false,
@@ -940,9 +1046,10 @@ private fun GrepWorkspaceTool(parent: AkibaModule): Tool = Tool(
     description = buildString {
         appendLine("Search for a regex pattern across files in the agent's workspace directory.")
         appendLine()
-        appendLine("Searches file contents line-by-line (like `grep -rn`). Only text files are")
-        appendLine("searched; binary files and files larger than 2 MB are skipped. Results include")
-        appendLine("the relative file path, line number, and the matching line content.")
+        appendLine("Searches file contents line-by-line (like `grep -rn`). If `path` is a single file,")
+        appendLine("that file is searched directly; if it is a directory, all text files under it are")
+        appendLine("searched recursively. Binary files and files larger than 2 MB are skipped. Results")
+        appendLine("include the relative file path, line number, and the matching line content.")
         appendLine()
         appendLine("Paths **outside** the workspace are also accepted, but searching them requires")
         appendLine("explicit user confirmation via the frontend. The tool will block until the user")
@@ -1030,14 +1137,6 @@ private fun GrepWorkspaceTool(parent: AkibaModule): Tool = Tool(
         ))
     }
 
-    if (!Files.isDirectory(resolvedPath)) {
-        return@Tool wsMapper.writeValueAsString(mapOf(
-            "success" to false,
-            "error" to "Path is not a directory: $pathStr. Use a directory path for grep.",
-            "path" to pathStr
-        ))
-    }
-
     val workspaceRoot = parent.workspaceDir.normalize()
     val matches = mutableListOf<Map<String, Any?>>()
     var filesSearched = 0
@@ -1045,56 +1144,69 @@ private fun GrepWorkspaceTool(parent: AkibaModule): Tool = Tool(
     var truncated = false
     var outputChars = 0
 
-    try {
-        Files.walkFileTree(resolvedPath, object : SimpleFileVisitor<Path>() {
-            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
-                // Skip files larger than the size limit
-                if (attrs.size() > MAX_GREP_FILE_SIZE) {
-                    filesSkipped++
-                    return FileVisitResult.CONTINUE
-                }
+    /**
+     * Grep a single file: apply binary/size checks, read lines, collect matches.
+     */
+    fun grepFile(file: Path) {
+        // Skip files larger than the size limit
+        val size = try { Files.size(file) } catch (_: Exception) { -1L }
+        if (size < 0 || size > MAX_GREP_FILE_SIZE) {
+            filesSkipped++
+            return
+        }
 
-                // Skip binary files by detecting NUL bytes in the first 8 KB
-                try {
-                    val probe = Files.newInputStream(file).use { it.readNBytes(8192) }
-                    if (probe.any { it == 0.toByte() }) {
-                        filesSkipped++
-                        return FileVisitResult.CONTINUE
-                    }
-                } catch (_: Exception) {
-                    filesSkipped++
-                    return FileVisitResult.CONTINUE
-                }
-
-                filesSearched++
-
-                try {
-                    val content = Files.readString(file, Charset.defaultCharset())
-                    val relPath = workspaceRoot.relativize(file.normalize()).pathString
-
-                    content.lineSequence().forEachIndexed { idx, line ->
-                        if (truncated) return@forEachIndexed
-                        if (regex.containsMatchIn(line)) {
-                            val matchEntry = mapOf<String, Any?>(
-                                "file" to relPath,
-                                "line" to (idx + 1),
-                                "content" to line.take(500)
-                            )
-                            outputChars += matchEntry.toString().length
-                            matches.add(matchEntry)
-                            if (matches.size >= MAX_GREP_MATCHES || outputChars >= MAX_GREP_OUTPUT_CHARS) {
-                                truncated = true
-                            }
-                        }
-                    }
-                } catch (_: Exception) {
-                    // File could not be read as text — skip
-                    filesSkipped++
-                }
-
-                return if (truncated) FileVisitResult.TERMINATE else FileVisitResult.CONTINUE
+        // Skip binary files by detecting NUL bytes in the first 8 KB
+        try {
+            val probe = Files.newInputStream(file).use { it.readNBytes(8192) }
+            if (probe.any { it == 0.toByte() }) {
+                filesSkipped++
+                return
             }
-        })
+        } catch (_: Exception) {
+            filesSkipped++
+            return
+        }
+
+        filesSearched++
+
+        try {
+            val content = Files.readString(file, Charset.defaultCharset())
+            val relPath = workspaceRoot.relativize(file.normalize()).pathString
+
+            content.lineSequence().forEachIndexed { idx, line ->
+                if (truncated) return@forEachIndexed
+                if (regex.containsMatchIn(line)) {
+                    val matchEntry = mapOf<String, Any?>(
+                        "file" to relPath,
+                        "line" to (idx + 1),
+                        "content" to line.take(500)
+                    )
+                    outputChars += matchEntry.toString().length
+                    matches.add(matchEntry)
+                    if (matches.size >= MAX_GREP_MATCHES || outputChars >= MAX_GREP_OUTPUT_CHARS) {
+                        truncated = true
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // File could not be read as text — skip
+            filesSkipped++
+        }
+    }
+
+    try {
+        if (Files.isRegularFile(resolvedPath)) {
+            // Single-file mode: grep the file directly
+            grepFile(resolvedPath)
+        } else {
+            // Directory mode: walk recursively
+            Files.walkFileTree(resolvedPath, object : SimpleFileVisitor<Path>() {
+                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    grepFile(file)
+                    return if (truncated) FileVisitResult.TERMINATE else FileVisitResult.CONTINUE
+                }
+            })
+        }
     } catch (e: Exception) {
         return@Tool wsMapper.writeValueAsString(mapOf(
             "success" to false,

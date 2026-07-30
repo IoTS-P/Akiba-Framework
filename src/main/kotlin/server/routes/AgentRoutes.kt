@@ -14,6 +14,7 @@ import org.iotsplab.akiba.data.database.AgentDatabaseClient.SessionInfo
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.llm.agent.AgentMailboxService
 import org.iotsplab.akiba.llm.tool.ConfirmationManager
+import org.iotsplab.akiba.llm.tool.UserChoiceManager
 import org.iotsplab.akiba.llm.agent.AgentPrompts
 import org.iotsplab.akiba.llm.agent.ModelContextLengthService
 import org.iotsplab.akiba.llm.agent.akibaAgent
@@ -23,6 +24,8 @@ import org.iotsplab.akiba.llm.config.LLMKeyFileStore
 import org.iotsplab.akiba.llm.memory.persistentChatMemory
 import org.iotsplab.akiba.llm.agent.AgentModule
 import org.iotsplab.akiba.llm.agent.SYSTEM_SESSION_UUID
+import org.iotsplab.akiba.llm.agent.LLM_RETRY_STATUS_PREFIX
+import org.iotsplab.akiba.llm.agent.LLM_PROGRESS_PREFIX
 import org.iotsplab.akiba.llm.tool.BuiltInTools
 import org.iotsplab.akiba.llm.tool.ListModulesTool
 import org.iotsplab.akiba.llm.tool.QueryGhidraAPITool
@@ -106,6 +109,11 @@ data class AgentSessionResponse(
      * shows a confirmation modal. `null` when no confirmation is pending.
      */
     val pendingConfirmation: PendingConfirmationDto? = null,
+    /**
+     * Pending user-choice request for this session, if any (populated
+     * from [UserChoiceManager] when `ask_user_choice` is blocked).
+     */
+    val pendingUserChoice: PendingUserChoiceDto? = null,
 )
 
 /** Wire DTO for a pending confirmation request (see [ConfirmationManager]). */
@@ -118,6 +126,26 @@ data class PendingConfirmationDto(
     val action: String = "shell_command",
     val targetPath: String? = null,
     val createdAt: Long
+)
+
+/** Wire DTO for a pending user-choice request (see [UserChoiceManager]). */
+data class PendingUserChoiceDto(
+    val requestId: String,
+    val question: String,
+    val options: List<String>,
+    val allowCustomInput: Boolean,
+    val createdAt: Long,
+    /** Follow-up (BTW) Q&A pairs already answered by the side assistant. */
+    val btwHistory: List<BtwQADto> = emptyList(),
+    /** Last user-activity timestamp; the frontend renders the inactivity countdown from it. */
+    val lastActivityAt: Long = createdAt
+)
+
+/** One follow-up (BTW) question/answer pair. */
+data class BtwQADto(
+    val question: String,
+    val answer: String,
+    val answeredAt: Long
 )
 
 /** Request body for `POST /agent/sessions/{id}/confirmation/respond`. */
@@ -137,6 +165,43 @@ data class InternalConfirmationRequest(
     val action: String = "shell_command",
     /** Target path for file_access actions. Null for shell_command. */
     val targetPath: String? = null
+)
+
+/** Request body for `POST /agent/internal/user-choice/request` (worker → server). */
+data class InternalUserChoiceRequest(
+    val sessionId: String,
+    val question: String,
+    val options: List<String>,
+    val allowCustomInput: Boolean = true,
+    /** Set (with [btwAnswer]) when the worker re-enters the long-poll after answering a BTW question. */
+    val btwId: String? = null,
+    /** The worker's locally-generated answer to the BTW question. */
+    val btwAnswer: String? = null
+)
+
+/** Request body for `POST /agent/sessions/{id}/user-choice/respond`. */
+data class UserChoiceRespondRequest(
+    /** The selected option text or the user's custom free-form answer. */
+    val choice: String? = null,
+    /** When true, the user dismissed the question without answering. */
+    val cancelled: Boolean = false
+)
+
+/** Request body for `POST /agent/sessions/{id}/user-choice/btw`. */
+data class UserChoiceBtwRequest(
+    /** The follow-up question the user wants answered before deciding. */
+    val question: String
+)
+
+/** Map a manager snapshot to its wire DTO. */
+private fun org.iotsplab.akiba.llm.tool.PendingChoiceSnapshot.toDto() = PendingUserChoiceDto(
+    requestId = choice.requestId,
+    question = choice.question,
+    options = choice.options,
+    allowCustomInput = choice.allowCustomInput,
+    createdAt = choice.createdAt,
+    btwHistory = btwHistory.map { BtwQADto(it.question, it.answer, it.answeredAt) },
+    lastActivityAt = lastActivityAt
 )
 
 data class AgentMessageResponse(
@@ -185,6 +250,21 @@ data class ManualAgentStartResponse(
     val systemPrompt: String,
     val username: String,
     val programName: String? = null
+)
+
+/**
+ * Payload sent by a worker (or the in-process runtime) to
+ * `POST /agent/internal/stream-chunk` for every live LLM streaming
+ * chunk.  The server fans it out to every SSE subscriber via
+ * [org.iotsplab.akiba.llm.agent.StreamChunkBus].
+ */
+data class StreamChunkRequest(
+    val sessionId: String,
+    val delta: String,
+    val chunkCount: Int,
+    val byteCount: Int,
+    val done: Boolean = false,
+    val error: String? = null,
 )
 
 private data class ManualAgentTurnJob(
@@ -335,6 +415,157 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         ))
     }
 
+    // ------ Internal: force-close all live LLM clients -----------------------
+    //
+    // Motivation: each AkibaAgent holds an LLM client wrapping a JDK
+    // `java.net.http.HttpClient` whose connection pool keep-alive defaults
+    // to **1200 seconds**.  When many sessions accumulate, the per-IP
+    // connection budget at the LLM provider is exhausted, and the provider
+    // starts deliberately slowing responses — which looks like a 20-30
+    // minute "hang" on the frontend.
+    //
+    // The JVM shutdown hook in `LLMClientFactory` already calls
+    // `closeAllLiveClients("JVM shutdown hook")`, but that only fires on
+    // graceful shutdown.  This endpoint lets an operator / orchestrator
+    // force-close every live LLM connection **before** a rolling restart,
+    // releasing the provider's connection slots immediately.
+    //
+    // Security: this is an *internal* endpoint (under `/agent/internal/`),
+    // but it's still bound to the public HTTP listener.  We therefore
+    // require the same instance header as every other agent route to
+    // prevent unauthenticated internet-facing invocation.
+    post("/agent/internal/llm/close-all") {
+        val instance = call.requireInstanceHeader() ?: return@post
+        if (instance.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance header"))
+            return@post
+        }
+        val liveBefore = org.iotsplab.akiba.llm.client.LLMClientFactory.liveClientCount()
+        val closed = org.iotsplab.akiba.llm.client.LLMClientFactory.closeAllLiveClients(
+            reason = "manual close-all via /agent/internal/llm/close-all (instance=$instance)"
+        )
+        call.respond(mapOf(
+            "status" to "ok",
+            "liveClientsBefore" to liveBefore,
+            "closed" to closed,
+        ))
+    }
+
+    // ------ Internal: receive a live LLM streaming chunk from a worker ----
+    //
+    // Called by manual-agent worker JVMs (and the in-process runtime)
+    // on every streaming chunk from the LLM.  The server records the
+    // chunk in [StreamChunkBus]'s per-session history, which the
+    // frontend drains via `GET /agent/sessions/{id}/stream-chunks`,
+    // giving the user a true per-token live view of the response
+    // being generated.  No DB write — the worker writes the final
+    // assistant message itself once the stream completes.
+    //
+    // Security: this endpoint is exposed on the public listener, but
+    // requires the same instance header as every other agent route.
+    // The payload is bounded (a few hundred bytes per chunk) so a
+    // malicious caller can't easily DoS the bus.
+    post("/agent/internal/stream-chunk") {
+        val instance = call.requireInstanceHeader() ?: return@post
+        if (instance.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance header"))
+            return@post
+        }
+        val req = try {
+            call.receive<StreamChunkRequest>()
+        } catch (e: Exception) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid chunk payload: ${e.message}"))
+            return@post
+        }
+        if (req.sessionId.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "sessionId is required"))
+            return@post
+        }
+        org.iotsplab.akiba.llm.agent.StreamChunkBus.publish(
+            org.iotsplab.akiba.llm.agent.StreamChunkBus.Chunk(
+                sessionId = req.sessionId,
+                delta = req.delta,
+                chunkCount = req.chunkCount,
+                byteCount = req.byteCount,
+                done = req.done,
+                error = req.error,
+            )
+        )
+        call.respond(mapOf("status" to "ok"))
+    }
+
+    // ------ Incremental poll: live LLM streaming chunks for a session ------
+    //
+    // The frontend polls this endpoint (~1 s cadence) while a session
+    // is selected and renders the returned deltas with a typewriter
+    // animation, giving true per-token "natural growth" over a plain
+    // JSON GET — a transport that survives every proxy (an earlier
+    // SSE transport died at the outer reverse proxy, which kills
+    // `text/event-stream` connections after the first flush).
+    //
+    // Request:  GET /agent/sessions/{id}/stream-chunks?since=N
+    // Response: { active, generation, latestCount, done, error,
+    //             chunks: [{ delta, chunkCount, byteCount, done, error }] }
+    //
+    // `since` is the highest chunkCount the client has consumed; only
+    // newer chunks are returned.  `generation` bumps whenever a new
+    // LLM generation starts — the client must discard accumulated
+    // text and re-pull from zero when it changes.
+    get("/agent/sessions/{id}/stream-chunks") {
+        val instance = call.request.header("X-Akiba-Instance")
+            ?.takeIf { it.isNotBlank() }
+            ?: call.request.queryParameters["instance"]?.takeIf { it.isNotBlank() }
+        if (instance == null) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance"))
+            return@get
+        }
+        val sessionId = call.parameters["id"].orEmpty()
+        if (sessionId.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@get
+        }
+        val since = call.request.queryParameters["since"]?.toIntOrNull()?.coerceAtLeast(0) ?: 0
+        val snap = org.iotsplab.akiba.llm.agent.StreamChunkBus.historySince(sessionId, since)
+        if (snap == null) {
+            call.respond(mapOf(
+                "active" to false,
+                "generation" to 0,
+                "latestCount" to 0,
+                "done" to false,
+                "chunks" to emptyList<Any>(),
+            ))
+            return@get
+        }
+        call.respond(mapOf(
+            "active" to true,
+            "generation" to snap.generation,
+            "latestCount" to snap.latestCount,
+            "done" to snap.done,
+            "error" to snap.error,
+            "chunks" to snap.chunks.map { c ->
+                mapOf(
+                    "delta" to c.delta,
+                    "chunkCount" to c.chunkCount,
+                    "byteCount" to c.byteCount,
+                    "done" to c.done,
+                    "error" to c.error,
+                )
+            },
+        ))
+    }
+
+    // ------ Internal: report how many LLM clients are currently open -------
+    get("/agent/internal/llm/live-count") {
+        val instance = call.requireInstanceHeader() ?: return@get
+        if (instance.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance header"))
+            return@get
+        }
+        call.respond(mapOf(
+            "liveClients" to org.iotsplab.akiba.llm.client.LLMClientFactory.liveClientCount()
+        ))
+    }
+
     // ------ Internal: tool confirmation request (cross-process long-poll) ---
     //
     // Called by worker processes when a tool (e.g. run_shell) requires
@@ -356,6 +587,46 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             targetPath = req.targetPath
         )
         call.respond(mapOf("approved" to approved))
+    }
+
+    // ------ Internal: user-choice request (cross-process long-poll) ---------
+    //
+    // Called by worker processes when `ask_user_choice` needs the user to
+    // pick an option. Same long-poll pattern as the confirmation endpoint:
+    // the worker blocks on the HTTP response until the user answers, the
+    // inactivity timeout expires, or a BTW question arrives.
+    post("/agent/internal/user-choice/request") {
+        val req = call.receive<InternalUserChoiceRequest>()
+        val entry = UserChoiceManager.register(
+            sessionId = req.sessionId,
+            question = req.question,
+            options = req.options,
+            allowCustomInput = req.allowCustomInput
+        )
+        if (entry == null) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@post
+        }
+        // Worker re-entering the long-poll after answering a BTW question
+        // locally — deliver that answer first, then keep waiting.
+        if (req.btwId != null && req.btwAnswer != null) {
+            UserChoiceManager.completeBtw(req.sessionId, req.btwId, req.btwAnswer)
+        }
+        when (val ev = UserChoiceManager.awaitEvent(entry)) {
+            is org.iotsplab.akiba.llm.tool.UserChoiceEvent.Resolved ->
+                call.respond(mapOf(
+                    "status" to if (ev.answer != null) "answered" else "cancelled",
+                    "choice" to ev.answer
+                ))
+            org.iotsplab.akiba.llm.tool.UserChoiceEvent.TimedOut ->
+                call.respond(mapOf("status" to "timeout", "choice" to null))
+            is org.iotsplab.akiba.llm.tool.UserChoiceEvent.Btw ->
+                call.respond(mapOf(
+                    "status" to "btw",
+                    "btwId" to ev.exchange.btwId,
+                    "btwQuestion" to ev.exchange.question
+                ))
+        }
     }
 
     // ------ List sessions -----------------------------------------------------
@@ -447,7 +718,8 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     createdAt = pc.createdAt
                 )
             }
-            call.respond(info.toResponse(pendingConf))
+            val pendingChoice = UserChoiceManager.getPending(id)?.toDto()
+            call.respond(info.toResponse(pendingConf, pendingChoice))
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             // 404 from the daemon (session not found) — surface as 404
             if (e.statusCode == HttpStatusCode.NotFound) {
@@ -460,6 +732,65 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             val (status, body) = errorPayload(e)
             call.respond(status, body)
         }
+    }
+
+    // ------ List ALL pending confirmations (cross-session) -------------------
+    //
+    // The per-session `GET /agent/sessions/{id}` poll only surfaces
+    // confirmations for the session the user is currently viewing.
+    // That breaks down when a sub-agent (spawned via
+    // `spawn_sub_agent` / `RunFreeAnalyzersTool`) is the one blocked
+    // on a `read_workspace_file` confirmation: the pending entry
+    // lives under the sub-agent's sessionId, but the user is
+    // looking at the root session's tree and never sees the modal.
+    // From the user's point of view, the request is "redirected to
+    // stdio" (the worker process's stdout, which the framework
+    // captures into a per-worker log file) and after 5 minutes the
+    // server times out and the request is auto-denied.
+    //
+    // This endpoint returns every pending confirmation across every
+    // session in the JVM, keyed by sessionId, so the frontend can
+    // surface a single global modal regardless of which session the
+    // user is currently viewing.
+    get("/agent/pending-confirmations") {
+        val instance = call.requireInstanceHeader() ?: return@get
+        if (instance.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance header"))
+            return@get
+        }
+        val all = ConfirmationManager.getAllPending()
+        call.respond(mapOf(
+            "pending" to all.mapValues { (_, pc) ->
+                PendingConfirmationDto(
+                    requestId = pc.requestId,
+                    toolName = pc.toolName,
+                    command = pc.command,
+                    workingDirectory = pc.workingDirectory,
+                    timeout = pc.timeout,
+                    action = pc.action,
+                    targetPath = pc.targetPath,
+                    createdAt = pc.createdAt
+                )
+            }
+        ))
+    }
+
+    // ------ List ALL pending user choices (cross-session) -------------------
+    //
+    // Same rationale as `/agent/pending-confirmations`: a sub-agent may be
+    // the one blocked on `ask_user_choice` while the user is viewing the
+    // root session — surface every pending choice JVM-wide so the frontend
+    // can show the modal regardless of the currently open session.
+    get("/agent/pending-user-choices") {
+        val instance = call.requireInstanceHeader() ?: return@get
+        if (instance.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance header"))
+            return@get
+        }
+        val all = UserChoiceManager.getAllPending()
+        call.respond(mapOf(
+            "pending" to all.mapValues { (_, snap) -> snap.toDto() }
+        ))
     }
 
     // ------ Create session ----------------------------------------------------
@@ -560,32 +891,43 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 }
                 info to messages
             }
-            val filtered = msgs.filter { it.role != "system" }
-            // Compute cumulative token usage from all messages in the session.
-            // Do not serialize this polling request behind long-running chat turns.
-            val allMsgs = withDaemonSession(
-                daemonHost, daemonPort, instance, serialize = false
-            ) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-                fetchAllAgentMessages(agentDbClient, id)
+            // Filter out system messages (compaction summaries etc.)
+            // BUT keep LLM retry-status notices so the frontend can show
+            // "LLM timed out, retry #N in X minutes" during outages,
+            // AND keep LLM in-flight progress heartbeats so the frontend
+            // can render "agent still working on LLM (Ns elapsed)" during
+            // long-form generations.
+            val filtered = msgs.filter { m ->
+                if (m.role != "system") return@filter true
+                val c = m.content ?: ""
+                c.startsWith(LLM_RETRY_STATUS_PREFIX) || c.startsWith(LLM_PROGRESS_PREFIX)
             }
+            // Compute cumulative token usage from the messages we already
+            // fetched (avoid a second round-trip to the daemon).
             var totalInput = 0L
             var totalOutput = 0L
-            // inputTokenCount is set on assistant messages from LLM tokenUsage
-            // tokenCount holds the output token count for assistant messages
-            for (m in allMsgs) {
+            for (m in filtered) {
                 totalInput += m.inputTokenCount ?: 0
                 totalOutput += m.tokenCount ?: 0
             }
             // Find the last input token count (from the most recent LLM call)
-            val lastInputTokens = allMsgs.lastOrNull { it.role == "assistant" }?.inputTokenCount
-            // Resolve context length for this session's model
+            val lastInputTokens = filtered.lastOrNull { it.role == "assistant" }?.inputTokenCount
+            // Resolve context length for this session's model. Registry
+            // lookup first; for unknown models fall back to the observed
+            // lower bound (ContextLengthObserver) — flagged so the
+            // frontend can render it as an estimate.
+            var contextLengthObserved = false
             val contextLength = sessionInfo.modelName?.let { modelName ->
                 LLMKeyFileStore.load().firstOrNull { entry ->
                     entry.modelNames.any { it.equals(modelName, ignoreCase = true) }
                 }?.let { entry ->
                     val provider = LLMProvider.fromString(entry.provider)
-                    if (provider != null) ModelContextLengthService.getContextLength(provider, modelName) else null
+                    if (provider != null) {
+                        ModelContextLengthService.getContextLength(provider, modelName)
+                            ?: org.iotsplab.akiba.llm.agent.ContextLengthObserver
+                                .bound(provider, modelName)
+                                ?.also { contextLengthObserved = true }
+                    } else null
                 }
             }
             call.respond(mapOf(
@@ -593,7 +935,8 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 "totalInputTokens" to totalInput,
                 "totalOutputTokens" to totalOutput,
                 "lastInputTokens" to lastInputTokens,
-                "contextLength" to contextLength
+                "contextLength" to contextLength,
+                "contextLengthObserved" to contextLengthObserved
             ))
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             if (e.statusCode == HttpStatusCode.NotFound) {
@@ -759,15 +1102,27 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             }
 
             val token = UUID.randomUUID().toString()
-            // For project-based sessions (no binaryId), try to find the
-            // program name in the project so the manual agent worker
-            // can open it.  This is a best-effort lookup — if it fails,
-            // the worker will try to auto-open the first program.
+            // For project-based sessions (no binaryId), locate the
+            // program in the project so the manual agent worker can
+            // open it.  FAIL FAST when the project has no program at
+            // all: the worker cannot run any analysis tool without one,
+            // and previously it died on the worker side with the real
+            // reason ("no Ghidra Program is loaded") swallowed, so the
+            // user only saw the cryptic "User message was not
+            // persisted".
             var programName: String? = null
             if (sessionInfo.binaryId == null && sessionInfo.projectName != null) {
-                programName = try {
-                    findFirstProgramName(sessionInfo.projectName, call.currentUserGhidraProjectsRoot())
-                } catch (_: Exception) { null }
+                programName = findFirstProgramName(sessionInfo.projectName, call.currentUserGhidraProjectsRoot())
+                if (programName == null) {
+                    markManualChatFailed(daemonHost, daemonPort, instance, id,
+                        "project has no program")
+                    call.respond(HttpStatusCode.BadRequest, mapOf(
+                        "error" to "Project '${sessionInfo.projectName}' contains no analyzable binary " +
+                            "(Ghidra program). Import a binary into the project first (e.g. via the " +
+                            "Files/Projects page), then chat again."
+                    ))
+                    return@post
+                }
             }
             ManualAgentTurnRegistry.put(token, ManualAgentTurnJob(
                 id, req.content, systemPrompt, call.currentUsernameOrDefault(),
@@ -1075,6 +1430,10 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             return@post
         }
         val cancelled = ManualAgentProcessRegistry.cancel(id)
+        // Release any tool threads blocked on human-in-the-loop prompts
+        // (confirmation / user choice) for this session.
+        ConfirmationManager.clear(id)
+        UserChoiceManager.clear(id)
         if (cancelled) {
             // Mark the session as closed so the frontend can recover.
             val instance = call.instanceHeader()
@@ -1129,6 +1488,71 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         ))
     }
 
+    // ------ User choice response (human-in-the-loop) ------------------------
+    //
+    // The frontend discovers a pending `ask_user_choice` request via
+    // `pendingUserChoice` on `GET /agent/sessions/{id}` (or the global
+    // `/agent/pending-user-choices` poll) and delivers the answer here.
+    post("/agent/sessions/{id}/user-choice/respond") {
+        val id = call.parameters["id"].orEmpty()
+        if (id.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@post
+        }
+        val req = runCatching { call.receive<UserChoiceRespondRequest>() }
+            .getOrNull()
+        val answer: String? = when {
+            req == null || req.cancelled -> null
+            else -> req.choice?.trim()?.takeIf { it.isNotEmpty() }
+        }
+
+        val delivered = UserChoiceManager.respond(id, answer)
+        call.respond(mapOf(
+            "status" to if (delivered) "delivered" else "no_pending",
+            "sessionId" to id,
+            "answered" to (answer != null),
+            "message" to if (delivered) {
+                if (answer != null) "Answer delivered to the agent."
+                else "Cancellation delivered to the agent."
+            } else "No pending user-choice request for this session."
+        ))
+    }
+
+    // ------ User choice follow-up ("BTW") question ---------------------------
+    //
+    // While an `ask_user_choice` request is pending, the user may ask
+    // follow-up questions inside the choice modal. The question is handed
+    // to the blocked consumer (in-process tool thread, or worker via the
+    // long-poll), which answers it via BtwAssistant (read-only). Suspends
+    // until the answer is ready (up to BTW_AWAIT_TIMEOUT_MS); submitting
+    // refreshes the choice request's inactivity timeout.
+    post("/agent/sessions/{id}/user-choice/btw") {
+        val id = call.parameters["id"].orEmpty()
+        if (id.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+            return@post
+        }
+        val req = runCatching { call.receive<UserChoiceBtwRequest>() }.getOrNull()
+        val question = req?.question?.trim()
+        if (question.isNullOrEmpty()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing question"))
+            return@post
+        }
+        if (question.length > 4000) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Question too long (max 4000 chars)"))
+            return@post
+        }
+        val answer = UserChoiceManager.submitBtw(id, question)
+        if (answer == null) {
+            call.respond(HttpStatusCode.Conflict, mapOf(
+                "answered" to false,
+                "error" to "No pending user-choice request for this session."
+            ))
+        } else {
+            call.respond(mapOf("answered" to true, "answer" to answer))
+        }
+    }
+
     // ------ Delete session ----------------------------------------------------
     delete("/agent/sessions/{id}") {
         val instance = call.requireInstanceHeader() ?: return@delete
@@ -1166,6 +1590,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             // already be terminal, but just in case).
             ManualAgentProcessRegistry.cancel(id)
             ConfirmationManager.clear(id)
+            UserChoiceManager.clear(id)
 
             call.respond(mapOf("message" to "Session deleted"))
         } catch (e: IllegalArgumentException) {
@@ -1697,9 +2122,12 @@ private fun runManualAgentWorker(
     }
 }
 
-/** Best-effort lookup of the first program name in a Ghidra project.
- *  Used by the manual-agent chat endpoint to pass the program name
- *  to the worker so it can open it for tool access. */
+/** Best-effort lookup of the first program in a Ghidra project,
+ *  searched RECURSIVELY through all folders (Ghidra projects can
+ *  organise programs into subfolders; a root-only scan misses
+ *  those).  Returns the full project pathname ("/dir/prog" — "/prog"
+ *  for root-level files) so the worker can open it directly.
+ *  Used by the manual-agent chat endpoint. */
 private fun findFirstProgramName(projectName: String, projectDir: java.nio.file.Path): String? {
     val grpFile = projectDir.resolve("$projectName.gpr")
     val repFile = projectDir.resolve("$projectName.rep")
@@ -1708,15 +2136,26 @@ private fun findFirstProgramName(projectName: String, projectDir: java.nio.file.
         WorkspaceManager.openOrCreateInteractiveProject(projectName, false, projectDir)
         val project = WorkspaceManager.project
         project.projectData.refresh(true)
-        val first = project.projectData.rootFolder.files.firstOrNull { f ->
-            val doc = f.domainObjectClass
-            doc != null && ghidra.program.model.listing.Program::class.java.isAssignableFrom(doc)
-        }
+        val first = findFirstProgramRecursive(project.projectData.rootFolder)
         WorkspaceManager.releaseActiveProject()
-        first?.name
-    } catch (_: Exception) {
+        first?.pathname
+    } catch (e: Exception) {
+        agentRouteLogger.warn("findFirstProgramName('$projectName') failed to open project: ${e.message}")
         null
     }
+}
+
+private fun findFirstProgramRecursive(
+    folder: ghidra.framework.model.DomainFolder
+): ghidra.framework.model.DomainFile? {
+    folder.files.firstOrNull { f ->
+        val doc = f.domainObjectClass
+        doc != null && ghidra.program.model.listing.Program::class.java.isAssignableFrom(doc)
+    }?.let { return it }
+    for (sub in folder.folders) {
+        findFirstProgramRecursive(sub)?.let { return it }
+    }
+    return null
 }
 
 private fun findAkibaScriptForAgent(): String {
@@ -1743,7 +2182,8 @@ private fun findAkibaScriptForAgent(): String {
 }
 
 private fun SessionInfo.toResponse(
-    pendingConfirmation: PendingConfirmationDto? = null
+    pendingConfirmation: PendingConfirmationDto? = null,
+    pendingUserChoice: PendingUserChoiceDto? = null
 ) = AgentSessionResponse(
     sessionId = sessionId,
     sessionName = sessionName,
@@ -1759,6 +2199,7 @@ private fun SessionInfo.toResponse(
     closingReason = closingReason,
     errorMessage = if (runtimeState == "error" || status == "error") closingReason else null,
     pendingConfirmation = pendingConfirmation,
+    pendingUserChoice = pendingUserChoice,
     // token totals omitted here for performance; use GET /agent/sessions/{id}/messages
 )
 

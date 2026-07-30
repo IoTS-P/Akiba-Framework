@@ -270,6 +270,23 @@ object ConfirmationManager {
         pending[sessionId]?.confirmation
 
     /**
+     * Snapshot of **every** session that currently has a pending
+     * confirmation, keyed by sessionId.
+     *
+     * Used by the global `/agent/pending-confirmations` poll to surface
+     * confirmation requests to the user **even when they are viewing a
+     * different session** — most importantly when a sub-agent
+     * (`spawn_sub_agent` / `RunFreeAnalyzersTool`) is the one blocked
+     * on confirmation.  Without this, the user on the root session
+     * would never see the modal and the request would silently
+     * time out after 5 minutes, with the only visible trace being
+     * the worker's stdout log file (which the user perceives as
+     * "the request was redirected to stdio").
+     */
+    fun getAllPending(): Map<String, PendingConfirmation> =
+        pending.entries.associate { (sid, entry) -> sid to entry.confirmation }
+
+    /**
      * Cancel and clear any pending confirmation for a session.
      *
      * Called when a session is cancelled or deleted to ensure the

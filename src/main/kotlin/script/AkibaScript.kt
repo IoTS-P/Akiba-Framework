@@ -38,8 +38,10 @@ abstract class AkibaScript(
     val saveResult: Boolean = true,
     val maxOutputSizeBytes: Long = 10 * 1024 * 1024,
     val description: String = "",
-    scriptSkipDbWrite: Boolean = true
+    scriptSkipDbWrite: Boolean = true,
+    binaryId: Int = -1
 ) : AkibaModule(
+    id = binaryId,
     skipDbWrite = scriptSkipDbWrite
 ) {
 

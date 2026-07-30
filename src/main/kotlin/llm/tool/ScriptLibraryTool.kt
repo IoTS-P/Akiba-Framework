@@ -437,33 +437,36 @@ private fun runLibraryScript(
         ))
     }
 
-    // Inject parameters as scriptArgs by prepending a property to the source
-    val sourceWithArgs = if (parameters.isNotEmpty()) {
-        // Inject a scriptArgs map accessible within execute()
-        val injection = buildString {
-            val paramsJson = mapper.writeValueAsString(parameters)
-            val paramsB64 = java.util.Base64.getEncoder()
-                .encodeToString(paramsJson.toByteArray(Charsets.UTF_8))
-            appendLine("// Auto-injected scriptArgs")
-            appendLine("private val __akibaScriptArgsJson = String(java.util.Base64.getDecoder().decode(${kotlinLiteral(paramsB64)}), Charsets.UTF_8)")
-            appendLine("val scriptArgs: Map<String, Any?> = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper().readValue(__akibaScriptArgsJson, object : com.fasterxml.jackson.core.type.TypeReference<Map<String, Any?>>() {})")
-        }
-        // Insert the injection after the imports, before the class definition
-        val classIdx = script.source.indexOf("class ${script.className}")
-        if (classIdx >= 0) {
-            script.source.substring(0, classIdx) + injection + "\n" + script.source.substring(classIdx)
-        } else {
-            injection + "\n" + script.source
-        }
+    // Inject parameters as scriptArgs by prepending a property to the source.
+    // Also inject _akiba_workspace_dir so the script can save files to the
+    // caller's workspace (scripts run under a temporary AkibaScript instance
+    // whose own workspaceDir is under id=-1).
+    val augmentedParams = if (parameters.isNotEmpty() || parent.workspaceDir != null) {
+        val mutable = (parameters as? MutableMap<String, Any?>) ?: parameters.toMutableMap()
+        mutable.putIfAbsent("_akiba_workspace_dir", parent.workspaceDir.toString())
+        mutable
     } else {
-        // Provide empty scriptArgs
-        val classIdx = script.source.indexOf("class ${script.className}")
-        val injection = "val scriptArgs: Map<String, Any?> = emptyMap()\n\n"
-        if (classIdx >= 0) {
-            script.source.substring(0, classIdx) + injection + script.source.substring(classIdx)
-        } else {
-            injection + script.source
-        }
+        mapOf("_akiba_workspace_dir" to parent.workspaceDir.toString())
+    }
+    val sourceWithArgs = buildString {
+        val paramsJson = mapper.writeValueAsString(augmentedParams)
+        val paramsB64 = java.util.Base64.getEncoder()
+            .encodeToString(paramsJson.toByteArray(Charsets.UTF_8))
+        appendLine("// Auto-injected scriptArgs")
+        appendLine("private val __akibaScriptArgsJson = String(java.util.Base64.getDecoder().decode(${kotlinLiteral(paramsB64)}), Charsets.UTF_8)")
+        appendLine("val scriptArgs: Map<String, Any?> = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper().readValue(__akibaScriptArgsJson, object : com.fasterxml.jackson.core.type.TypeReference<Map<String, Any?>>() {})")
+    }
+    // Insert the injection after the imports, before the class definition.
+    // Note: `sourceWithArgs` here is the (renamed) result of splicing the
+    // pre-built injection from above into the script's source — NOT a fresh
+    // declaration.  The previous shape of this block shadowed the name with
+    // a second `val sourceWithArgs`, which the Kotlin compiler rejected
+    // with "Conflicting declarations: local val sourceWithArgs: String".
+    val classIdx = script.source.indexOf("class ${script.className}")
+    val finalSource = if (classIdx >= 0) {
+        script.source.substring(0, classIdx) + sourceWithArgs + "\n" + script.source.substring(classIdx)
+    } else {
+        sourceWithArgs + "\n" + script.source
     }
 
     // Record execution in DB (best-effort)
@@ -472,7 +475,7 @@ private fun runLibraryScript(
         // Fallback: if no dbId, look up the script by name from all scripts
         agentDbClient.listScripts(limit = 500).firstOrNull { it.name == script.name }?.id
             ?: agentDbClient.createScript(
-                name = script.name, code = sourceWithArgs, maxOutputSize = 10 * 1024 * 1024
+                name = script.name, code = finalSource, maxOutputSize = 10 * 1024 * 1024
             )
     } catch (_: Exception) { -1 }
     if (scriptDbId >= 0) {
@@ -486,7 +489,7 @@ private fun runLibraryScript(
         var resultJson = ""
         val totalElapsed = measureTimeMillis {
             runBlocking {
-                val instance = ScriptInstance.compile(sourceWithArgs, script.className)
+                val instance = ScriptInstance.compile(finalSource, script.className)
                 val scriptObj = instance.newInstance(
                     binaryId = parent.id,
                     program = parent.program,
