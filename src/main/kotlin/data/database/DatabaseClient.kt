@@ -240,10 +240,11 @@ class DatabaseClient(
     }
 
     /**
-     * Search binaries by name, id, architecture, or format.
+     * Search binaries by name, id, architecture, format, or checksum.
      *
      * @param query Free-text search term; matches against original_path, arch, and format.
      *              If the query is a number, also matches by exact id.
+     *              If the query is a 32-char hex string, also matches checksum exactly.
      * @return List of binary metadata maps, each containing id, name, originalPath,
      *         arch, format, compilerSpec, and checksum.
      */

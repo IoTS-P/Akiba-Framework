@@ -1063,6 +1063,11 @@ abstract class AgentModule(
         // 2. Build LLM client
         val llmConfig = resolveLLMConfig()
         val llmClient = LLMClientFactory.create(llmConfig)
+        // Route adapter-level logs (chat requests, connection lifecycle)
+        // into this module's log file instead of the global Root.log.
+        // The same client instance is shared with sub-agents, so their
+        // adapter logs land here too.
+        (llmClient as? org.iotsplab.akiba.llm.client.AbstractLangChainAdapter)?.logger = logger
         logger.info("Agent LLM: ${llmConfig.provider.displayName} / ${llmConfig.modelName}")
 
         // 3. Build memory

@@ -132,6 +132,15 @@ object ImportManager {
         if (db.checkMD5Duplicate(originalChecksum))
             throw DuplicateChecksumException(originalChecksum)
 
+        // Archive/container files (apk, zip, jar, gzip, 7z, rar, tar, …):
+        // import the FILE ITSELF as a single Raw Binary program using the
+        // DATA pseudo-language (no real architecture). Auto-detection or
+        // arch guessing on such files either fails or misimports the
+        // container's contents instead of the file.
+        if (isArchiveFile(originalPath)) {
+            return importArchiveAsRawBinary(originalPath, originalChecksum, sourceId, sourceModule)
+        }
+
         // If Ghidra can automatically detect the file format, import directly and insert it to database
         ProgramManager.tryCreateProgramWithAutoDetect(project, originalPath)?.let {
             // Ghidra successfully identified the binary format, import directly
@@ -210,6 +219,99 @@ object ImportManager {
             project.close(program)
         }
 
+        return id
+    }
+
+    /**
+     * Magic-byte check for archive/container files (zip family incl.
+     * apk/jar, gzip, 7z, rar, xz, bzip2, tar).
+     */
+    private fun isArchiveFile(path: Path): Boolean {
+        val head = ByteArray(8)
+        val n = try {
+            path.inputStream().use { it.read(head) }
+        } catch (_: Exception) {
+            return false
+        }
+        if (n >= 4) {
+            // ZIP family: PK\x03\x04 / PK\x05\x06 / PK\x07\x08
+            if (head[0] == 0x50.toByte() && head[1] == 0x4B.toByte() &&
+                (head[2] == 0x03.toByte() || head[2] == 0x05.toByte() || head[2] == 0x07.toByte())
+            ) return true
+            // gzip
+            if (head[0] == 0x1F.toByte() && head[1] == 0x8B.toByte()) return true
+            // rar: Rar!\x1A\x07
+            if (head[0] == 0x52.toByte() && head[1] == 0x61.toByte() &&
+                head[2] == 0x72.toByte() && head[3] == 0x21.toByte()
+            ) return true
+            // bzip2: BZh
+            if (head[0] == 0x42.toByte() && head[1] == 0x5A.toByte() && head[2] == 0x68.toByte()) return true
+        }
+        if (n >= 6) {
+            // 7z: 7z\xBC\xAF\x27\x1C
+            if (head[0] == 0x37.toByte() && head[1] == 0x7A.toByte() && head[2] == 0xBC.toByte() &&
+                head[3] == 0xAF.toByte() && head[4] == 0x27.toByte() && head[5] == 0x1C.toByte()
+            ) return true
+            // xz: \xFD7zXZ\x00
+            if (head[0] == 0xFD.toByte() && head[1] == 0x37.toByte() && head[2] == 0x7A.toByte() &&
+                head[3] == 0x58.toByte() && head[4] == 0x5A.toByte() && head[5] == 0x00.toByte()
+            ) return true
+        }
+        // tar: "ustar" at offset 257
+        try {
+            path.inputStream().use { ins ->
+                ins.skip(257)
+                val magic = ByteArray(5)
+                if (ins.read(magic) == 5 &&
+                    magic[0] == 'u'.code.toByte() && magic[1] == 's'.code.toByte() &&
+                    magic[2] == 't'.code.toByte() && magic[3] == 'a'.code.toByte() &&
+                    magic[4] == 'r'.code.toByte()
+                ) return true
+            }
+        } catch (_: Exception) { /* not a tar */ }
+        return false
+    }
+
+    /**
+     * Import an archive/container file as-is: a single Raw Binary
+     * program backed by the DATA pseudo-language (no real
+     * architecture), without auto-analysis.
+     */
+    private fun importArchiveAsRawBinary(
+        originalPath: Path,
+        originalChecksum: String,
+        sourceId: Int?,
+        sourceModule: String?,
+    ): Long {
+        val dataLanguage = languageProvider.getLanguage(LanguageID("DATA:LE:64:default"))
+            ?: throw IllegalStateException("DATA pseudo-language is not available")
+        val program = ProgramManager.loadProgram(originalPath, project, dataLanguage)
+            ?: throw IllegalStateException("Failed to import $originalPath as Raw Binary")
+
+        val id = db.insertBinary(
+            DatabaseClient.InsertData(
+                originalPath = originalPath.absolutePathString(),
+                processedPath = null,
+                checksum = originalChecksum,
+                processedChecksum = null,
+                size = originalPath.fileSize(),
+                processedSize = -1,
+                loadProperties = null,
+                arch = dataLanguage.languageID.toString(),
+                format = program.executableFormat,
+                compilerSpec = program.compiler,
+                sourceId = sourceId,
+                sourceModule = sourceModule,
+            )
+        )
+        originalPath.copyTo(WorkspaceManager.binaryPath.resolve("$id.bin"), overwrite = true)
+
+        val txId = program.startTransaction("rename")
+        program.name = "$id-${originalPath.fileName}"
+        program.endTransaction(txId, true)
+        project.saveAs(program, "/", program.name, false)
+        project.close(program)
+        globalLogger.info("Imported archive $originalPath as Raw Binary (id=$id)")
         return id
     }
 

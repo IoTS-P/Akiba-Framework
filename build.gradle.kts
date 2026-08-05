@@ -65,13 +65,13 @@ dependencies {
     implementation("io.ktor:ktor-serialization-jackson-jvm:3.4.2")
 
     // Langchain4j core + providers
-    implementation("dev.langchain4j:langchain4j:1.15.0")
-    implementation("dev.langchain4j:langchain4j-open-ai:1.15.0")
-    implementation("dev.langchain4j:langchain4j-anthropic:1.15.0")
-    implementation("dev.langchain4j:langchain4j-google-ai-gemini:1.15.0")
-    implementation("dev.langchain4j:langchain4j-mistral-ai:1.15.0")
-    implementation("dev.langchain4j:langchain4j-ollama:1.15.0")
-    implementation("dev.langchain4j:langchain4j-azure-open-ai:1.15.0")
+    implementation("dev.langchain4j:langchain4j:1.18.1")
+    implementation("dev.langchain4j:langchain4j-open-ai:1.18.1")
+    implementation("dev.langchain4j:langchain4j-anthropic:1.18.1")
+    implementation("dev.langchain4j:langchain4j-google-ai-gemini:1.18.1")
+    implementation("dev.langchain4j:langchain4j-mistral-ai:1.18.1")
+    implementation("dev.langchain4j:langchain4j-ollama:1.18.1")
+    implementation("dev.langchain4j:langchain4j-azure-open-ai:1.18.1")
 
     // JWT for authentication
     implementation("io.jsonwebtoken:jjwt:0.12.6")

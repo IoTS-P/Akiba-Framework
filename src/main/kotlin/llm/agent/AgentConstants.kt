@@ -122,78 +122,41 @@ val LLM_RETRY_BACKOFF_MS: List<Long> = listOf(
 const val LLM_RETRY_STATUS_PREFIX = "__llm_retry_status__"
 
 /**
- * Prefix for LLM "still working" progress messages written to the
- * agent_messages table while a single LLM call is in-flight.
+ * Prefix for LLM "still working" progress messages written to
+ * agent_messages every [LLM_PROGRESS_HEARTBEAT_MS] while an LLM call
+ * is in-flight, so the frontend can render liveness during long
+ * generations. Uses `role="system"`; filtered out of the LLM context
+ * by [PersistentChatMemory].
  *
- * Motivation: a long-form LLM response (e.g. a detailed analysis)
- * can take 60+ seconds to generate.  During that window the
- * frontend has no signal that the agent is alive — only the
- * eventual assistant message.  The retry-status path covers the
- * "previous call failed" case but says nothing while the
- * current call is still running.  These progress heartbeats
- * close that gap: a small system message is appended every
- * [LLM_PROGRESS_HEARTBEAT_MS] while the call is in-flight so
- * the frontend can render "LLM still working (Ns elapsed)".
- *
- * Like [LLM_RETRY_STATUS_PREFIX], these use `role="system"` and
- * are filtered out of the LLM context by [PersistentChatMemory].
- *
- * Format: `"$LLM_PROGRESS_PREFIX elapsedMs=12345 status=in_flight"`
- * and a final `"$LLM_PROGRESS_PREFIX elapsedMs=N status=done"` when
- * the call returns (success or failure).
+ * Format: `"$LLM_PROGRESS_PREFIX elapsedMs=12345 status=in_flight"`,
+ * and a final `"... status=done"` when the call returns.
  */
 const val LLM_PROGRESS_PREFIX = "__llm_progress__"
 
-/**
- * How often the in-flight heartbeat is written while an LLM
- * call is running.  15 seconds is a sweet spot:
- *  - fast enough that the UI feels alive (user sees updates)
- *  - slow enough that we don't spam the agent_messages table
- *    with hundreds of rows for a single LLM call
- */
+/** Heartbeat interval for in-flight progress messages (15 s). */
 const val LLM_PROGRESS_HEARTBEAT_MS: Long = 15_000L
 
 /**
- * Prefix marking an assistant message that contains the PARTIAL
- * output of an LLM streaming call that was interrupted mid-stream
- * (provider stall / connection drop).
- *
- * Written by `AgentStrategy.invokeChatStreaming`'s catch block into
- * chat memory (and therefore the DB for persistent memories) right
- * before the exception propagates to the retry loop.  Two consumers:
- *  - The LLM itself: the next retry rebuilds its message list from
- *    the same memory, so the model sees its own interrupted partial
- *    answer in context and can build on it instead of the work
- *    vanishing.
- *  - The frontend: renders the row with a dimmed background and an
- *    "interrupted partial" badge instead of a normal assistant
- *    bubble.
- *
- * Unlike the retry-status / progress markers, this row MUST stay
- * in the LLM context (it is real model output), so it uses
- * `role="assistant"` and is NOT filtered by [PersistentChatMemory].
+ * Prefix marking an assistant message containing the PARTIAL output
+ * of an interrupted streaming call. Written by
+ * `AgentStrategy.invokeChatStreaming`'s catch block before the
+ * exception propagates to the retry loop, so the model sees its own
+ * partial answer in the retry's context (and the frontend can render
+ * the row dimmed). Kept in the LLM context (`role="assistant"`).
  */
 const val INTERRUPTED_PARTIAL_PREFIX = "__interrupted_partial__"
 
 /**
- * Prefix of the continuation-instruction message written right
- * after an [INTERRUPTED_PARTIAL_PREFIX] row.
+ * Prefix of the continuation-instruction message written right after
+ * an [INTERRUPTED_PARTIAL_PREFIX] row. The instruction depends on
+ * where the stream was cut (see `ToolCallParser.endsWithTruncatedToolCall`):
+ *  - inside a tool_call JSON block → re-emit the entire tool call as
+ *    one complete block (seamless continuation would leave two
+ *    unparseable halves);
+ *  - anywhere else → continue seamlessly without repeating content.
  *
- * Observed behaviour this prevents: when a retry follows an
- * interrupted stream, some models try to SEAMLESSLY continue the
- * partial output — if the interruption happened inside a tool_call
- * JSON block, the model then emits only the remaining tail, and
- * NEITHER half parses as valid JSON.  The instruction text is
- * chosen by where the stream was cut (see
- * `ToolCallParser.endsWithTruncatedToolCall`):
- *  - inside a tool_call JSON block → MUST re-emit the entire
- *    tool call as one complete block (continuing prose is fine);
- *  - anywhere else → continue seamlessly from where it stopped
- *    (saves tokens; tool calls must still be complete blocks).
- *
- * Written with `role="user"` (the strongest instruction channel
- * across providers) and MUST stay in the LLM context; the frontend
- * hides the row as an internal directive.
+ * Written with `role="user"` and kept in the LLM context; the
+ * frontend hides the row as an internal directive.
  */
 const val RETRY_INSTRUCTION_PREFIX = "__retry_instruction__"
 

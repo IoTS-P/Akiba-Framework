@@ -6,6 +6,7 @@ import com.fasterxml.jackson.module.kotlin.readValue
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
 import io.ktor.serialization.jackson.jackson
@@ -37,6 +38,14 @@ object ModelContextLengthService {
                 disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
             }
         }
+        // Hard timeouts: the registry may be unreachable (blocked
+        // egress / poisoned DNS) — a hanging fetch must not stall the
+        // caller (this service is queried on the messages poll path).
+        install(HttpTimeout) {
+            connectTimeoutMillis = 3_000
+            requestTimeoutMillis = 5_000
+            socketTimeoutMillis = 5_000
+        }
     }
 
     private val akibaDir: File by lazy {
@@ -54,6 +63,15 @@ object ModelContextLengthService {
     private const val MODELS_DEV_URL = "https://models.dev/models.json"
 
     private const val STALE_THRESHOLD_HOURS = 1L
+
+    /**
+     * Last fetch ATTEMPT time (epoch millis), regardless of outcome.
+     * A failed/unreachable registry must not be retried on every call
+     * (this service sits on the messages poll path) — attempts are
+     * spaced at least [STALE_THRESHOLD_HOURS] apart.
+     */
+    @Volatile
+    private var lastFetchAttemptMs: Long = 0L
 
     data class ModelMetadata(
         val contextLength: Int?,
@@ -101,9 +119,13 @@ object ModelContextLengthService {
         val found = lookupIn(data, mappedProvider, modelName)
         if (found != null) return found
 
-        // Not found — check if the file is missing or stale, then re-fetch
-        val needsFetch = fileDatetime == null || stale
+        // Not found — re-fetch when the file is missing or stale, but
+        // at most once per STALE_THRESHOLD (a failed attempt counts too,
+        // so an unreachable registry can't stall every lookup).
+        val needsFetch = (fileDatetime == null || stale) &&
+            (System.currentTimeMillis() - lastFetchAttemptMs) >= STALE_THRESHOLD_HOURS * 3600_000L
         if (needsFetch) {
+            lastFetchAttemptMs = System.currentTimeMillis()
             logger.info("Model metadata stale or missing for ${mappedProvider ?: "*"}/$modelName, fetching fresh data")
             val freshData = try {
                 runBlocking { fetchAndSave() }

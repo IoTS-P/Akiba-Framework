@@ -25,11 +25,8 @@ import java.time.Duration
  *    `AgentRoutes.runManualAgentWorker` exports.
  *
  * Back-pressure: every public method is non-blocking.  Cross-process
- * sends use `sendAsync` with a 2-second timeout and silently drop
- * failures — a slow/dead server must not stall the LLM consumer
- * (that was the bug that caused "preview shows 1-2 chars then
- * everything dumps at once" in the previous DB-write-based
- * heartbeat).
+ * sends use a 2-second timeout and silently drop failures — a
+ * slow/dead server must not stall the LLM consumer.
  */
 object StreamingChunkPusher {
 
@@ -40,19 +37,12 @@ object StreamingChunkPusher {
         .build()
 
     /**
-     * Serial sender queue for cross-process POSTs.  Chunks MUST
-     * reach the server in publish order: the poll endpoint only ever
-     * moves its `since` cursor forward, so a chunk that arrives
-     * after a higher-numbered one would be skipped forever (a
-     * permanently missing character in the bubble), and a
-     * generation-start chunk (`chunkCount == 1`) arriving late would
-     * wipe newer chunks from the history.  `sendAsync` makes no
-     * ordering guarantee, so every request is funneled through a
-     * single daemon thread that sends them one at a time.  The
-     * queue is unbounded but self-limiting (an LLM generation
-     * produces at most a few thousand small chunks), and the worker
-     * side never blocks: `offer` is non-blocking and the sender
-     * thread absorbs the network latency.
+     * Serial sender queue for cross-process POSTs: chunks MUST reach
+     * the server in publish order (the poll endpoint only moves its
+     * `since` cursor forward, and a late generation-start chunk would
+     * wipe newer history).  Every request is funneled through a single
+     * daemon thread that sends them one at a time; `offer` never
+     * blocks the worker.
      */
     private val sendQueue = java.util.concurrent.LinkedBlockingQueue<HttpRequest>()
 

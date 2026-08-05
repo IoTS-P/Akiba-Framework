@@ -491,47 +491,27 @@ class StrategyContext(
             }
             val partial = textBuffer.toString()
             if (partial.isNotBlank()) {
-                // FIRST try to salvage the buffer: the provider may
-                // have finished generating (Final Answer or complete
-                // tool calls) but never closed the connection — the
-                // 45 s stall budget then fired on an idle-but-complete
-                // stream.  Discarding that and regenerating from
-                // scratch would waste the whole response.
+                // First try to salvage the buffer: the stream may have
+                // stalled AFTER the response was already complete.
                 tryRecoverCompletedStream(
                     partial,
                     chunkCountAtomic.get(),
                     byteCountAtomic.get(),
                 )?.let { return it }
-                // Genuinely truncated.  Preserve the partial output so
-                // the work isn't lost, but strip reasoning markup
-                // first: an interruption that happened INSIDE a
-                // <think> block has no visible body worth saving at
-                // all, and completed think blocks are noise in the
-                // retry's context (they also inflate the apparent
-                // output length).
+                // Genuinely truncated. Strip reasoning markup before
+                // persisting: think-block content is not worth keeping.
                 val partialBody = ToolCallParser.stripThinking(
                     ToolCallParser.stripLeadingThoughtBlock(partial)
                 )
                 if (partialBody.isNotBlank()) {
-                    // Write the partial into chat memory (persistent →
-                    // also lands in the DB) with the interrupted-
-                    // partial marker, followed by an explicit
-                    // continuation instruction.  The retry loop's next
-                    // invokeChatStreaming call rebuilds its message
-                    // list from THIS memory, so the model sees both:
-                    // its own interrupted partial answer AND the rule
-                    // for how to continue.  The instruction depends on
-                    // WHERE the stream was cut:
-                    //  - Inside a tool_call JSON block: the tail is
-                    //    unparseable, and a model that seamlessly
-                    //    continues would emit only the missing
-                    //    remainder — two broken halves.  Demand a
-                    //    fresh, complete block.
-                    //  - Anywhere else (plain prose): continuing is
-                    //    safe and saves tokens, so only the weaker
-                    //    "keep going, don't repeat yourself" hint.
-                    // The frontend renders the partial dimmed and
-                    // hides the instruction row.
+                    // Persist the partial with an interrupted marker plus
+                    // a continuation instruction, so the retry's message
+                    // list (rebuilt from this memory) shows the model its
+                    // own partial answer and how to continue. The rule
+                    // depends on where the stream was cut: inside a
+                    // tool_call JSON block the tail is unparseable, so
+                    // demand a fresh complete block; in plain prose,
+                    // seamless continuation is fine.
                     val truncatedInToolCall = ToolCallParser.endsWithTruncatedToolCall(partialBody)
                     val instruction = if (truncatedInToolCall) {
                         "The previous assistant message was interrupted WHILE a " +
@@ -578,30 +558,20 @@ class StrategyContext(
     }
 
     /**
-     * Attempt to salvage a stalled stream whose buffered text already
-     * looks COMPLETE.  Observed in production: the provider finishes
-     * generating a long response but never closes the connection, so
-     * the 45 s per-chunk stall budget fires on an idle-but-complete
-     * stream.  Rather than discarding the buffer and regenerating
-     * from scratch, run the same parsing the normal path would apply
-     * (mirroring the ReAct loop's extraction order):
+     * Salvage a stalled stream whose buffered text already looks
+     * COMPLETE (provider finished generating but never closed the
+     * connection), using the same parsing as the normal path:
      *
-     *  1. Final Answer marker present → return a plain completion;
-     *     the strategy loop's own Final-Answer check terminates the
-     *     iteration normally.
-     *  2. Complete text-embedded tool call(s) → return them as
-     *     native tool calls so the loop executes them exactly as if
-     *     the provider had finished cleanly.  A truncated trailing
-     *     call is NOT parsed (`ToolCallParser` requires balanced
-     *     JSON), so only genuinely complete calls are executed; the
-     *     loop's next iteration lets the model re-emit anything
-     *     that was cut off.
+     *  1. Final Answer marker present → return a plain completion.
+     *  2. Complete text-embedded tool call(s) → return them as native
+     *     tool calls. A truncated trailing call is NOT parsed
+     *     (`ToolCallParser` requires balanced JSON); the next
+     *     iteration lets the model re-emit it.
      *
      * Returns null when the buffer looks genuinely truncated — the
-     * caller then persists the partial and retries.  On success a
-     * final CLEAN done chunk is published first, so the frontend
-     * clears the interrupted marker and swaps the bubble for the
-     * canonical flow.
+     * caller then persists the partial and retries. On success a
+     * final clean done chunk is published first so the frontend
+     * clears the interrupted marker.
      */
     private fun tryRecoverCompletedStream(
         partial: String,
@@ -700,8 +670,13 @@ class StrategyContext(
                 r
             } catch (initialError: Exception) {
                 stopProgressHeartbeat(heartbeat, succeeded = false)
-                stats.lastError = initialError.message
-                logger.warn("LLM chat failed: ${initialError.message}")
+                // Walk the cause chain so wrapper exceptions (e.g.
+                // "DeepSeek streaming error") don't hide the provider's
+                // actual error payload underneath.
+                val causeChain = generateSequence(initialError as Throwable) { it.cause }
+                    .joinToString(" <- ") { "${it.javaClass.simpleName}: ${it.message}" }
+                stats.lastError = causeChain
+                logger.warn("LLM chat failed: $causeChain")
 
                 // ---- One-shot recovery hook (context compaction) ----
                 // Call the hook ONCE on the first error.  The hook may
@@ -1140,9 +1115,7 @@ class LoopStats {
      * registered wake condition); if false, the run ends with
      * [StopReason.COMPLETED] (the agent is truly done).
      *
-     * This replaces the old "Enter standby mode." text marker:
-     * the LLM now expresses "I want to park" by calling
-     * `await_condition` rather than emitting a magic string.
+     * The LLM expresses "I want to park" by calling `await_condition`.
      */
     var awaitConditionRegistered: Boolean = false
 

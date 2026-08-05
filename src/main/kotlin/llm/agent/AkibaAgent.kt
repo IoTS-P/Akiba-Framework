@@ -253,12 +253,9 @@ class AkibaAgent(
      *
      * This is the synchronisation point that makes the
      * "startProcess returned ⇒ the root agent is fully torn down"
-     * contract enforceable.  In the previous design the cascade
-     * cancel ran inside `GlobalScope.launch`, which was fire-and-
-     * forget — startProcess would return while the children were
-     * still being torn down in the background, breaking module
-     * seriality (the next module's startProcess could observe a
-     * half-cancelled child tree, or a still-open LLM client).
+     * contract enforceable: cascade cancel is awaited here rather
+     * than fired into the background, so the next module never
+     * observes a half-cancelled child tree or a still-open LLM client.
      *
      * The latch is completed only for terminal runs, after cleanup.
      * It remains open while a STANDBY agent is parked, including the
@@ -989,53 +986,108 @@ class AkibaAgent(
 
     /**
      * Emergency context reduction for repeated provider context-length
-     * rejections (`StrategyContext.onContextOverflowHook`). Tries the
-     * normal summarising [compact] first; when that fails (the
-     * summarisation request itself may be over the limit) or has nothing
-     * to summarise, falls back to [dropOldestRounds], which shrinks the
-     * context WITHOUT any LLM call.
+     * rejections (`StrategyContext.onContextOverflowHook`). Runs four
+     * progressively more destructive stages, each of which may shrink
+     * the context further on successive invocations:
      *
-     * When an observed bound exists for this model ([observedCap]), the
-     * reduction keeps dropping rounds until the context fits under it —
-     * the proven-safe size. The bound itself is never lowered here:
-     * failures may be transient, so the cap stays dynamic.
+     * 1. [pruneToolOutputsInMemory] (LLM-free): replace bulky tool
+     *    outputs still held in memory with placeholders. [compact] only
+     *    prunes the rounds it feeds to the summariser — the recent
+     *    rounds it KEEPS retain full outputs, so an oversized result in
+     *    a kept round otherwise survives every compaction.
+     * 2. [compact]: summarising compaction. Its summary request is
+     *    itself an LLM call that can fail when the context is already
+     *    over-length, so failure here does not abort the LLM-free stages.
+     * 3. [dropOldestRound] (LLM-free): shed oldest rounds one at a time.
+     *    With an observed bound ([observedCap]) this repeats until the
+     *    context fits the proven-safe size, dipping below
+     *    [compactKeepRounds] if necessary; without a bound, one round is
+     *    shed per invocation so each overflow retry sheds a bit more
+     *    history rather than giving up after the first drop.
+     * 4. [truncateOversizedMessages] (LLM-free, last resort): when even
+     *    a single surviving message exceeds the bound on its own (e.g.
+     *    a huge payload in the latest user message), hard-truncate it.
+     *
+     * The observed bound itself is never lowered here: failures may be
+     * transient, so the cap stays dynamic.
      *
      * @return true if the context was actually reduced.
      */
     fun forceCompactForOverflow(): Boolean {
-        var reduced = try {
-            compact()
+        var reduced = false
+
+        if (pruneToolOutputsInMemory()) reduced = true
+
+        reduced = try {
+            compact() || reduced
         } catch (e: Exception) {
             logger.warn(
                 "Summarising compact() failed during overflow recovery " +
-                    "(${e.message}); falling back to wholesale round drop.", e
+                    "(${e.message}); continuing with LLM-free reduction.", e
             )
-            false
+            reduced
         }
+
         val target = observedCap()
         if (target != null) {
-            // Drop rounds until the context fits the proven-safe size.
             var guard = 0
-            while (currentContextTokens() > target && guard++ < 20) {
-                if (!dropOldestRounds()) break
+            while (currentContextTokens() > target && guard++ < 50) {
+                if (!dropOldestRound()) break
+                reduced = true
+            }
+            if (currentContextTokens() > target && truncateOversizedMessages(target)) {
                 reduced = true
             }
         } else if (!reduced) {
-            reduced = dropOldestRounds()
+            reduced = dropOldestRound()
         }
         return reduced
     }
 
     /**
-     * Drop all but the most recent [compactKeepRounds] rounds WITHOUT
-     * summarising — fallback for [compact] when even the summarisation
-     * request is over-length. Keeps leading system messages, the latest
+     * Prune bulky tool outputs currently held in memory (opencode-style,
+     * newest [PRUNE_PROTECT_TOKENS] preserved) WITHOUT any LLM call.
+     * Complements [compact], which only prunes the summariser input.
+     *
+     * @return true if any tool output was pruned.
+     */
+    private fun pruneToolOutputsInMemory(): Boolean {
+        val rounds = memory.messages().map { listOf(it) }
+        val pruned = pruneToolOutputs(rounds)
+        if (pruned === rounds) return false
+        memory.clear()
+        pruned.flatten().forEach { memory.add(it) }
+        return true
+    }
+
+    /**
+     * Drop exactly the oldest conversation round WITHOUT summarising.
+     * Always keeps at least the newest round so the retry still carries
+     * the latest user intent.
+     *
+     * @return true if a round was dropped.
+     */
+    private fun dropOldestRound(): Boolean {
+        val allMsgs = memory.messages()
+        val summaryMsg = allMsgs.firstOrNull {
+            it.role == "system" && it.content.contains("<previous_summary>")
+        }
+        val conversation = allMsgs.filter { it !== summaryMsg }
+        val systemCount = conversation.takeWhile { it.role == "system" }.size
+        val rounds = groupIntoRounds(conversation.drop(systemCount))
+        if (rounds.size <= 1) return false
+        return shedRoundsTo(rounds.size - 1)
+    }
+
+    /**
+     * Drop all but the most recent [keepRounds] rounds WITHOUT
+     * summarising. Keeps leading system messages, the latest
      * `<previous_summary>` (if any) and the recent rounds; a context note
      * tells the model older tool results must be re-fetched.
      *
      * @return true if any rounds were dropped.
      */
-    private fun dropOldestRounds(): Boolean {
+    private fun shedRoundsTo(keepRounds: Int): Boolean {
         val allMsgs = memory.messages()
         if (allMsgs.isEmpty()) return false
 
@@ -1046,9 +1098,10 @@ class AkibaAgent(
         val systemMsgs = conversation.takeWhile { it.role == "system" }
         val nonSystem = conversation.drop(systemMsgs.size)
         val rounds = groupIntoRounds(nonSystem)
-        if (rounds.size <= compactKeepRounds) return false
+        val keep = keepRounds.coerceAtLeast(1)
+        if (rounds.size <= keep) return false
 
-        val keptRounds = rounds.takeLast(compactKeepRounds)
+        val keptRounds = rounds.takeLast(keep)
         val droppedCount = rounds.size - keptRounds.size
 
         memory.clear()
@@ -1064,6 +1117,45 @@ class AkibaAgent(
         logger.warn(
             "Emergency context drop: discarded $droppedCount oldest rounds " +
                 "(no summary), kept ${keptRounds.size} round(s)."
+        )
+        return true
+    }
+
+    /**
+     * Hard-truncate any surviving message that alone exceeds a quarter
+     * of [targetTokens] (min 2 000 tokens), replacing the cut portion
+     * with a placeholder. Last resort of [forceCompactForOverflow] for
+     * cases where a single message (e.g. a huge pasted payload) exceeds
+     * the proven-safe size. Leading system messages are never touched:
+     * they carry the system prompt / tool instructions whose structure
+     * must stay intact.
+     *
+     * @return true if any message was truncated.
+     */
+    private fun truncateOversizedMessages(targetTokens: Int): Boolean {
+        val perMessageCap = (targetTokens / 4).coerceAtLeast(2_000)
+        val msgs = memory.messages()
+        val systemCount = msgs.takeWhile { it.role == "system" }.size
+        var truncatedCount = 0
+        val rebuilt = msgs.mapIndexed { i, m ->
+            if (i < systemCount) return@mapIndexed m
+            val tokens = client.estimateTokenCount(m.content)
+            if (tokens <= perMessageCap) return@mapIndexed m
+            truncatedCount++
+            val keepChars = (m.content.length.toLong() * perMessageCap / tokens)
+                .toInt().coerceIn(0, m.content.length)
+            m.copy(
+                content = m.content.take(keepChars) +
+                    "\n[message truncated during overflow recovery — " +
+                    "original ~${m.content.length} chars / ~$tokens tokens]"
+            )
+        }
+        if (truncatedCount == 0) return false
+        memory.clear()
+        rebuilt.forEach { memory.add(it) }
+        logger.warn(
+            "Emergency truncation: hard-truncated $truncatedCount oversized " +
+                "message(s) to ~$perMessageCap tokens each."
         )
         return true
     }

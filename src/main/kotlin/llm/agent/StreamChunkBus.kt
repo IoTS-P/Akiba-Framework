@@ -3,33 +3,19 @@ package org.iotsplab.akiba.llm.agent
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * In-memory store that carries live LLM streaming chunks from the
- * **producer** (a manual-agent worker JVM, via the internal HTTP
- * endpoint, or the in-process runtime) to the **consumer** (the
- * frontend, via short incremental polls).
- *
- * Why this exists: the previous "write a progress row to
- * agent_messages every 3 s" approach could only deliver a batch
- * preview every few seconds — the user explicitly asked for
- * "natural per-token growth", which polling the DB can never
- * deliver.  This store keeps the hot path entirely in memory:
- * worker → HTTP POST → map lookup → browser poll, with no DB write
- * in between.  (An earlier revision fanned chunks out over SSE, but
- * the deployment sits behind an outer reverse proxy that kills
- * `text/event-stream` connections, so the transport is plain
- * JSON-over-GET polling instead — a transport every proxy passes.)
+ * In-memory store carrying live LLM streaming chunks from producer
+ * (worker JVM via internal HTTP, or in-process runtime) to consumer
+ * (frontend incremental polls). Transport is plain JSON-over-GET
+ * polling, which every proxy passes; the hot path has no DB writes.
  *
  * Design:
- *  - Per-session rolling history of the current (or most recent)
- *    LLM generation.  A new generation starts when a chunk with
- *    `chunkCount <= 1` arrives: the history resets and
- *    [SessionHistory.generation] is bumped so polling clients can
- *    detect the rollover and discard text from the previous
- *    generation.
- *  - Fire-and-forget: [publish] only appends to an in-memory deque.
- *    A slow/dead browser never back-pressures the worker.
- *  - Bounded memory: each generation is capped at [MAX_CHUNKS]
- *    chunks (far beyond any realistic LLM response).
+ *  - Per-session rolling history of the current LLM generation.
+ *    A chunk with `chunkCount <= 1` starts a new generation: history
+ *    resets and [SessionHistory.generation] bumps so polling clients
+ *    discard text from the previous generation.
+ *  - Fire-and-forget: [publish] only appends to an in-memory deque;
+ *    a slow/dead browser never back-pressures the worker.
+ *  - Bounded memory: each generation is capped at [MAX_CHUNKS] chunks.
  */
 object StreamChunkBus {
 
@@ -111,14 +97,8 @@ object StreamChunkBus {
             while (hist.chunks.size > MAX_CHUNKS) hist.chunks.removeFirst()
             if (chunk.done) {
                 hist.done = true
-                // Overwrite unconditionally: a later CLEAN done
-                // (error=null) must clear a previously reported
-                // interruption.  This is the "stalled stream turned
-                // out to be complete" recovery path — the strategy
-                // first publishes done+error, then discovers the
-                // buffered text parses as a full response and
-                // publishes a final clean done so the frontend swaps
-                // the interrupted bubble for the canonical row.
+                // Overwrite unconditionally: a later clean done
+                // (error=null) clears a previously reported interruption.
                 hist.error = chunk.error
             }
         }

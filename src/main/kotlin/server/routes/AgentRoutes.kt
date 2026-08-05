@@ -736,22 +736,10 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
 
     // ------ List ALL pending confirmations (cross-session) -------------------
     //
-    // The per-session `GET /agent/sessions/{id}` poll only surfaces
-    // confirmations for the session the user is currently viewing.
-    // That breaks down when a sub-agent (spawned via
-    // `spawn_sub_agent` / `RunFreeAnalyzersTool`) is the one blocked
-    // on a `read_workspace_file` confirmation: the pending entry
-    // lives under the sub-agent's sessionId, but the user is
-    // looking at the root session's tree and never sees the modal.
-    // From the user's point of view, the request is "redirected to
-    // stdio" (the worker process's stdout, which the framework
-    // captures into a per-worker log file) and after 5 minutes the
-    // server times out and the request is auto-denied.
-    //
-    // This endpoint returns every pending confirmation across every
-    // session in the JVM, keyed by sessionId, so the frontend can
-    // surface a single global modal regardless of which session the
-    // user is currently viewing.
+    // Returns every pending confirmation in the JVM, keyed by sessionId.
+    // The per-session poll only covers the session the user is viewing;
+    // this global view lets the frontend surface a modal even when a
+    // sub-agent is the one blocked on confirmation.
     get("/agent/pending-confirmations") {
         val instance = call.requireInstanceHeader() ?: return@get
         if (instance.isBlank()) {
@@ -1105,11 +1093,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             // For project-based sessions (no binaryId), locate the
             // program in the project so the manual agent worker can
             // open it.  FAIL FAST when the project has no program at
-            // all: the worker cannot run any analysis tool without one,
-            // and previously it died on the worker side with the real
-            // reason ("no Ghidra Program is loaded") swallowed, so the
-            // user only saw the cryptic "User message was not
-            // persisted".
+            // all: the worker cannot run any analysis tool without one.
             var programName: String? = null
             if (sessionInfo.binaryId == null && sessionInfo.projectName != null) {
                 programName = findFirstProgramName(sessionInfo.projectName, call.currentUserGhidraProjectsRoot())

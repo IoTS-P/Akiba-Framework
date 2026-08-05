@@ -245,10 +245,22 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
         val deletedLogDirs = mutableListOf<String>()
         if (deleteLogs) {
             try {
-                val logsRoot = call.currentUserLogsRoot()
-                if (logsRoot.isDirectory()) {
-                    Files.list(logsRoot).use { stream ->
-                        stream.filter { it.isDirectory() }.forEach { logDir ->
+                val userLogsRoot = call.currentUserLogsRoot()
+                // Some run types (import / manual-agent / workflow) write
+                // their log dirs at the TOP level of ~/.akiba/logs without
+                // the username suffix, so scan both levels. The user dir
+                // itself is skipped at the top level (already covered by
+                // the user-root scan).
+                val roots = listOfNotNull(userLogsRoot, userLogsRoot.parent).distinct()
+                // Well-known system log dirs that must never be deleted as
+                // "project logs", even if a project shares their name.
+                val systemLogDirs = setOf("server", "workflows")
+                for (root in roots) {
+                    if (!root.isDirectory()) continue
+                    Files.list(root).use { stream ->
+                        stream.filter {
+                            it.isDirectory() && it != userLogsRoot && it.name !in systemLogDirs
+                        }.forEach { logDir ->
                             val configFile = logDir.resolve("config.json")
                             if (configFile.isRegularFile()) {
                                 try {
@@ -256,22 +268,26 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                                     val mapper = com.fasterxml.jackson.databind.ObjectMapper()
                                         .registerKotlinModule()
                                     val rootNode = mapper.readTree(configText)
-                                    val withGhidraProject = rootNode.get("withGhidraProject")
+                                    // mergeConfigs() writes the main config
+                                    // under the "main" key — unwrap it.
+                                    val mainNode = rootNode.get("main") ?: rootNode
+                                    val withGhidraProject = mainNode.get("withGhidraProject")
                                     if (withGhidraProject != null) {
                                         val mode = withGhidraProject.get("mode")?.asText("") ?: ""
                                         val name = withGhidraProject.get("name")?.asText("") ?: ""
                                         val forkTo = withGhidraProject.get("forkTo")?.asText("") ?: ""
                                         val continueLog = withGhidraProject.get("continueLog")?.asText("") ?: ""
 
-                                        val isAssociated = when {
-                                            mode == "fork" && forkTo.isNotBlank() ->
-                                                forkTo == projectName || forkTo.endsWith("/$projectName")
-                                            mode == "base" && continueLog.isNotBlank() ->
-                                                continueLog == projectName || continueLog.endsWith("/$projectName") ||
-                                                logDir.name == projectName
-                                            else ->
-                                                name == projectName || logDir.name == projectName
-                                        }
+                                        // `name` is the project association
+                                        // in every mode; forkTo/continueLog
+                                        // are additional hints when the run
+                                        // dir is named differently.
+                                        val isAssociated =
+                                            name == projectName || logDir.name == projectName ||
+                                                (mode == "fork" && forkTo.isNotBlank() &&
+                                                    (forkTo == projectName || forkTo.endsWith("/$projectName"))) ||
+                                                (mode == "base" && continueLog.isNotBlank() &&
+                                                    (continueLog == projectName || continueLog.endsWith("/$projectName")))
 
                                         if (isAssociated) {
                                             logDir.toFile().deleteRecursively()

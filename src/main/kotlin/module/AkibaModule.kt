@@ -149,11 +149,18 @@ abstract class AkibaModule (
     val configClass: KClass<*>?
         get() = this::class.findAnnotation<WithConfigClass>() ?.clazz
 
-    val originalFile: File = File("${mainConf.binariesRoot}/original/$id.bin")
-    val processedFile: File? = File("${mainConf.binariesRoot}/processed/$id.bin").let {
-        if (it.exists()) it else null
+    // Lazy: `id` may be injected via reflection AFTER construction
+    // (dynamically-compiled scripts are built with the no-arg
+    // constructor, where id is still the -1 default).  Eagerly computed
+    // paths would then permanently point at `-1.bin` — see
+    // ScriptClassLoader.instantiateScript.
+    val originalFile: File by lazy { File("${mainConf.binariesRoot}/original/$id.bin") }
+    val processedFile: File? by lazy {
+        File("${mainConf.binariesRoot}/processed/$id.bin").let {
+            if (it.exists()) it else null
+        }
     }
-    val usingFile: File = processedFile ?: originalFile
+    val usingFile: File by lazy { processedFile ?: originalFile }
 
     // ============================================================
     //  Module workspace — persistent file storage for modules

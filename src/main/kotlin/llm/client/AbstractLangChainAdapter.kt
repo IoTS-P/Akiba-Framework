@@ -4,12 +4,13 @@ import dev.langchain4j.agent.tool.ToolSpecification
 import dev.langchain4j.data.message.AiMessage
 import dev.langchain4j.data.message.ChatMessage
 import dev.langchain4j.data.message.SystemMessage
-import dev.langchain4j.data.message.ToolExecutionResultMessage
 import dev.langchain4j.data.message.UserMessage
 import dev.langchain4j.model.chat.ChatModel
 import dev.langchain4j.model.chat.StreamingChatModel
 import dev.langchain4j.model.chat.request.ChatRequest
 import dev.langchain4j.model.chat.response.ChatResponse
+import dev.langchain4j.model.chat.response.PartialThinking
+import dev.langchain4j.model.chat.response.PartialThinkingContext
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler
 import dev.langchain4j.model.chat.request.json.JsonObjectSchema
 import dev.langchain4j.model.chat.request.json.JsonStringSchema
@@ -46,15 +47,10 @@ import java.util.concurrent.atomic.AtomicReference
 class LLMTimeoutException(message: String) : RuntimeException(message)
 
 /**
- * How long the streaming chat consumer will wait for the *next* chunk
- * before declaring the stream stalled. 45 s is the chosen budget:
- *  - Long enough to tolerate provider-side resource scheduling, where
- *    a long generation can pause mid-stream for a minute or more
- *    before resuming (a pattern the user observed in production —
- *    a 30 s budget killed those recoverable streams and forced a
- *    full regeneration from scratch).
- *  - Still bounded so a genuinely dead connection is detected and
- *    the retry loop kicks in within a reasonable time.
+ * How long the streaming chat consumer waits for the *next* chunk
+ * before declaring the stream stalled. 45 s tolerates provider-side
+ * scheduling pauses while still detecting genuinely dead connections
+ * quickly enough for the retry loop.
  */
 private const val PER_CHUNK_TIMEOUT_MS: Long = 45_000L
 
@@ -71,7 +67,17 @@ abstract class AbstractLangChainAdapter(
     /** Short tag used in log messages (e.g. "OpenAI", "Gemini"). */
     protected abstract val providerTag: String
 
-    private val logger = LogManager.getLogger(this::class.java)
+    /**
+     * Logger for adapter-level messages (chat requests, connection
+     * lifecycle, errors).  Defaults to the per-class logger (which
+     * writes to the global Root.log).  [org.iotsplab.akiba.llm.agent.AgentModule]
+     * overrides it with the module logger right after client creation
+     * so adapter logs land in the module's own log file alongside the
+     * agent's strategy logs.  Assignment happens before any chat call,
+     * so a plain `var` is sufficient.
+     */
+    var logger: org.apache.logging.log4j.Logger = LogManager.getLogger(this::class.java)
+        internal set
 
     private fun <T> runWithHardTimeout(label: String, block: () -> T): T {
         val timeoutSeconds = config.timeoutSeconds.coerceAtLeast(1)
@@ -157,15 +163,30 @@ abstract class AbstractLangChainAdapter(
         val errorRef = AtomicReference<Throwable?>(null)
         val completionRef = AtomicReference<ChatResponse?>(null)
         val doneLatch = CountDownLatch(1)
+        // Updated by ANY streaming activity (content OR thinking deltas).
+        // The watchdog below keys off this instead of content chunks only:
+        // thinking models (e.g. deepseek-v4-flash) can stream minutes of
+        // reasoning_content before the first content token, and those
+        // deltas arrive via onPartialThinking, not onPartialResponse.
+        val lastActivityAt = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
 
         val handler = object : StreamingChatResponseHandler {
             override fun onPartialResponse(partial: String) {
+                lastActivityAt.set(System.currentTimeMillis())
                 // trySend is non-blocking; if the channel is full we drop
                 // the chunk (which is OK for UI feedback but bad for the
                 // final accumulation).  We therefore also append to a
                 // local buffer inside the synchronized block.  Caller
                 // uses both — flow for UI, buffer for the final result.
                 chunkChannel.trySend(partial)
+            }
+
+            override fun onPartialThinking(thinking: PartialThinking) {
+                lastActivityAt.set(System.currentTimeMillis())
+            }
+
+            override fun onPartialThinking(thinking: PartialThinking, context: PartialThinkingContext) {
+                lastActivityAt.set(System.currentTimeMillis())
             }
 
             override fun onCompleteResponse(response: ChatResponse) {
@@ -194,42 +215,37 @@ abstract class AbstractLangChainAdapter(
             }
         }
 
-        // Per-chunk timeout: if no new chunk arrives for this long, the
-        // stream is stalled (provider throttling / network half-open) —
-        // treat it as a timeout so the retry loop kicks in.
-        val perChunkTimeoutMs = PER_CHUNK_TIMEOUT_MS
-        // Total cap: a single streaming call must complete within this
-        // budget, otherwise it's effectively a hang.
-        val totalTimeoutMs = config.timeoutSeconds.coerceAtLeast(1) * 1000L
-        val overallDeadline = System.currentTimeMillis() + totalTimeoutMs
+        // Stall watchdog: if NO streaming activity (content or thinking
+        // deltas) arrives for PER_CHUNK_TIMEOUT_MS, the stream is dead
+        // (provider throttling / network half-open) — treat it as a
+        // timeout so the retry loop kicks in.  There is deliberately no
+        // overall time cap: thinking models can legitimately stream for
+        // many minutes, and any activity proves the stream is alive.
+        // Short probe interval so completion/error signals are picked up
+        // promptly even when no content chunks flow.
+        val stallTimeoutMs = PER_CHUNK_TIMEOUT_MS
+        val probeMs = 5_000L
 
-        var sawCompletion = false
         try {
             while (true) {
-                val remainingTotal = overallDeadline - System.currentTimeMillis()
-                if (remainingTotal <= 0) {
+                val idleForMs = System.currentTimeMillis() - lastActivityAt.get()
+                if (idleForMs >= stallTimeoutMs) {
                     throw LLMTimeoutException(
-                        "$providerTag streaming chat total timeout after ${totalTimeoutMs}ms " +
+                        "$providerTag streaming chat stalled: no stream activity for ${stallTimeoutMs}ms " +
                             "(model=${config.modelName})"
                     )
                 }
                 val chunk = kotlinx.coroutines.withTimeoutOrNull(
-                    minOf(perChunkTimeoutMs, remainingTotal)
+                    minOf(probeMs, stallTimeoutMs - idleForMs)
                 ) {
                     chunkChannel.receive()
                 }
                 if (chunk == null) {
-                    // Either per-chunk timeout fired or the total
-                    // deadline hit.  If the completion latch already
-                    // fired we're done; otherwise it's a real timeout.
-                    if (doneLatch.count == 0L) {
-                        sawCompletion = true
-                        break
-                    }
-                    throw LLMTimeoutException(
-                        "$providerTag streaming chat stalled: no chunk for ${perChunkTimeoutMs}ms " +
-                            "(model=${config.modelName})"
-                    )
+                    // Probe window elapsed.  If the completion latch
+                    // fired we're done; otherwise re-check liveness at
+                    // the top of the loop.
+                    if (doneLatch.count == 0L) break
+                    continue
                 }
                 // Got a chunk — emit it as an incremental delta.
                 emit(ChatChunk(delta = chunk, isComplete = false))
@@ -243,19 +259,11 @@ abstract class AbstractLangChainAdapter(
                         val rest = chunkChannel.tryReceive().getOrNull() ?: break
                         emit(ChatChunk(delta = rest, isComplete = false))
                     }
-                    sawCompletion = true
                     break
                 }
             }
         } finally {
             chunkChannel.close()
-        }
-
-        if (!sawCompletion) {
-            throw LLMTimeoutException(
-                "$providerTag streaming chat did not complete within ${totalTimeoutMs}ms " +
-                    "(model=${config.modelName})"
-            )
         }
 
         errorRef.get()?.let { throw RuntimeException("$providerTag streaming error", it) }
@@ -303,13 +311,16 @@ abstract class AbstractLangChainAdapter(
             when (msg.role.lowercase()) {
                 "user" -> result.add(UserMessage.from(msg.content))
                 "assistant" -> result.add(AiMessage.from(msg.content))
-                "tool" -> result.add(
-                    ToolExecutionResultMessage.from(
-                        msg.toolCallId ?: "",
-                        msg.toolName ?: "",
-                        msg.content
-                    )
-                )
+                // Tool results are presented as user messages, not
+                // ToolExecutionResultMessage: the framework flattens
+                // native tool calls into assistant text before
+                // persisting, so no assistant message in memory ever
+                // carries structured tool_calls.  A role=tool message
+                // would therefore be orphaned and strict
+                // OpenAI-compatible providers reject the whole request
+                // (e.g. DeepSeek: "Messages with role 'tool' must be a
+                // response to a preceding message with 'tool_calls'").
+                "tool" -> result.add(UserMessage.from(msg.content))
                 else -> result.add(UserMessage.from(msg.content))
             }
         }
@@ -416,21 +427,15 @@ abstract class AbstractLangChainAdapter(
     }
 
     override fun close() {
-        // langchain4j 1.15.0 wraps JDK's java.net.http.HttpClient inside each
-        // model (chatModel + streamingModel).  The JDK HttpClient keeps its
-        // own connection pool with a default keep-alive of **1200 seconds**
-        // — exactly the "20-30 minute freeze" the user observed.  Each time
-        // `LLMClientFactory.create()` ran we built a new model + new
-        // HttpClient + new connection pool, but `close()` was a no-op, so
-        // every pool lingered for 20 minutes after the session ended.  The
-        // accumulated keep-alive connections eventually throttled the LLM
-        // provider's per-IP connection budget, making it respond
-        // *extremely* slowly — which in turn looked like a hang.
+        // langchain4j wraps a JDK java.net.http.HttpClient inside each
+        // model (chatModel + streamingModel); its connection pool has a
+        // 1200 s default keep-alive.  Without an explicit shutdown, pools
+        // linger after the session ends and exhaust the provider's
+        // per-IP connection budget.
         //
-        // Walk both models reflectively and call `shutdownNow()` on every
-        // java.net.http.HttpClient we find.  `shutdownNow()` (JDK 21+)
-        // forcibly closes all idle connections in the pool, releasing
-        // both local FDs and the provider's per-client connection slots.
+        // Walk both models reflectively and call `shutdownNow()` (JDK 21+)
+        // on every java.net.http.HttpClient found, forcibly closing all
+        // idle connections and releasing local FDs and provider slots.
         val visited = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>())
         var closed = 0
         closed += shutdownHttpClients(chatModel, visited)

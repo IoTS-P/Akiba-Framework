@@ -270,18 +270,11 @@ object ConfirmationManager {
         pending[sessionId]?.confirmation
 
     /**
-     * Snapshot of **every** session that currently has a pending
-     * confirmation, keyed by sessionId.
-     *
-     * Used by the global `/agent/pending-confirmations` poll to surface
-     * confirmation requests to the user **even when they are viewing a
-     * different session** — most importantly when a sub-agent
-     * (`spawn_sub_agent` / `RunFreeAnalyzersTool`) is the one blocked
-     * on confirmation.  Without this, the user on the root session
-     * would never see the modal and the request would silently
-     * time out after 5 minutes, with the only visible trace being
-     * the worker's stdout log file (which the user perceives as
-     * "the request was redirected to stdio").
+     * Snapshot of every session that currently has a pending
+     * confirmation, keyed by sessionId. Used by the global
+     * `/agent/pending-confirmations` poll to surface requests even
+     * when the user is viewing a different session (e.g. a sub-agent
+     * is the one blocked).
      */
     fun getAllPending(): Map<String, PendingConfirmation> =
         pending.entries.associate { (sid, entry) -> sid to entry.confirmation }
@@ -313,10 +306,7 @@ object ConfirmationManager {
  * server process). The worker POSTs to the server's
  * `POST /agent/internal/confirmation/request` endpoint and blocks on
  * the HTTP response (long-poll) until the user responds.
- *
- * This is a generalised version of the function that was previously
- * in `RunShellTool.kt`. It now supports both `shell_command` and
- * `file_access` action types.
+ * Supports both `shell_command` and `file_access` action types.
  *
  * @return `true` if the user approved, `false` if denied, timed out,
  *         or the HTTP call failed.
