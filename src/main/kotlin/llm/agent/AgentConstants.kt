@@ -275,6 +275,21 @@ const val MAX_FAILED_OVERFLOW_COMPACTIONS: Int = 3
  */
 const val PRUNE_PROTECT_TOKENS: Int = 40_000
 
+/**
+ * Minimum estimated tokens that one overflow-recovery invocation must
+ * shed via oldest-round dropping when the earlier stages (tool-output
+ * pruning, summarising compaction, bound-driven dropping) saved less
+ * than this. Dropping a fixed NUMBER of rounds is unreliable: a round
+ * can be a few hundred tokens while the provider's rejection margin
+ * (prompt + requested output tokens vs the window) is typically
+ * several thousand. Sized at the usual max-output-token reservation so
+ * a single drop covers the common "prompt fits but prompt+output
+ * doesn't" case.
+ *
+ * Referenced by `AkibaAgent.kt` (`forceCompactForOverflow`).
+ */
+const val OVERFLOW_DROP_MIN_TOKENS: Int = 8_192
+
 // ----------------------------------------------------------
 // 7. Tool result truncation
 // ----------------------------------------------------------

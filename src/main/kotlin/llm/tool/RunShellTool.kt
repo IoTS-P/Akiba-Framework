@@ -267,10 +267,18 @@ fun RunShellTool(
                     drainStream(process.errorStream, maxOutputChars)
                 }
 
-                // Wait for process exit on an IO thread. withTimeout will cancel
-                // us if the deadline is exceeded; CancellationException propagates
-                // to the outer try where we destroyForcibly().
-                val exitCode = withContext(Dispatchers.IO) {
+                // Wait for process exit on an IO thread.  MUST be
+                // runInterruptible: process.waitFor() is a BLOCKING JDK
+                // call — a plain withContext(Dispatchers.IO) cannot be
+                // preempted by withTimeout (cancellation is cooperative
+                // and never reaches a suspension point), so a child that
+                // never exits would freeze the agent loop FOREVER (the
+                // timeout would never fire and destroyForcibly() would
+                // never run).  runInterruptible interrupts the waiting
+                // thread on cancellation; waitFor() responds with
+                // InterruptedException, which runInterruptible converts
+                // back to TimeoutCancellationException.
+                val exitCode = runInterruptible {
                     process.waitFor()
                 }
 
@@ -288,7 +296,7 @@ fun RunShellTool(
             }
             result
         } catch (_: TimeoutCancellationException) {
-            process?.destroyForcibly()
+            killProcessTree(process)
             mapper.writeValueAsString(mapOf(
                 "exitCode" to -1,
                 "error" to "Command timed out after ${timeout}s and was killed.",
@@ -297,7 +305,7 @@ fun RunShellTool(
             ))
         } catch (_: CancellationException) {
             // Parent coroutine (AkibaModule) was cancelled — kill process immediately
-            process?.destroyForcibly()
+            killProcessTree(process)
             mapper.writeValueAsString(mapOf(
                 "exitCode" to -1,
                 "error" to "Execution cancelled (parent module terminated).",
@@ -305,7 +313,7 @@ fun RunShellTool(
                 "cancelled" to true
             ))
         } catch (e: Exception) {
-            process?.destroyForcibly()
+            killProcessTree(process)
             mapper.writeValueAsString(mapOf(
                 "exitCode" to -1,
                 "error" to "Failed to execute command: ${e.message}",
@@ -313,6 +321,18 @@ fun RunShellTool(
             ))
         }
     }
+}
+
+/**
+ * Kill [process] AND its entire descendant tree.  The command runs via
+ * `/bin/sh -c`, so the direct child is a shell whose own children
+ * (e.g. a `python3 -c` script) survive a plain `destroyForcibly()` on
+ * the shell and keep burning CPU as orphans.
+ */
+private fun killProcessTree(process: Process?) {
+    val handle = process?.toHandle() ?: return
+    runCatching { handle.descendants().forEach { it.destroyForcibly() } }
+    runCatching { handle.destroyForcibly() }
 }
 
 /**

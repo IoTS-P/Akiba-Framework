@@ -320,6 +320,7 @@ class BudgetPolicyBuilder(initial: BudgetPolicy) {
  */
 class InteractionPolicyBuilder(initial: InteractionPolicy) {
     private var lifecycle: Lifecycle = initial.lifecycle
+    private var coldStart: Boolean = initial.coldStart
     private var canSendToParent: Boolean = initial.canSendToParent
     private var canSendToChildren: Boolean = initial.canSendToChildren
     private var canPublishArtifacts: Boolean = initial.canPublishArtifacts
@@ -331,6 +332,7 @@ class InteractionPolicyBuilder(initial: InteractionPolicy) {
     private var canBeCancelledBy: CancellationPolicy = initial.canBeCancelledBy
 
     fun lifecycle(v: Lifecycle) { lifecycle = v }
+    fun coldStart(v: Boolean) { coldStart = v }
     fun canSendToParent(v: Boolean) { canSendToParent = v }
     fun canSendToChildren(v: Boolean) { canSendToChildren = v }
     fun canPublishArtifacts(v: Boolean) { canPublishArtifacts = v }
@@ -343,6 +345,7 @@ class InteractionPolicyBuilder(initial: InteractionPolicy) {
 
     internal fun build(): InteractionPolicy = InteractionPolicy(
         lifecycle = lifecycle,
+        coldStart = coldStart,
         canSendToParent = canSendToParent,
         canSendToChildren = canSendToChildren,
         canPublishArtifacts = canPublishArtifacts,

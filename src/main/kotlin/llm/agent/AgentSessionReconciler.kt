@@ -30,9 +30,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 //  is too long for an interactive user.
 //
 //  This reconciler is the startup-time safety net.  It scans
-//  the DB for any non-terminal session row and transitions it
-//  to `closed` with an explanatory `closing_reason`.  It runs
-//  on:
+//  the DB for non-terminal session rows and closes ONLY those
+//  that are provably orphaned: active-state rows (`running` /
+//  `msghandle` / `cancelling`) whose `updated_at` has been frozen
+//  longer than the staleness window (live processes bump
+//  `updated_at` on every appended message).  `standby` rows are
+//  never touched — a parked live session is indistinguishable
+//  from a dead one without process ownership.  It runs on:
 //
 //   1. **Server startup** (`AkibaServer.start`).  Covers all
 //      ungraceful exits from a previous process.
@@ -122,6 +126,25 @@ class AgentSessionReconciler(
      * millions of historical rows.
      */
     private val maxRowsPerScan: Int = 1000,
+    /**
+     * Minimum idle age (minutes since `updated_at`) before an
+     * ACTIVE non-terminal session is considered orphaned.
+     *
+     * Rationale: a live session's `updated_at` is bumped on every
+     * appended message (see the daemon's append-message route), so a
+     * session owned by a LIVE process is never older than its last
+     * tool/LLM step.  Only rows frozen longer than [staleMinutes]
+     * can belong to a dead process (SIGKILL / OOM / container
+     * restart).  This makes the reconciler safe for multi-process
+     * deployments where several workflows run in PARALLEL against
+     * the same daemon: a newly started process no longer flips the
+     * other processes' live sessions to `closed`.
+     *
+     * Default: [DEFAULT_STALE_MINUTES]; override via the
+     * `AKIBA_AGENT_RECONCILE_STALE_MINUTES` env var.  Must exceed
+     * the longest expected single tool call (e.g. angr runs).
+     */
+    private val staleMinutes: Long = defaultStaleMinutes(),
 ) {
     private val logger = LogManager.getLogger(AgentSessionReconciler::class.java)
 
@@ -149,9 +172,18 @@ class AgentSessionReconciler(
      * `status` value but a non-terminal `runtime_state` is
      * the same "live" case.
      */
-    private val nonTerminalStates: Set<String> = setOf(
+    /**
+     * States eligible for reconciliation: ACTIVE non-terminal states
+     * only.  `standby` is deliberately EXCLUDED — a parked standby
+     * session of a live process (agent parked on user input or on
+     * `await_condition`) receives no `updated_at` bumps while parked,
+     * so it is indistinguishable from a dead process's leftover row
+     * without a process-ownership column.  Closing a live parked
+     * session breaks resumption; leaving a dead parked session only
+     * costs a stale "Standby" pill until it is cleaned up manually.
+     */
+    private val reconcilableStates: Set<String> = setOf(
         RuntimeState.RUNNING.wire(),
-        RuntimeState.STANDBY.wire(),
         RuntimeState.MSGHANDLE.wire(),
         RuntimeState.CANCELLING.wire(),
     )
@@ -211,13 +243,26 @@ class AgentSessionReconciler(
         var reconciled = 0
         var failed = 0
 
+        val nowMs = System.currentTimeMillis()
+        var skippedFresh = 0
+
         for (s in sessions) {
             scanned++
             val current = s.runtimeState?.lowercase()
-            if (current == null || current !in nonTerminalStates) continue
+            if (current == null || current !in reconcilableStates) continue
             // Skip the empty-string case too — that's how the
             // daemon encodes "no value" for legacy rows.
             if (current.isBlank()) continue
+
+            // Ownership proxy: only rows frozen for longer than the
+            // staleness window can belong to a dead process.  Rows
+            // without a parseable timestamp are SKIPPED — never close
+            // what we cannot age-verify.
+            val updatedMs = parseDbTimestamp(s.updatedAt)
+            if (updatedMs == null || nowMs - updatedMs < staleMinutes * 60_000L) {
+                skippedFresh++
+                continue
+            }
 
             val reason = buildClosingReason(
                 tag = reasonTag,
@@ -274,15 +319,40 @@ class AgentSessionReconciler(
         if (reconciled > 0 || failed > 0) {
             logger.info(
                 "AgentSessionReconciler[$reasonTag]: done — scanned=$scanned, " +
-                    "reconciled=$reconciled, failed=$failed"
+                    "reconciled=$reconciled, failed=$failed, " +
+                    "skippedFresh=$skippedFresh (live or unverifiable, left alone)"
             )
         } else {
             logger.info(
                 "AgentSessionReconciler[$reasonTag]: done — scanned=$scanned, " +
-                    "no stale sessions found"
+                    "no stale sessions found (skippedFresh=$skippedFresh)"
             )
         }
         return report
+    }
+
+    /**
+     * Parse the daemon's `timestamptz` text form (e.g.
+     * `2026-08-14 19:00:00.123456+08`) to epoch milliseconds.
+     * Returns `null` on any parse failure — callers must treat an
+     * unparseable timestamp as "not stale" (never close what we
+     * cannot age-verify).
+     */
+    private fun parseDbTimestamp(s: String?): Long? {
+        if (s.isNullOrBlank()) return null
+        val t = s.trim()
+        return runCatching {
+            java.time.OffsetDateTime.parse(t.replace(' ', 'T'), DB_TS_FORMAT)
+                .toInstant().toEpochMilli()
+        }.getOrElse {
+            // Fallback: no offset present — take the wall-clock part as UTC.
+            runCatching {
+                val m = Regex("""^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})""").find(t)
+                    ?: return null
+                java.time.LocalDateTime.parse("${m.groupValues[1]}T${m.groupValues[2]}")
+                    .toInstant(java.time.ZoneOffset.UTC).toEpochMilli()
+            }.getOrNull()
+        }
     }
 
     /**
@@ -329,4 +399,30 @@ class AgentSessionReconciler(
         val deduped: Boolean,
         val dbError: String? = null,
     )
+
+    companion object {
+        /**
+         * Default staleness window (minutes).  Must exceed the longest
+         * expected single tool call (angr explorations can run for tens
+         * of minutes without appending a session message).
+         */
+        const val DEFAULT_STALE_MINUTES: Long = 90L
+
+        /** PostgreSQL `timestamptz` text format with optional fraction and offset. */
+        private val DB_TS_FORMAT = java.time.format.DateTimeFormatterBuilder()
+            .appendPattern("yyyy-MM-dd'T'HH:mm:ss")
+            .optionalStart()
+            .appendFraction(java.time.temporal.ChronoField.NANO_OF_SECOND, 0, 9, true)
+            .optionalEnd()
+            .optionalStart()
+            .appendOffset("+HH:MM", "")
+            .optionalEnd()
+            .toFormatter()
+
+        /** Read the staleness window from `AKIBA_AGENT_RECONCILE_STALE_MINUTES`. */
+        private fun defaultStaleMinutes(): Long =
+            System.getenv("AKIBA_AGENT_RECONCILE_STALE_MINUTES")
+                ?.trim()?.toLongOrNull()?.takeIf { it > 0 }
+                ?: DEFAULT_STALE_MINUTES
+    }
 }

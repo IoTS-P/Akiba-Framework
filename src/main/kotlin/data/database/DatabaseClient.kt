@@ -260,6 +260,23 @@ class DatabaseClient(
         return@runBlocking (jacksonObjectMapper().readValue(response) as? List<Map<String, Any?>>) ?: emptyList()
     }
 
+    /**
+     * Delete binaries (and their FK-cascaded rows) by id list.
+     *
+     * @param ids Binary ids to delete; unknown ids are skipped by the daemon.
+     * @return The ids that were actually deleted.
+     */
+    @Throws(DatabaseDaemonException::class)
+    fun deleteBinaries(ids: List<Long>): List<Long> = runBlocking {
+        val response = post("/delete/binaries", mapOf("ids" to ids)).let {
+            if (it.first == HttpStatusCode.OK)
+                it.second
+            else
+                throw DatabaseDaemonException(it.first, it.first.description)
+        }
+        return@runBlocking jacksonObjectMapper().readValue<List<Long>>(response)
+    }
+
     @Throws(DatabaseDaemonException::class)
     fun getModuleData(id: Long, tableName: String, columns: List<String>?): Map<String, Any?> = runBlocking {
         val data = mapOf(

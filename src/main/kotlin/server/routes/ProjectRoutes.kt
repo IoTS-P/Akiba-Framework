@@ -456,6 +456,134 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "Failed to export workspace: ${e.message}"))
         }
     }
+
+    /**
+     * List the agent sessions that worked on a project. Top-level
+     * sessions only — sub-agents are reachable through their parent's
+     * tree export. Requires an instance selection (sessions live in the
+     * daemon DB, not on disk).
+     */
+    get("/projects/{name}/sessions") {
+        val projectName = call.parameters["name"]
+            ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
+        if (!isValidProjectName(projectName)) {
+            return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name: $projectName"))
+        }
+        val instance = call.requireInstanceHeader() ?: return@get
+        try {
+            val sessions = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                AgentDatabaseClient(dbClient)
+                    .listSessions(limit = 1000)
+                    .filter { it.projectName == projectName }
+                    .map {
+                        mapOf(
+                            "sessionId" to it.sessionId,
+                            "sessionName" to it.sessionName,
+                            "status" to it.status,
+                            "modelName" to it.modelName,
+                            "createdAt" to it.createdAt,
+                        )
+                    }
+            }
+            call.respond(mapOf("sessions" to sessions))
+        } catch (e: Exception) {
+            logger.error("[project sessions] failed for '$projectName': ${e.message}", e)
+            call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "Failed to list sessions: ${e.message}"))
+        }
+    }
+
+    /**
+     * Batch-export agent sessions of a project as a ZIP of Markdown
+     * documents. Body: `{ "sessionIds": ["<uuid>", ...] }`. Each entry
+     * is the full agent-TREE export (root session + sub-agents) for one
+     * selected session. Sessions whose project does not match the path
+     * parameter are skipped (ownership check), and sessions that fail
+     * mid-export produce a small `.error.txt` entry instead of aborting
+     * the whole archive.
+     */
+    post("/projects/{name}/export_sessions") {
+        val projectName = call.parameters["name"]
+            ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
+        if (!isValidProjectName(projectName)) {
+            return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name: $projectName"))
+        }
+        val instance = call.requireInstanceHeader() ?: return@post
+
+        val body = try {
+            val text = call.receiveText()
+            if (text.isBlank()) null
+            else projectTextExportMapper.readValue(text, Map::class.java)
+        } catch (e: Exception) {
+            return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid request body: expected {\"sessionIds\": [...]}"))
+        }
+        val sessionIds = (body?.get("sessionIds") as? List<*>)?.filterIsInstance<String>().orEmpty()
+            .map { it.trim() }
+            .filter { it.matches(Regex("[0-9a-fA-F-]{36}")) }
+            .distinct()
+        if (sessionIds.isEmpty()) {
+            return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "No valid session ids supplied"))
+        }
+        if (sessionIds.size > 200) {
+            return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Too many sessions: ${sessionIds.size} (max 200)"))
+        }
+
+        try {
+            val baos = ByteArrayOutputStream()
+            var exported = 0
+            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                val agentDbClient = AgentDatabaseClient(dbClient)
+                // Ownership set from session/list (which reliably carries
+                // projectName): never export a session belonging to a
+                // different project through this endpoint.
+                val ownedIds = agentDbClient.listSessions(limit = 1000)
+                    .filter { it.projectName == projectName }
+                    .map { it.sessionId }
+                    .toSet()
+                ZipOutputStream(baos).use { zos ->
+                    val usedNames = mutableSetOf<String>()
+                    for (id in sessionIds) {
+                        if (id !in ownedIds) continue
+                        val info = try {
+                            agentDbClient.getSession(id)
+                        } catch (e: Exception) {
+                            logger.warn("[export_sessions] session $id not readable: ${e.message}")
+                            null
+                        } ?: continue
+
+                        val base = safeZipSegment(info.sessionName ?: "session").take(40)
+                        var entryName = "${base}_${id.take(8)}.md"
+                        var n = 2
+                        while (!usedNames.add(entryName)) entryName = "${base}_${id.take(8)}_$n.md".also { n++ }
+
+                        val md = try {
+                            renderTreeExport(agentDbClient, info)
+                        } catch (e: Exception) {
+                            logger.warn("[export_sessions] tree export failed for $id: ${e.message}")
+                            entryName = entryName.removeSuffix(".md") + ".error.txt"
+                            "Failed to export session $id: ${e.message}\n"
+                        }
+                        zos.putNextEntry(ZipEntry(entryName))
+                        zos.write(md.toByteArray(Charsets.UTF_8))
+                        zos.closeEntry()
+                        exported++
+                    }
+                }
+            }
+            if (exported == 0) {
+                return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "None of the supplied sessions belong to project '$projectName'"))
+            }
+            call.response.header(
+                HttpHeaders.ContentDisposition,
+                ContentDisposition.Attachment.withParameter(
+                    ContentDisposition.Parameters.FileName, "$projectName-sessions.zip"
+                ).toString()
+            )
+            call.respondBytes(baos.toByteArray(), ContentType.Application.Zip)
+        } catch (e: Exception) {
+            logger.error("[export_sessions] failed for '$projectName': ${e.message}", e)
+            call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "Failed to export sessions: ${e.message}"))
+        }
+    }
      /*
      * The implementation mirrors Ghidra's own `ArchiveTask.writeProject`
      * (see `ghidra/app/plugin/core/archive/ArchiveTask.java` in the upstream

@@ -199,6 +199,15 @@ object ProgramManager {
     }
 
     private fun setSkipList() {
+        // Manual-agent workers (one throwaway JVM per interactive chat
+        // turn) must ALWAYS run the turn: after the first turn succeeds,
+        // its binary's log dir lives under success/, so the batch-mode
+        // skip-list would silently no-op every subsequent chat turn on
+        // the same session (worker exits 0 without producing messages).
+        if (System.getenv("AKIBA_MANUAL_AGENT") == "1") {
+            skipList = mutableListOf()
+            return
+        }
         if (Main.restoreFailedOnly) {
             val whiteList = failedDir.toFile().listFiles()?.map {
                 it.name.toInt()
@@ -916,7 +925,17 @@ object ProgramManager {
         val options = program.getOptions("Analyzers")
         extraAnalyzerOptions.let {
             it.forEach { (optionName, optionValue) ->
-                check(options.contains(optionName)) { "Option $optionName not found in analyzer options" }
+                // Some analyzers only exist for specific languages (e.g.
+                // "Aggressive Instruction Finder" is x86-only).  A missing
+                // option simply does not apply to this program — skip it
+                // instead of failing the whole analysis.
+                if (!options.contains(optionName)) {
+                    globalLogger.debug(
+                        "Analyzer option '$optionName' not present for " +
+                            "${program.languageID}; skipped"
+                    )
+                    return@forEach
+                }
                 check(options.getType(optionName).isCompatible(optionValue)) {
                     "Option $optionName value type $optionValue unmatched"
                 }

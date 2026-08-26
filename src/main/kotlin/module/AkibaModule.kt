@@ -283,21 +283,28 @@ abstract class AkibaModule (
     /**
      * Resolve the Ghidra [Program] for a given binary [targetId].
      *
-     * This encapsulates the common pattern (shown in `AkibaExample4`)
-     * of computing the program name as `"<id>-<filename>"` and opening
-     * it from the project root. If the project has no program matching
-     * the expected name, `null` is returned.
+     * Programs in the project root are named `"<id>-<name>"`, but
+     * `<name>` differs by import path: pipeline-imported binaries use
+     * `"<id>-<id>.bin"` (see `ProgramManager`), while module imports
+     * via [importFile] keep the ORIGINAL file name (e.g.
+     * `"13-libnotecore.so"`, see `ImportManager.importSingleFile`).
+     * Reconstructing the full name from the stored `.bin` file is
+     * therefore unreliable — instead we scan the project root for the
+     * `"<id>-"` prefix (same convention as the restore-mode lookup in
+     * `ProgramManager`).  If no program matches, `null` is returned.
      *
      * @param targetId The binary ID whose program should be opened.
      * @return The resolved [Program], or `null` if not found.
      */
     fun getProgram(targetId: Int): Program? {
         val project = WorkspaceManager.project
-        val file = File("${mainConf.binariesRoot}/processed/$targetId.bin")
-            .let { if (it.exists()) it else File("${mainConf.binariesRoot}/original/$targetId.bin") }
-        if (!file.exists()) return null
-
-        val programName = "$targetId-${file.name}"
+        val programName = try {
+            project.projectData.rootFolder.files.firstOrNull {
+                it.name.startsWith("$targetId-")
+            }?.name
+        } catch (_: Exception) {
+            null
+        } ?: return null
         return try {
             project.openProgram("/", programName, false)
         } catch (_: Exception) {
@@ -802,6 +809,15 @@ abstract class AkibaModule (
                 runtimeReport?.recordTraceback(moduleTracebackOf(e))
                 if (hasTable)
                     updateErr("Process error: $detail")
+            } finally {
+                // Flush queued cross-process stream chunks before this
+                // worker JVM exits.  The chunk sender thread is a
+                // daemon, so without this drain the response TAIL and
+                // the `done` marker can be discarded at process exit —
+                // the browser then shows the final answer truncated.
+                runCatching {
+                    org.iotsplab.akiba.llm.agent.StreamingChunkPusher.awaitQuiescence(3_000)
+                }
             }
         }
 

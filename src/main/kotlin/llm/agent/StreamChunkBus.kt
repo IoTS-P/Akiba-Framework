@@ -105,6 +105,26 @@ object StreamChunkBus {
     }
 
     /**
+     * Terminate the current generation WITHOUT appending a chunk.
+     * Used when the producer (worker JVM) was killed externally — e.g.
+     * the user cancelled the chat turn — and will therefore never
+     * publish its own terminal chunk.  Polling clients then see
+     * `done=true` + [error] and end the streaming bubble (interrupted
+     * marker) instead of stalling on "waiting for model…" forever.
+     *
+     * No-op when the session has no history (nothing was ever
+     * streamed) or the current generation already finished.
+     */
+    fun finish(sessionId: String, error: String?) {
+        val hist = histories[sessionId] ?: return
+        synchronized(hist.lock) {
+            if (hist.done) return
+            hist.done = true
+            hist.error = error
+        }
+    }
+
+    /**
      * Return every chunk with `chunkCount > since` for [sessionId],
      * or null when the session has no streaming history at all.
      */

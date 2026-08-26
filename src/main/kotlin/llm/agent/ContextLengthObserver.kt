@@ -36,7 +36,18 @@ object ContextLengthObserver {
         File(System.getProperty("user.home"), ".akiba/model_context_bounds.json")
     }
 
-    private data class BoundEntry(val bound: Int, val updatedAt: Long)
+    private data class BoundEntry(
+        val bound: Int,
+        val updatedAt: Long,
+        /**
+         * Exact window size stated by the provider's overflow error
+         * ("maximum context length is N tokens"), when one was seen.
+         * Unlike [bound] (a proven-safe lower bound), this is the true
+         * window — providers count prompt + requested output tokens
+         * against it.
+         */
+        val providerLimit: Int? = null,
+    )
 
     /** Key: "<provider>/<modelName>". */
     private val bounds = ConcurrentHashMap<String, BoundEntry>()
@@ -57,7 +68,8 @@ object ContextLengthObserver {
             raw.forEach { (key, value) ->
                 val bound = (value["bound"] as? Number)?.toInt()
                 val updatedAt = (value["updatedAt"] as? Number)?.toLong() ?: 0L
-                if (bound != null && bound > 0) bounds[key] = BoundEntry(bound, updatedAt)
+                val providerLimit = (value["providerLimit"] as? Number)?.toInt()
+                if (bound != null && bound > 0) bounds[key] = BoundEntry(bound, updatedAt, providerLimit)
             }
             logger.info("Loaded observed context bounds for ${bounds.size} model(s) from ${boundsFile.name}")
         } catch (e: Exception) {
@@ -77,10 +89,40 @@ object ContextLengthObserver {
         val k = key(provider, modelName)
         val previous = bounds[k]
         if (previous != null && previous.bound >= promptTokens) return
-        bounds[k] = BoundEntry(promptTokens, System.currentTimeMillis())
+        bounds[k] = BoundEntry(promptTokens, System.currentTimeMillis(), previous?.providerLimit)
         if (previous == null || promptTokens - previous.bound >= PERSIST_MIN_DELTA) {
             persist()
         }
+    }
+
+    /**
+     * Record the exact window size stated by a provider's overflow
+     * error. This is precise ground truth, so it is kept even when it
+     * is below the current lower bound (the lower bound was recorded
+     * from a prompt the provider counted differently, or the provider
+     * changed its serving configuration).
+     */
+    fun recordProviderLimit(provider: LLMProvider, modelName: String, limit: Int) {
+        if (limit <= 0) return
+        ensureLoaded()
+        val k = key(provider, modelName)
+        val previous = bounds[k]
+        if (previous?.providerLimit == limit) return
+        bounds[k] = BoundEntry(
+            bound = previous?.bound ?: 0,
+            updatedAt = System.currentTimeMillis(),
+            providerLimit = limit,
+        )
+        persist()
+    }
+
+    /**
+     * The exact provider-stated window size for the model, or null
+     * when no overflow error has revealed it yet.
+     */
+    fun providerLimit(provider: LLMProvider, modelName: String): Int? {
+        ensureLoaded()
+        return bounds[key(provider, modelName)]?.providerLimit
     }
 
     /**
@@ -99,7 +141,11 @@ object ContextLengthObserver {
             if (!dir.exists() && !dir.mkdirs()) return
             val tmp = File(dir, boundsFile.name + ".tmp")
             val out = bounds.mapValues { (_, e) ->
-                mapOf("bound" to e.bound, "updatedAt" to e.updatedAt)
+                mapOf(
+                    "bound" to e.bound,
+                    "updatedAt" to e.updatedAt,
+                    "providerLimit" to e.providerLimit,
+                )
             }
             mapper.writerWithDefaultPrettyPrinter().writeValue(tmp, out)
             if (!tmp.renameTo(boundsFile)) {

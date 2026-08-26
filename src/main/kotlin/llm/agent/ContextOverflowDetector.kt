@@ -85,6 +85,18 @@ object ContextOverflowDetector {
         return null
     }
 
+    /** "maximum context length is 131072 tokens" → 131072. */
+    private val PROVIDER_LIMIT_PATTERN =
+        Regex("maximum context length is (\\d+) tokens", RegexOption.IGNORE_CASE)
+
+    /**
+     * Extract the exact context-window size from a provider overflow
+     * error, when the error text states it. Returns null when the
+     * provider did not name a number.
+     */
+    fun extractProviderLimit(e: Throwable): Int? =
+        PROVIDER_LIMIT_PATTERN.find(collectMessages(e))?.groupValues?.get(1)?.toIntOrNull()
+
     /**
      * Whether [e] is a provider context-length rejection.
      * Exclusions are evaluated first: a rate-limit/quota error is never

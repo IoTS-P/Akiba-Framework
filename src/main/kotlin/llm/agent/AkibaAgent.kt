@@ -860,17 +860,34 @@ class AkibaAgent(
         memory.messages().sumOf { client.estimateTokenCount(it.content) }
 
     /**
-     * The observed-proven safe size for this model ([ContextLengthObserver]
-     * lower bound × [errorRecoverySafetyFactor]), or null when nothing has
-     * been observed yet. Used ONLY as the compaction TARGET after a
-     * suspected overflow — never as a pre-emptive cap: capping at the
-     * bound would lock exploration (context never grows past it → no
-     * larger prompt is ever attempted → the bound can never rise), and a
-     * 1M-window model would get stuck at whatever size was observed first.
+     * The observed-proven safe size for this model, or null when nothing
+     * has been observed yet. Two information sources are combined:
+     *  - [ContextLengthObserver.bound]: largest accepted prompt ×
+     *    [errorRecoverySafetyFactor] (empirical lower bound).
+     *  - [ContextLengthObserver.providerLimit]: the exact window the
+     *    provider named in an overflow error, minus the requested output
+     *    reservation and a margin — providers count prompt +
+     *    max_output_tokens against the window, so a prompt at the raw
+     *    limit is still rejected.
+     *
+     * Used ONLY as the compaction TARGET after a suspected overflow —
+     * never as a pre-emptive cap: capping at the bound would lock
+     * exploration (context never grows past it → no larger prompt is
+     * ever attempted → the bound can never rise), and a 1M-window model
+     * would get stuck at whatever size was observed first.
      */
-    private fun observedCap(): Int? =
-        ContextLengthObserver.bound(client.config.provider, client.config.modelName)
+    private fun observedCap(): Int? {
+        val lower = ContextLengthObserver.bound(client.config.provider, client.config.modelName)
             ?.let { (it * errorRecoverySafetyFactor).toInt().coerceAtLeast(1) }
+        val exact = ContextLengthObserver.providerLimit(client.config.provider, client.config.modelName)
+            ?.let { limit ->
+                (limit - (client.config.maxTokens ?: 8192) - 2048).coerceAtLeast(1)
+            }
+        return when {
+            lower != null && exact != null -> minOf(lower, exact)
+            else -> lower ?: exact
+        }
+    }
 
     /**
      * Compact the conversation history if the estimated token count exceeds
@@ -998,15 +1015,16 @@ class AkibaAgent(
      * 2. [compact]: summarising compaction. Its summary request is
      *    itself an LLM call that can fail when the context is already
      *    over-length, so failure here does not abort the LLM-free stages.
-     * 3. [dropOldestRound] (LLM-free): shed oldest rounds one at a time.
-     *    With an observed bound ([observedCap]) this repeats until the
-     *    context fits the proven-safe size, dipping below
-     *    [compactKeepRounds] if necessary; without a bound, one round is
-     *    shed per invocation so each overflow retry sheds a bit more
-     *    history rather than giving up after the first drop.
-     * 4. [truncateOversizedMessages] (LLM-free, last resort): when even
-     *    a single surviving message exceeds the bound on its own (e.g.
-     *    a huge payload in the latest user message), hard-truncate it.
+     * 3. [dropOldestRound] (LLM-free): with an observed bound
+     *    ([observedCap]), shed oldest rounds until the context fits the
+     *    proven-safe size, dipping below [compactKeepRounds] if
+     *    necessary.
+     * 4. Minimum-shed guarantee (LLM-free): whenever the earlier stages
+     *    saved less than [OVERFLOW_DROP_MIN_TOKENS] (bound unknown, or
+     *    our token estimate disagrees with the provider's), oldest
+     *    rounds totalling at least the shortfall are dropped via
+     *    [dropOldestRoundsForTokens]; when no rounds remain to drop,
+     *    [truncateOversizedMessages] shrinks the survivors directly.
      *
      * The observed bound itself is never lowered here: failures may be
      * transient, so the cap stays dynamic.
@@ -1014,6 +1032,7 @@ class AkibaAgent(
      * @return true if the context was actually reduced.
      */
     fun forceCompactForOverflow(): Boolean {
+        val tokensAtEntry = currentContextTokens()
         var reduced = false
 
         if (pruneToolOutputsInMemory()) reduced = true
@@ -1038,10 +1057,55 @@ class AkibaAgent(
             if (currentContextTokens() > target && truncateOversizedMessages(target)) {
                 reduced = true
             }
-        } else if (!reduced) {
-            reduced = dropOldestRound()
+        }
+
+        // Guaranteed minimum shed: if the stages above saved less than
+        // OVERFLOW_DROP_MIN_TOKENS (bound unknown, or our estimator
+        // disagrees with the provider's count and thinks we are already
+        // under the bound), drop oldest rounds totalling at least the
+        // shortfall.  Dropping a fixed NUMBER of rounds is unreliable —
+        // a round can be a few hundred tokens while the provider's
+        // rejection margin is typically several thousand.
+        val shortfall = OVERFLOW_DROP_MIN_TOKENS - (tokensAtEntry - currentContextTokens())
+        if (shortfall > 0) {
+            if (dropOldestRoundsForTokens(shortfall)) {
+                reduced = true
+            } else if (!reduced) {
+                // Nothing left to drop (a single round remains): shrink
+                // the surviving oversized messages directly.
+                val fallbackTarget = (currentContextTokens() / 2)
+                    .coerceAtLeast(OVERFLOW_DROP_MIN_TOKENS)
+                reduced = truncateOversizedMessages(fallbackTarget)
+            }
         }
         return reduced
+    }
+
+    /**
+     * Drop oldest conversation rounds until at least [minTokens]
+     * (estimated) have been removed, always keeping the newest round.
+     * Companion of [dropOldestRound] for callers that know how much
+     * they need to save rather than how many rounds to drop.
+     *
+     * @return true if any round was dropped.
+     */
+    private fun dropOldestRoundsForTokens(minTokens: Int): Boolean {
+        var shedTokens = 0
+        var droppedAny = false
+        var guard = 0
+        while (shedTokens < minTokens && guard++ < 50) {
+            val before = currentContextTokens()
+            if (!dropOldestRound()) break
+            droppedAny = true
+            shedTokens += before - currentContextTokens()
+        }
+        if (droppedAny) {
+            logger.warn(
+                "Emergency token-driven drop: discarded oldest rounds totalling " +
+                    "~$shedTokens tokens (requested minimum $minTokens)."
+            )
+        }
+        return droppedAny
     }
 
     /**
@@ -1182,6 +1246,11 @@ class AkibaAgent(
         for (i in flat.indices.reversed()) {
             val m = flat[i]
             if (m.role != "tool") continue
+            // Already a placeholder from an earlier prune — replacing it
+            // with an identical placeholder is not progress and must not
+            // count towards prunedCount (otherwise the overflow-recovery
+            // loop reports "reduced" forever without shrinking anything).
+            if (m.content.startsWith("[tool output pruned")) continue
             val tokens = client.estimateTokenCount(m.content)
             if (budget > 0) {
                 budget -= tokens

@@ -1035,14 +1035,19 @@ abstract class AgentModule(
             logger.warn("Bundled script installation failed: ${e.message}")
         }
 
-        // 1. Create agent session
+        // 1. Create agent session.  When this module runs inside a
+        //    workflow subprocess, the workflow's run id is propagated via
+        //    the AKIBA_WORKFLOW_ID env var (set by WorkflowRoutes) so the
+        //    session — and, by daemon-side inheritance, all its child
+        //    sessions — can be grouped by workflow in the UI.
         val sessionId = try {
             agentDbClient.createSession(
                 sessionName = "${this.javaClass.simpleName}-$id",
                 binaryId = id,
                 moduleName = this.javaClass.simpleName,
                 modelName = resolveModelName(),
-                projectName = WorkspaceManager.activeProjectName
+                projectName = WorkspaceManager.activeProjectName,
+                workflowId = System.getenv("AKIBA_WORKFLOW_ID")?.takeIf { it.isNotBlank() }
             )
         } catch (e: Exception) {
             logger.warn("Failed to create agent session: ${e.message}")

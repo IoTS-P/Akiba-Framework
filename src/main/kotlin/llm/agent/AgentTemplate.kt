@@ -197,6 +197,17 @@ data class BudgetPolicy(
 data class InteractionPolicy(
     /** Lifecycle after the primary task finishes. See [Lifecycle]. */
     val lifecycle: Lifecycle = Lifecycle.ONE_SHOT,
+    /**
+     * STANDBY children only: when true (default), the child parks
+     * immediately at spawn WITHOUT running its initial task prompt and
+     * waits for the first mailbox message (e.g. a request-driven worker
+     * such as AndroidAnalyzer's native analyzer).  When false, the
+     * child runs its initial task prompt first — required when the
+     * spawn-time inputs already assign real work (e.g. the Java
+     * analyzer's file list) — and only parks when it later calls
+     * `await_condition`.  Ignored for ONE_SHOT lifecycle.
+     */
+    val coldStart: Boolean = true,
     /** Child may send mailbox messages to its direct parent. */
     val canSendToParent: Boolean = true,
     /** Parent may send mailbox messages to its direct children. */

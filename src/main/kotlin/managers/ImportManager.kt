@@ -96,6 +96,57 @@ object ImportManager {
         IllegalStateException("Duplicate checksum: $checksum")
 
     /**
+     * Re-materialize the Ghidra [Program] for a binary that is ALREADY
+     * registered in the database ([binaryId]) but has no program file
+     * in the CURRENT project.
+     *
+     * This happens when the duplicate-checksum path maps a file to an
+     * existing database id whose program was created under a DIFFERENT
+     * (since deleted/recreated) Ghidra project: the DB row persists,
+     * but the current project's root folder has no `"<id>-*"` file, so
+     * every `getProgram(binaryId)` prefix scan comes up empty.
+     *
+     * No database rows are written.  The program is saved under the
+     * standard `"<binaryId>-<fileName>"` name so the usual prefix-scan
+     * lookup finds it afterwards.  Auto-analysis runs BEFORE saving,
+     * mirroring [importSingleFile].
+     *
+     * @return true when a program for [binaryId] exists in the current
+     *         project afterwards (already present or newly created).
+     */
+    fun reimportProgramIntoProject(originalPath: Path, binaryId: Long): Boolean {
+        require(originalPath.exists() && originalPath.isRegularFile()) {
+            "File not found or not a regular file: $originalPath"
+        }
+
+        // Already present in this project — nothing to do.
+        if (project.projectData.rootFolder.files.any { it.name.startsWith("$binaryId-") }) {
+            return true
+        }
+
+        val program = ProgramManager.tryCreateProgramWithAutoDetect(project, originalPath)
+            ?: ProgramManager.tryCreateProgramWithoutLang(project, originalPath)
+            ?: return false
+        return try {
+            autoAnalyzeInTimeout(program, mainConf.autoAnalysisTimeout)
+            val txId = program.startTransaction("rename")
+            program.name = "$binaryId-${originalPath.fileName}"
+            program.endTransaction(txId, true)
+            project.saveAs(program, "/", program.name, false)
+            globalLogger.info(
+                "Re-imported $originalPath into the current project as ${program.name} " +
+                    "(binary id=$binaryId already registered in the database)"
+            )
+            true
+        } catch (e: Exception) {
+            globalLogger.warn("Failed to re-import $originalPath into the current project: ${e.message}")
+            false
+        } finally {
+            runCatching { project.close(program) }
+        }
+    }
+
+    /**
      * Import a single binary file into the project and register it in the database.
      *
      * This is the runtime/single-file counterpart of [import] (which iterates the import config
@@ -143,7 +194,12 @@ object ImportManager {
 
         // If Ghidra can automatically detect the file format, import directly and insert it to database
         ProgramManager.tryCreateProgramWithAutoDetect(project, originalPath)?.let {
-            // Ghidra successfully identified the binary format, import directly
+            // Ghidra successfully identified the binary format, import directly.
+            // Auto-analyze BEFORE saving: without analysis the program's
+            // function manager is empty and every downstream function
+            // lookup (JNI exports, decompile, xrefs, script_library runs)
+            // comes up empty.  Symmetric with the arch-specified path below.
+            autoAnalyzeInTimeout(it, mainConf.autoAnalysisTimeout)
             val id = db.insertBinary(
                 DatabaseClient.InsertData(
                     originalPath = originalPath.absolutePathString(),

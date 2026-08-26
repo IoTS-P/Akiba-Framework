@@ -105,6 +105,11 @@ object WorkflowManager {
                 // fullEnv.putAll(System.getenv())
                 fullEnv["AKIBA_PROGRESS_URL"] = progressUrl
                 fullEnv["AKIBA_PROGRESS_TOKEN"] = progressToken
+                // Propagate the workflow run id so agent sessions created by
+                // module runs inside this subprocess can tag themselves with
+                // it (read by AgentModule.startProcess; inherited by child
+                // sessions at the daemon level).
+                fullEnv["AKIBA_WORKFLOW_ID"] = workflowId
 
                 // Resolve LLM API key from the saved config if present.
                 // The frontend sets "llm.apiKeyEnv" to the first 8 hex chars
@@ -285,7 +290,9 @@ object WorkflowManager {
 
         // The subprocess has been killed. Reconcile any agent sessions
         // that are still non-terminal — the process did not get a chance
-        // to close them cleanly.
+        // to close them cleanly.  Scoped to sessions owned by THIS
+        // workflow (exact workflow_id attribution) so parallel
+        // workflows are not affected.
         if (daemonInfo != null) {
             reconcileAgentSessions(daemonInfo, workflowId, "workflow_stopped")
         }
@@ -298,31 +305,35 @@ object WorkflowManager {
     fun getAllWorkflowStatuses(): List<WorkflowStatusEntry> = workflowStatuses.values.toList()
 
     /**
-     * Close every non-terminal agent session whose owning workflow
-     * process has just exited or been stopped.
+     * Close non-terminal agent sessions owned by the workflow process
+     * that has just been stopped.
      *
-     * The `agent_sessions` table has no `workflow_id` column, so we
-     * cannot precisely associate a session with a specific workflow.
-     * Instead, we close **all** non-terminal, non-chat sessions —
-     * this is safe because:
+     * Session→workflow attribution is EXACT: every module-spawned
+     * session carries `agent_sessions.workflow_id` (propagated through
+     * the `AKIBA_WORKFLOW_ID` env var set at workflow launch, and
+     * inherited by child sessions at the daemon level), so cleanup only
+     * touches rows whose `workflow_id` equals [workflowId].  Stopping
+     * one workflow can therefore never flip another PARALLEL workflow's
+     * live agents to `closed` — the previous creation-window heuristic
+     * did exactly that whenever two workflows overlapped in time.
      *
-     *  1. In practice only one workflow runs at a time per instance.
-     *  2. Even if multiple workflows were running, a session whose
-     *     process is still alive will simply be re-opened by that
-     *     process on its next state transition (the daemon's
-     *     `set_runtime_state` route accepts `running` → `closed` →
-     *     `running` transitions for sessions in the same process).
+     * Legacy rows with a NULL `workflow_id` (interactive sessions and
+     * anything spawned before the column existed) are deliberately left
+     * alone; the startup-time AgentSessionReconciler reaps them once
+     * their `updated_at` goes stale.
      *
      * The [reasonTag] is embedded in the `closing_reason` column so
-     * an operator can tell whether the session was closed by a normal
-     * workflow exit (`"workflow_exited"`) or by a user-initiated stop
-     * (`"workflow_stopped"`).
+     * an operator can tell the trigger (e.g. `"workflow_stopped"`).
      *
      * Failures are logged at WARN and never thrown — the workflow
      * itself has already exited/stopped; the session cleanup is
      * best-effort.
      */
-    private fun reconcileAgentSessions(info: DaemonInfo, workflowId: String, reasonTag: String) {
+    private fun reconcileAgentSessions(
+        info: DaemonInfo,
+        workflowId: String,
+        reasonTag: String,
+    ) {
         try {
             withDaemonSession(info.host, info.port, info.instance) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
@@ -330,6 +341,7 @@ object WorkflowManager {
                     status = null,
                     binaryId = null,
                     moduleName = null,
+                    workflowId = workflowId,
                     limit = 500,
                     offset = 0,
                     parentSessionId = "ALL",
@@ -368,7 +380,7 @@ object WorkflowManager {
                 if (closed > 0) {
                     logger.info(
                         "reconcileAgentSessions[$workflowId]: closed $closed stale " +
-                            "agent session(s) ($reasonTag)"
+                            "agent session(s) ($reasonTag, workflow_id scoped)"
                     )
                 }
             }
@@ -379,6 +391,7 @@ object WorkflowManager {
             )
         }
     }
+
 }
 
 // Reuse the script finder from FileRoutes

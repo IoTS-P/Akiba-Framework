@@ -73,6 +73,8 @@ data class AgentSessionResponse(
     val modelName: String?,
     val projectName: String?,
     val moduleName: String?,
+    /** Workflow run that spawned this session (null for interactive sessions). */
+    val workflowId: String? = null,
     val createdAt: String?,
     val updatedAt: String?,
     val parentSessionId: String? = null,
@@ -218,7 +220,14 @@ data class ChatRequest(
     /** Free-form user message. */
     val content: String,
     /** Optional system prompt override (only respected on the first turn). */
-    val systemPrompt: String? = null
+    val systemPrompt: String? = null,
+    /**
+     * Optional model override for this and subsequent turns.  When it
+     * differs from the session's stored model, the session row is
+     * updated first so the switch survives restarts — a session keeps
+     * using one model until the user explicitly picks another.
+     */
+    val modelName: String? = null
 )
 
 /**
@@ -296,8 +305,13 @@ private object ManualAgentTurnRegistry {
 
 private object ManualAgentProcessRegistry {
     private val processes = ConcurrentHashMap<String, Process>()
+    /** Sessions whose running worker was deliberately killed via /cancel-chat. */
+    private val cancelled = ConcurrentHashMap.newKeySet<String>()
 
     fun put(sessionId: String, process: Process) {
+        // A new turn is starting — drop any stale cancellation marker so
+        // a later, unrelated failure is not misreported as a user cancel.
+        cancelled.remove(sessionId)
         processes[sessionId] = process
     }
 
@@ -307,10 +321,34 @@ private object ManualAgentProcessRegistry {
 
     fun cancel(sessionId: String): Boolean {
         val process = processes.remove(sessionId) ?: return false
+        cancelled.add(sessionId)
         process.destroyForcibly()
+        // End the live stream generation: the killed worker will never
+        // publish its own terminal chunk, so without this the frontend
+        // streaming bubble stalls on "waiting for model…" forever.
+        org.iotsplab.akiba.llm.agent.StreamChunkBus.finish(sessionId, USER_CANCELLED_STREAM_ERROR)
         return true
     }
+
+    /**
+     * True (exactly once) when [sessionId]'s last worker failure was
+     * caused by a user cancel; consumes the marker.
+     */
+    fun consumeCancelled(sessionId: String): Boolean = cancelled.remove(sessionId)
 }
+
+/** Stream-bus error label used when a chat turn is cancelled by the user.
+ *  The frontend recognises this prefix to render a calm "cancelled"
+ *  marker instead of a scary interruption error. */
+private const val USER_CANCELLED_STREAM_ERROR = "cancelled by user"
+
+/**
+ * A manual-agent worker JVM failed (non-zero exit / timeout).  Kept
+ * distinct from [IllegalStateException] (reserved for configuration
+ * problems) so the /chat handler does not prefix a worker crash with
+ * the misleading "Agent is not configured" label.
+ */
+private class ManualAgentWorkerException(message: String) : Exception(message)
 
 private val agentRouteLogger = LogManager.getLogger("AgentRoutes")
 private val agentRouteMapper = jacksonObjectMapper()
@@ -662,6 +700,31 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         }
     }
 
+    // ------ Search sessions by title / message content -------------------------
+    // Returns matching TOP-LEVEL sessions (a sub-agent hit is reported as
+    // its root session).  Used by the Agent view's search box.
+    get("/agent/sessions/search") {
+        val instance = call.requireInstanceHeader() ?: return@get
+        val query = call.parameters["q"]?.trim().orEmpty()
+        if (query.length < 2) {
+            call.respond(HttpStatusCode.BadRequest, mapOf(
+                "error" to "Query too short (min 2 characters)"))
+            return@get
+        }
+        val limit = call.parameters["limit"]?.toIntOrNull()?.coerceIn(1, 200) ?: 50
+        try {
+            val sessions = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                AgentDatabaseClient(dbClient).searchSessions(query, limit)
+            }
+            call.respond(mapOf("sessions" to sessions
+                .filter { it.sessionId != SYSTEM_SESSION_UUID }
+                .map { it.toResponse() }))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
     // ------ Get direct children of a session ----------------------------------
     get("/agent/sessions/{id}/children") {
         val instance = call.requireInstanceHeader() ?: return@get
@@ -892,9 +955,17 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             }
             // Compute cumulative token usage from the messages we already
             // fetched (avoid a second round-trip to the daemon).
+            // Compaction rebuilds persist kept messages as new rows with
+            // their original token counts, so collapse exact duplicate
+            // assistant rows before summing — otherwise a session that
+            // went through many compactions reports inflated usage.
             var totalInput = 0L
             var totalOutput = 0L
+            val seenAssistant = HashSet<String>()
             for (m in filtered) {
+                if (m.role != "assistant") continue
+                val key = "in:${m.inputTokenCount}:out:${m.tokenCount}:len:${m.content?.length}:${m.content}"
+                if (!seenAssistant.add(key)) continue
                 totalInput += m.inputTokenCount ?: 0
                 totalOutput += m.tokenCount ?: 0
             }
@@ -1076,10 +1147,34 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         val projectDirectory = call.currentUserProjectDirectory()
         val serverPort = call.request.local.serverPort
 
+        // Validate a requested model switch against the configured LLM
+        // keys (whitelist) BEFORE touching any session state — an
+        // unknown model is a client error, not a session failure.
+        val requestedModel = req.modelName?.trim()?.takeIf { it.isNotEmpty() }
+        if (requestedModel != null) {
+            val known = LLMKeyFileStore.load().any { entry ->
+                entry.modelNames.any { it.equals(requestedModel, ignoreCase = true) }
+            }
+            if (!known) {
+                call.respond(HttpStatusCode.BadRequest, mapOf(
+                    "error" to "No LLM key configured for model '$requestedModel'"
+                ))
+                return@post
+            }
+        }
+
         try {
             val sessionInfo = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
-                val info = agentDbClient.getSession(id)
+                var info = agentDbClient.getSession(id)
+                // Manual model switch: the chat-page picker follows the
+                // session's stored model; when the user deliberately
+                // picks a different one, persist it BEFORE launching the
+                // worker so this and all later turns use the new model.
+                if (requestedModel != null && !requestedModel.equals(info.modelName, ignoreCase = true)) {
+                    agentDbClient.updateSession(id, modelName = requestedModel)
+                    info = info.copy(modelName = requestedModel)
+                }
                 agentDbClient.updateSession(id, status = "running")
                 agentDbClient.setRuntimeState(
                     id,
@@ -1167,14 +1262,28 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     "output" to (asstMsg.tokenCount ?: 0)
                 )
             ))
-        } catch (e: IllegalStateException) {
-            markManualChatFailed(daemonHost, daemonPort, instance, id, e.message)
-            call.respond(HttpStatusCode.ServiceUnavailable,
-                mapOf("error" to "Agent is not configured: ${e.message}"))
         } catch (e: Exception) {
-            markManualChatFailed(daemonHost, daemonPort, instance, id, e.message)
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
+            when {
+                // The user cancelled this turn via /cancel-chat.  That
+                // endpoint already parked the session in
+                // CLOSED/user_cancelled_chat and terminated the stream
+                // generation — do NOT overwrite the state with a
+                // failure, and do NOT dump the killed worker's log
+                // (exit code + full stdout) into the HTTP response.
+                // Respond 200 so the frontend ends the turn calmly.
+                ManualAgentProcessRegistry.consumeCancelled(id) ->
+                    call.respond(mapOf("status" to "cancelled", "sessionId" to id))
+                e is IllegalStateException -> {
+                    markManualChatFailed(daemonHost, daemonPort, instance, id, e.message)
+                    call.respond(HttpStatusCode.ServiceUnavailable,
+                        mapOf("error" to "Agent is not configured: ${e.message}"))
+                }
+                else -> {
+                    markManualChatFailed(daemonHost, daemonPort, instance, id, e.message)
+                    val (status, body) = errorPayload(e)
+                    call.respond(status, body)
+                }
+            }
         }
     }
 
@@ -1672,7 +1781,7 @@ private data class ExportTreeNode(
  * Cycles are detected via a `seen` set and silently skipped so a malformed
  * hierarchy cannot crash the export.
  */
-private fun renderTreeExport(
+internal fun renderTreeExport(
     agentDbClient: AgentDatabaseClient,
     root: AgentDatabaseClient.SessionInfo
 ): String {
@@ -1878,6 +1987,13 @@ private fun ExportTreeNode.descendantsFlattened(): List<ExportTreeNode> =
  * Compute aggregate statistics for a session by walking its message
  * history. Assistant messages carry `inputTokenCount` / `tokenCount`;
  * tool invocations are messages with `role = "tool"`.
+ *
+ * Context-compaction rebuilds persist kept messages as NEW rows that
+ * carry their original token counts, so a runaway compaction loop can
+ * leave the same logical message duplicated thousands of times in
+ * `agent_messages`. Raw SUMs over the table are therefore meaningless;
+ * this function collapses exact rewrite copies before aggregating:
+ * assistant rows by (content, token counts), tool rows by toolCallId.
  */
 private fun computeSessionStats(
     agentDbClient: AgentDatabaseClient,
@@ -1888,20 +2004,39 @@ private fun computeSessionStats(
     var toolCalls = 0
     var totalMessages = 0
     val toolCounts = HashMap<String, Int>()
+    val seenAssistant = HashSet<String>()
+    val seenToolCalls = HashSet<String>()
     try {
-        // Pull enough messages to cover long-running sessions. We do not
-        // expect more than a few thousand even for sub-agents.
-        val messages = agentDbClient.getMessages(sessionId, 0, 5000)
-        for (m in messages) {
-            totalMessages++
-            if (m.role == "assistant") {
-                inputTokens += m.inputTokenCount ?: 0
-                outputTokens += m.tokenCount ?: 0
-            } else if (m.role == "tool") {
-                toolCalls++
-                val name = m.toolName ?: "unknown"
-                toolCounts.merge(name, 1) { a, b -> a + b }
+        // Paginate through the FULL transcript — a runaway session can
+        // accumulate far more rows than any fixed cap.
+        var nextIndex = 0
+        while (true) {
+            val page = agentDbClient.getMessages(sessionId, nextIndex, AGENT_MESSAGES_PAGE_SIZE)
+            if (page.isEmpty()) break
+            nextIndex = (page.maxOfOrNull { it.messageIndex } ?: nextIndex) + 1
+            for (m in page) {
+                when (m.role) {
+                    "assistant" -> {
+                        val key = "in:${m.inputTokenCount}:out:${m.tokenCount}:len:${m.content?.length}:${m.content}"
+                        if (seenAssistant.add(key)) {
+                            totalMessages++
+                            inputTokens += m.inputTokenCount ?: 0
+                            outputTokens += m.tokenCount ?: 0
+                        }
+                    }
+                    "tool" -> {
+                        val key = m.toolCallId ?: "content:${m.content}"
+                        if (seenToolCalls.add(key)) {
+                            totalMessages++
+                            toolCalls++
+                            val name = m.toolName ?: "unknown"
+                            toolCounts.merge(name, 1) { a, b -> a + b }
+                        }
+                    }
+                    else -> totalMessages++
+                }
             }
+            if (page.size < AGENT_MESSAGES_PAGE_SIZE) break
         }
     } catch (_: Exception) {
         // Best-effort: missing messages yield zeroed stats.
@@ -2095,11 +2230,23 @@ private fun runManualAgentWorker(
     runCatching { Files.deleteIfExists(logFile) }
     if (!finished) {
         process.destroyForcibly()
-        throw IllegalStateException("Manual agent worker timed out after ${MANUAL_AGENT_TIMEOUT_MINUTES} minutes\n$output")
+        agentRouteLogger.warn("Manual agent worker {} timed out after {} minutes. Worker output:\n{}",
+            sessionInfo.sessionId, MANUAL_AGENT_TIMEOUT_MINUTES, output)
+        throw ManualAgentWorkerException(
+            "The agent worker timed out after $MANUAL_AGENT_TIMEOUT_MINUTES minutes. " +
+                "Details were written to the server log.")
     }
     val exitCode = process.exitValue()
     if (exitCode != 0) {
-        throw IllegalStateException("Manual agent worker failed with exit code $exitCode\n$output")
+        // Keep the full worker stdout/stderr in the SERVER log only.
+        // The exception message (and therefore the HTTP error shown to
+        // the user) stays short — dumping thousands of log lines into
+        // the chat UI left users unable to tell what actually happened.
+        agentRouteLogger.warn("Manual agent worker {} failed with exit code {}. Worker output:\n{}",
+            sessionInfo.sessionId, exitCode, output)
+        throw ManualAgentWorkerException(
+            "The agent worker exited unexpectedly (code $exitCode). " +
+                "Details were written to the server log.")
     }
     if (output.isNotBlank()) {
         agentRouteLogger.debug("[manual-agent ${sessionInfo.sessionId}]\n$output")
@@ -2175,6 +2322,7 @@ private fun SessionInfo.toResponse(
     modelName = modelName,
     projectName = projectName,
     moduleName = moduleName,
+    workflowId = workflowId,
     createdAt = createdAt,
     updatedAt = updatedAt,
     parentSessionId = parentSessionId,

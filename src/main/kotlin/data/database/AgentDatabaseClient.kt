@@ -40,6 +40,8 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         val graphId: String?,
         val modelName: String?,
         val projectName: String? = null,
+        /** Workflow run that spawned this session (null for interactive sessions). */
+        val workflowId: String? = null,
         val createdAt: String?,
         val updatedAt: String?,
         val resumedAt: String?,
@@ -63,6 +65,12 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         modelName: String? = null,
         projectName: String? = null,
         /**
+         * Workflow run that spawned this session (the daemon propagates
+         * it to child sessions automatically).  Null for interactive
+         * sessions created from the web UI.
+         */
+        workflowId: String? = null,
+        /**
          * Optional parent session id. Set when spawning a child agent
          * (e.g. via `spawn_sub_agent`) so the frontend can group them
          * into a parent/child tree.
@@ -76,6 +84,7 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
             "modelName" to modelName,
             "projectName" to projectName
         )
+        if (workflowId != null) body["workflowId"] = workflowId
         if (parentSessionId != null) body["parentSessionId"] = parentSessionId
         val response = dbClient.post("/agent/session/create", body)
         if (response.first == HttpStatusCode.OK)
@@ -111,6 +120,7 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         status: String? = null,
         binaryId: Int? = null,
         moduleName: String? = null,
+        workflowId: String? = null,
         limit: Int = 50,
         offset: Int = 0,
         parentSessionId: String? = null
@@ -119,11 +129,30 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
             "status" to status,
             "binaryId" to binaryId,
             "moduleName" to moduleName,
+            "workflowId" to workflowId,
             "limit" to limit,
             "offset" to offset
         )
         if (parentSessionId != null) body["parentSessionId"] = parentSessionId
         val response = dbClient.post("/agent/session/list", body)
+        if (response.first == HttpStatusCode.OK)
+            mapper.readValue<List<SessionInfo>>(response.second)
+        else
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+    }
+
+    /**
+     * Search top-level sessions by title and message content.  A root
+     * session matches when any session in its subtree has a matching
+     * `session_name` or any matching message body.  See the daemon's
+     * `AgentOps.SearchSessions` for the exact semantics.
+     */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun searchSessions(query: String, limit: Int = 50): List<SessionInfo> = runBlocking {
+        val response = dbClient.post("/agent/session/search", mapOf(
+            "query" to query,
+            "limit" to limit
+        ))
         if (response.first == HttpStatusCode.OK)
             mapper.readValue<List<SessionInfo>>(response.second)
         else
@@ -200,17 +229,22 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
 
     /**
      * Append one or more messages to a session.
-     * @return list of generated message IDs
+     *
+     * @return the message_index values the daemon assigned to the
+     *   appended rows, in request order.  PersistentChatMemory stamps
+     *   its buffer with these so later index-based operations (e.g.
+     *   removeLast) hit the correct DB rows regardless of any rows
+     *   written outside the chat-memory track.
      */
     @Throws(DatabaseClient.DatabaseDaemonException::class)
-    fun appendMessages(sessionId: String, messages: List<MessageData>): List<Long> = runBlocking {
+    fun appendMessages(sessionId: String, messages: List<MessageData>): List<Int> = runBlocking {
         val body = mapOf(
             "sessionId" to sessionId,
             "messages" to messages
         )
         val response = dbClient.post("/agent/message/append", body)
         if (response.first == HttpStatusCode.OK)
-            mapper.readValue<List<Long>>(response.second)
+            mapper.readValue<List<Int>>(response.second)
         else
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }

@@ -402,11 +402,19 @@ class AgentRuntime(
             if (agent.sessionId == null) {
                 agent.sessionId = sessionId
             }
-            val lifecycle = try {
-                agent.lifecycle
-            } catch (e: Exception) {
-                Lifecycle.ONE_SHOT
-            }
+            // The spawn-declared lifecycle (template's interactionPolicy)
+            // is authoritative for state mapping — the agent factory may
+            // legitimately leave `agent.lifecycle` at its ONE_SHOT default
+            // (e.g. AndroidAnalyzer's Java analyzer factory).  Reading
+            // agent.lifecycle here would map a STANDBY template child's
+            // park to `closed` instead of `standby`, killing parked agents
+            // the moment they first call await_condition.
+            val lifecycle = spawnEntries[sessionId]?.lifecycle
+                ?: try {
+                    agent.lifecycle
+                } catch (e: Exception) {
+                    Lifecycle.ONE_SHOT
+                }
 
             // No per-child termination-hook installation needed.
             // [AkibaAgent]'s constructor `init` block installs a
@@ -1182,7 +1190,12 @@ class AgentRuntime(
             }
         }
 
-        val kind = if (isError) "error" else "note"
+        // The daemon only accepts [note, request, reply, cancel,
+        // heartbeat, user-hint] — a literal "error" kind is rejected
+        // with 400, which used to silently drop every child-error
+        // notification.  The subject line already carries the
+        // error/complete distinction.
+        val kind = "note"
         val subject = if (isError)
             "child agent error: ${handle.sessionId.take(8)}"
         else

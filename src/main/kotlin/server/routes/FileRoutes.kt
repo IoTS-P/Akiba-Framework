@@ -12,6 +12,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
+import org.iotsplab.akiba.managers.WorkspaceManager
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
@@ -47,9 +48,13 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
         Files.createDirectories(uploadDir)
 
         try {
-            // 1. Receive uploaded files
+            // 1. Receive uploaded files.  Ktor's default form-field
+            // limit is 50 MiB — smaller than our own 100 MB cap, so a
+            // 57 MB upload died inside the multipart parser with an
+            // opaque 400.  Pass our cap explicitly; the per-file
+            // accounting below still enforces the total.
             var totalBytes = 0L
-            call.receiveMultipart().forEachPart { part ->
+            call.receiveMultipart(MAX_UPLOAD_SIZE).forEachPart { part ->
                 when (part) {
                     is PartData.FileItem -> {
                         val originalName = part.originalFileName ?: "uploaded.bin"
@@ -301,11 +306,70 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
 
     // ------ Delete files ---------------------------------------------------
     delete("/files") {
-        @Suppress("UNUSED_VARIABLE")
-        val req = call.receive<DeleteFileRequest>()
-        call.respond(HttpStatusCode.NotImplemented, mapOf(
-            "error" to "File deletion via HTTP is not yet implemented"
-        ))
+        val instance = call.parameters["instanceName"]
+            ?: call.instanceHeader()
+            ?: run {
+                call.respond(HttpStatusCode.BadRequest, mapOf(
+                    "error" to "Missing instance selection. Please select an instance first."
+                ))
+                return@delete
+            }
+        val req = try {
+            call.receive<DeleteFileRequest>()
+        } catch (e: Exception) {
+            call.respond(HttpStatusCode.BadRequest, mapOf(
+                "error" to "Invalid request body: expected {\"fileIds\":[1,2,...]}"))
+            return@delete
+        }
+        val ids = req.fileIds.filter { it > 0 }.distinct()
+        if (ids.isEmpty()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "No file ids provided"))
+            return@delete
+        }
+        if (ids.size > 500) {
+            call.respond(HttpStatusCode.BadRequest, mapOf(
+                "error" to "Too many file ids (max 500 per call)"))
+            return@delete
+        }
+        logger.info("File delete requested for instance '{}': {} id(s)", instance, ids.size)
+        try {
+            // 1. Delete the DB rows.  The daemon's DELETE cascades to
+            //    processed_binaries and results via ON DELETE CASCADE.
+            val deleted = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                dbClient.deleteBinaries(ids)
+            }
+
+            // 2. Best-effort physical cleanup of the stored copies
+            //    ("<id>.bin" under the binaries root).  Filenames are
+            //    server-generated and ids come from the database, so
+            //    there is no path-traversal surface here.  Failures are
+            //    logged but do not fail the request — the rows are
+            //    already gone and a stale file is harmless.
+            WorkspaceManager.initBinDirectories()
+            deleted.forEach { id ->
+                listOf(
+                    WorkspaceManager.binaryPath.resolve("$id.bin"),
+                    WorkspaceManager.processedBinaryPath.resolve("$id.bin")
+                ).forEach { p ->
+                    try {
+                        if (Files.deleteIfExists(p))
+                            logger.debug("Deleted stored copy {}", p)
+                    } catch (e: Exception) {
+                        logger.warn("Failed to delete stored copy {}: {}", p, e.message)
+                    }
+                }
+            }
+
+            logger.info("File delete completed for instance '{}': {} deleted", instance, deleted.size)
+            call.respond(mapOf(
+                "message" to "Deleted ${deleted.size} file(s)",
+                "deletedIds" to deleted
+            ))
+        } catch (e: Exception) {
+            logger.error("File delete failed: {}", e.message, e)
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
     }
 }
 

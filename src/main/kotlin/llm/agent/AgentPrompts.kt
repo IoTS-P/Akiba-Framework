@@ -143,6 +143,23 @@ object AgentPrompts {
           one Action, provided none needs another's output.
         </tools_usage_policy>
 
+        <tool_output_truncation>
+        T1 — HIGH — never trust a partial view:
+        - [Must] treat any result carrying a "⚠️ TRUNCATED" marker, or whose
+          header shows original_bytes larger than the visible content, as
+          INCOMPLETE: the context view keeps only head + tail and the middle
+          is MISSING. Never reason as if the head and tail were contiguous.
+        - [Must NOT] re-run the identical call hoping for more content — the
+          budget cut will happen again. Narrow the scope instead (smaller
+          address range, fewer entries, one specific target).
+        - [Should] for paged tools (e.g. disassemble_function), follow the
+          resume hint in the output: pass the printed addressAfter /
+          resumeFrom value to fetch the next batch.
+        - [Should] use `read_history_tool_call` with the result_uuid from the
+          result header to inspect the stored snapshot (much larger than the
+          context view) instead of repeating an expensive call.
+        </tool_output_truncation>
+
         <error_handling>
         T1 — HIGH — triage discipline:
         - [Must] first decide whether an error is YOUR fault (wrong arguments,

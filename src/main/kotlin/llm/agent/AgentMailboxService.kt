@@ -505,6 +505,10 @@ private fun bumpSeenCount(sessionId: String, messageId: Long): Int {
     return sessionMap.compute(messageId) { _, v -> (v ?: 0) + 1 } ?: 1
 }
 
+/** Read the current seen-wake count without incrementing (0 if never seen). */
+private fun currentSeenCount(sessionId: String, messageId: Long): Int =
+    seenWakeCounter[sessionId]?.get(messageId) ?: 0
+
 private fun clearSeenCount(sessionId: String, messageId: Long) {
     seenWakeCounter[sessionId]?.remove(messageId)
 }
@@ -676,14 +680,25 @@ fun applyMailboxDrain(
         registry.scheduleNext()
     }
 
-    // 4. Bump seen-count for new messages (they're now "seen")
-    for (m in regularNew) {
-        bumpSeenCount(sessionId, m.messageId)
+    // 4+5. Age the seen counters — but ONLY ONCE PER WAKE (i.e. per
+    //      strategy execution), not on every ReAct iteration.  A
+    //      strategy execution corresponds to one park→wake cycle; the
+    //      escalation counter must measure "wakes survived unhandled",
+    //      not "iterations since first display".  Mid-execution arrivals
+    //      stay at their current age until the next genuine wake.
+    val shouldAge = !ctx.stats.wakeBoardAged
+    if (shouldAge) {
+        ctx.stats.wakeBoardAged = true
+        // 4. Bump seen-count for new messages (they're now "seen")
+        for (m in regularNew) {
+            bumpSeenCount(sessionId, m.messageId)
+        }
     }
 
     // 5. Bump seen-count for pending messages (they survived another wake)
     val pendingWithCount = pendingMessages.map { m ->
-        val count = bumpSeenCount(sessionId, m.messageId)
+        val count = if (shouldAge) bumpSeenCount(sessionId, m.messageId)
+        else currentSeenCount(sessionId, m.messageId)
         m to count
     }
 

@@ -515,7 +515,11 @@ private fun ReadAgentMessagesTool(
                 val mid = messageId
                     ?: return@Tool "Error: action=get requires 'messageId'. Use the msg#N number from the wake board, e.g. messageId=2 or messageId=\"msg#2\". Do NOT use conv#N here."
                 val msg = service.getMessage(sessionId, mid)
-                    ?: return@Tool "Error: message $mid not found or not visible to $sessionId"
+                    ?: return@Tool "Error: message $mid not found or not visible to $sessionId. " +
+                        "Message ids are GLOBAL across all sessions — you can only read " +
+                        "messages where YOU are sender or recipient. Check YOUR OWN wake " +
+                        "board for the correct msg#N (a number you saw in another agent's " +
+                        "context or guessed from memory does not necessarily exist in your mailbox)."
                 toolMapper.writeValueAsString(mailboxMessageToJson(msg))
             }
             else -> "Error: invalid action '$action'. Use peek | drain | count | get."

@@ -563,7 +563,7 @@ private fun WriteWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
             ))
         }
 
-        try {
+        return@Tool try {
             val current = Files.readString(resolvedPath)
             val occurrences = countOccurrences(current, oldString)
 
@@ -612,7 +612,6 @@ private fun WriteWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
                 "path" to pathStr
             ))
         }
-        return@Tool "Error: unreachable"
     }
 
     // ---- Modes 1 & 2: full write / append ----

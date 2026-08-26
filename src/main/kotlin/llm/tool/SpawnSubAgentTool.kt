@@ -75,6 +75,25 @@ fun SpawnSubAgentTool(
      * per-root budget.
      */
     callerSessionId: String? = null,
+    /**
+     * Optional override for the SCOPE used to resolve `templateId`
+     * (defaults to [callerSessionId] / the module session).
+     *
+     * Templates contributed by an [AgentModule] are registered under
+     * the ROOT session's scope.  A layer-1 child that legitimately
+     * needs to spawn a layer-2 template child (e.g. AndroidAnalyzer's
+     * Java analyzer creating its dedicated native analyzer through
+     * module-level tool code) would fail the scope check with
+     * "template ... is not registered in this scope", because its own
+     * session id is not a registered scope.  Module code can pass the
+     * root session id here to resolve against the root scope while
+     * keeping [callerSessionId] as the child's actual parent.
+     *
+     * Only pass this from trusted module code where the template id
+     * is fixed by the module itself — never forward an LLM-chosen
+     * scope.
+     */
+    templateScopeId: String? = null,
 ): Tool {
     val common = listOf(
         ToolParameter(
@@ -154,7 +173,7 @@ fun SpawnSubAgentTool(
             appendLine("the child directly from `systemPrompt` / `taskPrompt` / `toolNames`.")
         },
         parameters = common,
-    ) { args -> handleSpawn(args, parent, agentDbClient, resolver, callerSessionId) }
+    ) { args -> handleSpawn(args, parent, agentDbClient, resolver, callerSessionId, templateScopeId) }
 }
 
 private fun handleSpawn(
@@ -163,6 +182,7 @@ private fun handleSpawn(
     agentDbClient: AgentDatabaseClient,
     resolver: TemplateFactoryResolver,
     callerSessionId: String? = null,
+    templateScopeId: String? = null,
 ): String {
     val mapper = jacksonObjectMapper()
     val templateId = (args["templateId"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
@@ -177,7 +197,8 @@ private fun handleSpawn(
 
     if (templateId != null) {
         return spawnFromTemplate(
-            args, templateId, parent, parentAgent, parentSessionId, agentDbClient, resolver, mapper
+            args, templateId, parent, parentAgent, parentSessionId, agentDbClient, resolver, mapper,
+            templateScopeId,
         )
     }
     return spawnFreeform(args, parent, parentAgent, parentSessionId, agentDbClient, mapper)
@@ -258,6 +279,7 @@ private fun spawnFromTemplate(
     agentDbClient: AgentDatabaseClient,
     resolver: TemplateFactoryResolver,
     mapper: com.fasterxml.jackson.databind.ObjectMapper,
+    templateScopeId: String? = null,
 ): String {
     val inputsNode = coerceArgsObject(args["inputs"])
     val overridesNode = coerceArgsObject(args["overrides"])
@@ -270,7 +292,11 @@ private fun spawnFromTemplate(
         else -> false
     }
 
-    val template = AgentTemplateRegistry.resolveForScope(parentSessionId, templateId)
+    // Template resolution scope: normally the caller's own session;
+    // trusted module code may override it (e.g. a layer-1 child spawning
+    // a module-registered layer-2 template resolves against the ROOT
+    // scope where the module registered its templates).
+    val template = AgentTemplateRegistry.resolveForScope(templateScopeId ?: parentSessionId, templateId)
         ?: run {
             val err = "template '$templateId' is not registered in this scope"
             val wakeId = notifyParentOfPreSpawnFailure(
@@ -479,6 +505,7 @@ private fun spawnFromTemplate(
                 templateId = template.id,
                 depth = resolved.childDepth,
                 initialLifecycle = resolved.effectiveLifecycle,
+                coldStart = resolved.effectiveColdStart,
                 taskPrompt = taskPrompt,
                 factory = factoryRef,
                 forceCompactBeforeRun = reuseSessionId != null && forceCompactBeforeRun,

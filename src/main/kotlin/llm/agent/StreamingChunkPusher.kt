@@ -45,6 +45,7 @@ object StreamingChunkPusher {
      * blocks the worker.
      */
     private val sendQueue = java.util.concurrent.LinkedBlockingQueue<HttpRequest>()
+    private val inFlightSends = java.util.concurrent.atomic.AtomicInteger(0)
 
     @Volatile private var senderStarted = false
     private val senderLock = Any()
@@ -61,13 +62,34 @@ object StreamingChunkPusher {
                     } catch (_: InterruptedException) {
                         continue
                     }
+                    inFlightSends.incrementAndGet()
                     try {
                         httpClient.send(request, HttpResponse.BodyHandlers.discarding())
                     } catch (e: Exception) {
                         logger.debug("stream-chunk POST failed: ${e.message}")
+                    } finally {
+                        inFlightSends.decrementAndGet()
                     }
                 }
             }, "stream-chunk-sender").apply { isDaemon = true; start() }
+        }
+    }
+
+    /**
+     * Block until the cross-process send queue has drained (queue empty
+     * and no POST in flight), at most [maxMs].
+     *
+     * Worker JVMs MUST call this before exiting: the sender thread is a
+     * daemon, so a plain JVM exit silently discards whatever is still
+     * queued — typically the response TAIL and the `done` marker, which
+     * the browser then never sees (the "final answer arrives truncated"
+     * bug).
+     */
+    fun awaitQuiescence(maxMs: Long = 3_000) {
+        val deadline = System.currentTimeMillis() + maxMs
+        while (System.currentTimeMillis() < deadline) {
+            if (sendQueue.isEmpty() && inFlightSends.get() == 0) return
+            Thread.sleep(25)
         }
     }
 

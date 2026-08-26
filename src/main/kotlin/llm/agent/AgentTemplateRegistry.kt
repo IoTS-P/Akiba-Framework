@@ -450,6 +450,15 @@ data class ResolvedSubAgentSpec(
         get() = (appliedOverrides["lifecycle"] as? Lifecycle) ?: template.interactionPolicy.lifecycle
 
     /**
+     * Effective cold-start flag after applying the parent's
+     * `coldStart` override (if any).  Defaults to the template's
+     * [InteractionPolicy.coldStart]; only meaningful when
+     * [effectiveLifecycle] is STANDBY.
+     */
+    val effectiveColdStart: Boolean
+        get() = (appliedOverrides["coldStart"] as? Boolean) ?: template.interactionPolicy.coldStart
+
+    /**
      * Effective interaction policy after applying the parent's
      * `interaction.canSendTo*` and `interaction.canPublishArtifacts`
      * overrides. Legacy blocking fields remain whatever the template

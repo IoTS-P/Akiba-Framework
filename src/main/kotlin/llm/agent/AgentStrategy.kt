@@ -838,14 +838,40 @@ class StrategyContext(
                         // the context and retry promptly (see hook docs).
                         if (ContextOverflowDetector.isContextOverflow(retryError)) {
                             consecutiveOverflows++
+                            // Learn the exact window when the provider
+                            // tells us ("maximum context length is N") —
+                            // far more precise than any heuristic.
+                            ContextOverflowDetector.extractProviderLimit(retryError)?.let { limit ->
+                                ContextLengthObserver.recordProviderLimit(
+                                    client.config.provider, client.config.modelName, limit
+                                )
+                            }
                             if (consecutiveOverflows >= CONTEXT_OVERFLOW_COMPACT_THRESHOLD) {
+                                // A "compacted" report only counts when the
+                                // context measurably shrank.  Without this
+                                // check a hook that repeatedly reports success
+                                // while shrinking nothing (e.g. re-pruning
+                                // already-pruned placeholders) resets the
+                                // abort counter forever and the retry loop
+                                // never terminates.
+                                val tokensBefore = memory.messages().sumOf { client.estimateTokenCount(it.content) }
                                 val compacted = try {
                                     onContextOverflowHook?.invoke(consecutiveOverflows) == true
                                 } catch (hookErr: Exception) {
                                     logger.warn("onContextOverflowHook threw: ${hookErr.message}", hookErr)
                                     false
                                 }
-                                if (compacted) {
+                                val tokensAfter = memory.messages().sumOf { client.estimateTokenCount(it.content) }
+                                val actuallyShrank = compacted &&
+                                    tokensAfter <= (tokensBefore * 0.95).toInt()
+                                if (compacted && !actuallyShrank) {
+                                    logger.warn(
+                                        "Overflow hook reported success but context only moved " +
+                                            "$tokensBefore -> $tokensAfter tokens (<5% shrink); " +
+                                            "counting as a failed compaction."
+                                    )
+                                }
+                                if (actuallyShrank) {
                                     failedOverflowCompactions = 0
                                     retryImmediately = true
                                     logger.warn(
@@ -1137,6 +1163,18 @@ class LoopStats {
      * compaction loops.
      */
     var forcedCompactions: Int = 0
+
+    /**
+     * Set once the wake board has AGED its messages during THIS
+     * execution (see applyMailboxDrain).  A strategy execution == one
+     * wake: aging must happen exactly once per wake, otherwise the
+     * "seen N wakes" escalation counter actually counts ReAct
+     * *iterations* and long-running requests get falsely escalated
+     * while the agent is actively working on them (observed: a
+     * native-analysis request "escalated" 11 times during a single
+     * continuous analysis, pressuring premature replies).
+     */
+    var wakeBoardAged: Boolean = false
 }
 
 // ============================================================
@@ -1412,10 +1450,29 @@ class ReActStrategy : AgentStrategy {
                         continue
                     }
 
+                    // Pre-execution park gate: validate await_condition
+                    // BEFORE the tool registers a wake condition.  A
+                    // rejected park then surfaces as a single clean
+                    // rejection — never as a misleading "registered"
+                    // result contradicted by a later rejection message,
+                    // and no registry rollback is needed.
+                    val prePark = if (!beforeTool.skipCurrentAction && toolCall.name == "await_condition") {
+                        ctx.harness.validatePark(ctx, assistantText)
+                    } else {
+                        AgentHarnessDirective.None
+                    }
+
                     val toolResult = if (beforeTool.skipCurrentAction) {
                         ctx.applyHarnessDirective(beforeTool, "harness.beforeToolExecution")
                         val synthetic = beforeTool.userMessages.firstOrNull() ?: "[harness synthetic] handled: ${toolCall.name}"
                         StrategyContext.ToolResult(synthetic, 0L)
+                    } else if (prePark.rejectPark) {
+                        ctx.applyHarnessDirective(prePark, "harness.validatePark")
+                        StrategyContext.ToolResult(
+                            prePark.userMessages.firstOrNull()
+                                ?: "[harness.validatePark] park rejected",
+                            0L,
+                        )
                     } else {
                         ctx.executeToolWithDuration(toolCall)
                     }
@@ -1506,6 +1563,12 @@ class ReActStrategy : AgentStrategy {
                     // emit a Final Answer wastes a round-trip and risks
                     // the LLM calling more tools instead of wrapping up.
                     if (toolCall.name == "await_condition") {
+                        if (prePark.rejectPark) {
+                            // Park was rejected PRE-execution; the
+                            // rejection message was already injected.
+                            // Nothing registered — just continue.
+                            continue
+                        }
                         if (!isAwaitConditionRegistrationSuccess(toolResult.rawOutput)) {
                             logger.warn(
                                 "[ReAct] await_condition did not register successfully; " +
@@ -2038,10 +2101,25 @@ class PlanExecuteStrategy(
                         continue
                     }
 
+                    // Pre-execution park gate (same as the ReAct path):
+                    // validate await_condition BEFORE registration.
+                    val prePark = if (!beforeTool.skipCurrentAction && toolCall.name == "await_condition") {
+                        ctx.harness.validatePark(ctx, assistantText)
+                    } else {
+                        AgentHarnessDirective.None
+                    }
+
                     val toolResult = if (beforeTool.skipCurrentAction) {
                         ctx.applyHarnessDirective(beforeTool, "harness.beforeToolExecution")
                         val synthetic = beforeTool.userMessages.firstOrNull() ?: "[harness synthetic] handled: ${toolCall.name}"
                         StrategyContext.ToolResult(synthetic, 0L)
+                    } else if (prePark.rejectPark) {
+                        ctx.applyHarnessDirective(prePark, "harness.validatePark")
+                        StrategyContext.ToolResult(
+                            prePark.userMessages.firstOrNull()
+                                ?: "[harness.validatePark] park rejected",
+                            0L,
+                        )
                     } else {
                         ctx.executeToolWithDuration(toolCall)
                     }
@@ -2065,6 +2143,11 @@ class PlanExecuteStrategy(
                     // has expressed its intent to park; don't wait
                     // for a Final Answer.
                     if (toolCall.name == "await_condition") {
+                        if (prePark.rejectPark) {
+                            // Park rejected PRE-execution; message already
+                            // injected, nothing registered — continue.
+                            continue
+                        }
                         if (!isAwaitConditionRegistrationSuccess(toolResult.rawOutput)) {
                             logger.warn(
                                 "[PlanExec] await_condition did not register successfully; " +

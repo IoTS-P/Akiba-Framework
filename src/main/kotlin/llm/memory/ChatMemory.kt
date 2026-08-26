@@ -283,7 +283,7 @@ class PersistentChatMemory(
 
     override fun add(role: String, content: String) {
         // Persist to database
-        try {
+        val assigned: List<Int> = try {
             val data = if (role == "tool") {
                 AgentDatabaseClient.MessageData(role = role, content = content, toolResult = content)
             } else {
@@ -295,10 +295,14 @@ class PersistentChatMemory(
             throw e
         }
 
-        // Update local buffer, recording the message_index the daemon just
-        // assigned to this row so that removeLast() can target it later.
-        buffer.add(AgentChatMessage(role, content, messageIndex = nextMessageIndex))
-        nextMessageIndex += 1
+        // Stamp the REAL message_index the daemon just assigned.  Rows
+        // written outside this memory track (llm-progress heartbeats,
+        // retry markers) make the DB's indexes run ahead of the local
+        // counter — using the returned index keeps the buffer truthful
+        // and self-heals the counter for the next append.
+        val idx = assigned.firstOrNull() ?: nextMessageIndex
+        buffer.add(AgentChatMessage(role, content, messageIndex = idx))
+        nextMessageIndex = idx + 1
 
         // Apply eviction
         evictIfNeeded()
@@ -306,8 +310,8 @@ class PersistentChatMemory(
 
     override fun add(message: AgentChatMessage) {
         // For tool messages, persist full metadata
-        if (message.role == "tool") {
-            try {
+        val assigned: List<Int> = try {
+            if (message.role == "tool") {
                 agentDbClient.appendMessages(
                     sessionId,
                     listOf(
@@ -320,12 +324,7 @@ class PersistentChatMemory(
                         )
                     )
                 )
-            } catch (e: Exception) {
-                logger.error("Failed to persist tool message to DB for session $sessionId", e)
-                throw e
-            }
-        } else {
-            try {
+            } else {
                 agentDbClient.appendMessages(
                     sessionId,
                     listOf(AgentDatabaseClient.MessageData(
@@ -335,18 +334,20 @@ class PersistentChatMemory(
                         inputTokenCount = message.inputTokenCount
                     ))
                 )
-            } catch (e: Exception) {
-                logger.error("Failed to persist message to DB for session $sessionId", e)
-                throw e
             }
+        } catch (e: Exception) {
+            logger.error("Failed to persist message to DB for session $sessionId", e)
+            throw e
         }
 
-        // Stamp the assigned DB index on the buffered copy and advance
-        // the local counter for the next append.  We always overwrite
-        // whatever the caller passed in: PersistentChatMemory is the
-        // single owner of message_index assignment for this session.
-        val indexed = message.copy(messageIndex = nextMessageIndex)
-        nextMessageIndex += 1
+        // Stamp the REAL assigned DB index on the buffered copy (see
+        // add(role, content) for why the local counter alone is not
+        // trustworthy).  We always overwrite whatever the caller passed
+        // in: the daemon is the single owner of message_index
+        // assignment for this session.
+        val idx = assigned.firstOrNull() ?: nextMessageIndex
+        val indexed = message.copy(messageIndex = idx)
+        nextMessageIndex = idx + 1
         buffer.add(indexed)
         evictIfNeeded()
     }
@@ -357,7 +358,7 @@ class PersistentChatMemory(
         args: String?,
         result: String?
     ) {
-        try {
+        val assigned: List<Int> = try {
             agentDbClient.appendMessages(
                 sessionId,
                 listOf(
@@ -376,6 +377,7 @@ class PersistentChatMemory(
             throw e
         }
 
+        val idx = assigned.firstOrNull() ?: nextMessageIndex
         buffer.add(
             AgentChatMessage(
                 role = "tool",
@@ -383,10 +385,10 @@ class PersistentChatMemory(
                 toolCallId = toolCallId,
                 toolName = toolName,
                 toolCallArgs = args,
-                messageIndex = nextMessageIndex,
+                messageIndex = idx,
             )
         )
-        nextMessageIndex += 1
+        nextMessageIndex = idx + 1
         evictIfNeeded()
     }
 

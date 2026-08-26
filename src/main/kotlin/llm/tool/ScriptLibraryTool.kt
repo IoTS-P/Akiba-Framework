@@ -34,7 +34,21 @@ import kotlin.system.measureTimeMillis
  * - **Faster**: no API lookup or trial-and-error needed.
  * - **Learning**: read script source to understand Ghidra API patterns.
  */
-fun ScriptLibraryTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool = Tool(
+fun ScriptLibraryTool(
+    parent: AkibaModule,
+    agentDbClient: AgentDatabaseClient,
+    /**
+     * Additional binary ids (beyond the module's own [AkibaModule.id])
+     * that scripts may target via the optional `binaryId` parameter —
+     * e.g. `.so` libraries the module imported from the analyzed APK.
+     * Evaluated LAZILY on every call (pipelines that register
+     * sub-binaries during startup are honoured).  Default: empty —
+     * only the module's own Program is reachable and any `binaryId`
+     * other than the module's own is rejected, so cross-binary access
+     * is impossible unless the module explicitly allows it.
+     */
+    additionalAllowedBinaryIds: () -> Set<Int> = { emptySet() },
+): Tool = Tool(
     name = "script_library",
     description = buildString {
         appendLine("Access a library of pre-built Kotlin scripts for common binary analysis tasks.")
@@ -60,6 +74,10 @@ fun ScriptLibraryTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): 
         appendLine("  run:    {\"action\":\"run\", \"scriptName\":\"disassemble_function\", \"parameters\":{\"target\":\"main\"}}")
         appendLine("  run:    {\"action\":\"run\", \"scriptName\":\"list_functions\"}")
         appendLine()
+        appendLine("Optional 'binaryId' (integer): run the script against ANOTHER binary's Program")
+        appendLine("instead of the current one. Only ids explicitly allowed by the module are")
+        appendLine("accepted (e.g. libraries imported from the analyzed file); anything else is")
+        appendLine("rejected. Omit to use the current binary.")
         appendLine("CRITICAL: 'parameters' MUST be a nested JSON object, NOT a string!")
         appendLine("  ✅ CORRECT: \"parameters\": {\"target\": \"main\", \"direction\": \"to\"}")
         appendLine("  ❌ WRONG:   \"parameters\": \"{\\\"target\\\": \\\"main\\\"}\"")
@@ -90,6 +108,11 @@ fun ScriptLibraryTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): 
         ToolParameter(
             "parameters", "object",
             "For 'run': the script's runtime parameters as a JSON object. Key name MUST be \"parameters\" — do NOT use \"scriptArgs\" (that is the internal variable name inside script source code, not the API key). Example: {\"target\":\"main\",\"direction\":\"to\"}.",
+            required = false
+        ),
+        ToolParameter(
+            "binaryId", "integer",
+            "Optional: run the script against ANOTHER binary's Program (must be in the module's allowlist, e.g. libraries imported from the analyzed file). Omit to use the current binary.",
             required = false
         )
     ),
@@ -155,7 +178,23 @@ fun ScriptLibraryTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): 
                 else -> return@Tool "Error: 'parameters' must be a JSON object or a JSON string, " +
                     "got ${rawParams.javaClass.simpleName}"
             }
-            runLibraryScript(agentDbClient, parent, scriptName, parameters, mapper)
+            // Optional cross-binary target — restricted to the module's
+            // own binary plus its explicit allowlist (authorization at
+            // the trust boundary; reject anything else).
+            val requestedBinaryId = (args["binaryId"] as? Number)?.toInt()
+            val targetBinaryId = requestedBinaryId ?: parent.id
+            if (targetBinaryId != parent.id &&
+                targetBinaryId !in additionalAllowedBinaryIds()
+            ) {
+                return@Tool mapper.writeValueAsString(mapOf(
+                    "success" to false,
+                    "error" to "binaryId=$targetBinaryId is not allowed for this module. " +
+                        "Only the current binary (id=${parent.id}) and binaries explicitly " +
+                        "imported by it (e.g. libraries extracted from the analyzed file) " +
+                        "may be targeted.",
+                ))
+            }
+            runLibraryScript(agentDbClient, parent, scriptName, parameters, mapper, targetBinaryId)
         }
         else -> "Error: unknown action '$action'. Use 'search', 'read', or 'run'."
     }
@@ -408,10 +447,23 @@ private fun runLibraryScript(
     parent: AkibaModule,
     scriptName: String,
     parameters: Map<String, Any?>,
-    mapper: com.fasterxml.jackson.databind.ObjectMapper
+    mapper: com.fasterxml.jackson.databind.ObjectMapper,
+    targetBinaryId: Int = parent.id,
 ): String {
     val script = loadDbLibraryScripts(agentDbClient).firstOrNull { it.name == scriptName }
         ?: return "Error: Script '$scriptName' not found in library. Use 'search' action to see available scripts."
+
+    // Resolve the target Program: the module's own binary uses the
+    // already-open Program; an allowlisted sub-binary is opened via the
+    // module's getProgram (same convention as RunScriptTool).
+    val targetProgram = if (targetBinaryId == parent.id) {
+        parent.program
+    } else {
+        parent.getProgram(targetBinaryId) ?: return mapper.writeValueAsString(mapOf(
+            "success" to false,
+            "error" to "Program not found for binaryId=$targetBinaryId",
+        ))
+    }
 
     // -----------------------------------------------------------------
     //  Reverse-mistake guard: detect when the LLM put a tool_call JSON
@@ -480,7 +532,7 @@ private fun runLibraryScript(
     } catch (_: Exception) { -1 }
     if (scriptDbId >= 0) {
         try {
-            executionId = agentDbClient.createScriptExecution(scriptDbId, parent.id)
+            executionId = agentDbClient.createScriptExecution(scriptDbId, targetBinaryId)
             agentDbClient.updateScriptExecution(executionId, null, "running", null)
         } catch (_: Exception) { }
     }
@@ -491,8 +543,8 @@ private fun runLibraryScript(
             runBlocking {
                 val instance = ScriptInstance.compile(finalSource, script.className)
                 val scriptObj = instance.newInstance(
-                    binaryId = parent.id,
-                    program = parent.program,
+                    binaryId = targetBinaryId,
+                    program = targetProgram,
                     skipDbWrite = true
                 )
                 scriptObj.startProcess(AkibaModule.DEFAULT_TIMEOUT)

@@ -5,12 +5,12 @@ import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
 object ToolResultContext {
-    const val CURRENT_CONTEXT_MAX_BYTES = 40_000
-    const val CURRENT_HEAD_BYTES = 35_000
-    const val CURRENT_TAIL_BYTES = 5_000
-    const val HISTORICAL_CONTEXT_MAX_BYTES = 5_000
-    const val HISTORICAL_HEAD_BYTES = 4_000
-    const val HISTORICAL_TAIL_BYTES = 1_000
+    const val CURRENT_CONTEXT_MAX_BYTES = 8_000
+    const val CURRENT_HEAD_BYTES = 7_000
+    const val CURRENT_TAIL_BYTES = 1_000
+    const val HISTORICAL_CONTEXT_MAX_BYTES = 2_000
+    const val HISTORICAL_HEAD_BYTES = 1_600
+    const val HISTORICAL_TAIL_BYTES = 400
     const val STORED_MAX_BYTES = 100 * 1024
     const val STORED_HEAD_BYTES = 70 * 1024
     const val STORED_TAIL_BYTES = 30 * 1024
