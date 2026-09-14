@@ -135,6 +135,10 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             // page. This keeps the page usable when no instance has been selected.
             val sessionCounts = mutableMapOf<String, Int>()
             val instance = call.instanceHeader()
+            // The instance must belong to the caller: the server authenticates
+            // to the daemon as the instance owner.
+            if (instance != null && !call.requireInstanceOwnership(instance))
+                return@get
             if (instance != null) {
                 try {
                     withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
@@ -334,6 +338,10 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
         var deletedAgentSessions = 0
         if (deleteAgentSessions) {
             val instance = call.instanceHeader()
+            // The instance must belong to the caller: the server authenticates
+            // to the daemon as the instance owner.
+            if (instance != null && !call.requireInstanceOwnership(instance))
+                return@delete
             if (instance == null) {
                 errors.add("agent sessions: no instance selected — skipped")
             } else {
@@ -714,12 +722,14 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
         if (!isValidProjectName(projectName)) {
             return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name: $projectName"))
         }
+        val exportInstance = call.instanceHeader()
+        if (exportInstance != null && !call.requireInstanceOwnership(exportInstance)) return@get
         val status = projectTextExportStatus(
             projectName = projectName,
             projectDirectory = call.currentUserGhidraProjectsRoot(),
             daemonHost = daemonHost,
             daemonPort = daemonPort,
-            instance = call.instanceHeader(),
+            instance = exportInstance,
         )
         call.respond(status)
     }
@@ -757,12 +767,14 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
         }
 
         val projectDirectory = call.currentUserGhidraProjectsRoot()
+        val exportInstance = call.instanceHeader()
+        if (exportInstance != null && !call.requireInstanceOwnership(exportInstance)) return@post
         val status = projectTextExportStatus(
             projectName = projectName,
             projectDirectory = projectDirectory,
             daemonHost = daemonHost,
             daemonPort = daemonPort,
-            instance = call.instanceHeader(),
+            instance = exportInstance,
         )
         if (status.state != "available") {
             val http = if (status.state == "project_not_found") HttpStatusCode.NotFound else HttpStatusCode.Conflict
@@ -827,11 +839,29 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                 )
             }
 
+            val exportInstance = call.instanceHeader()
+            if (exportInstance == null) {
+                return@post call.respond(
+                    HttpStatusCode.BadRequest,
+                    mapOf("error" to "Select an instance before exporting a project")
+                )
+            }
+            val exportIdentity = DaemonIdentities.ownerOf(exportInstance)
+                ?.let { DaemonIdentities.forUser(it) }
+            if (exportIdentity == null) {
+                return@post call.respond(
+                    HttpStatusCode.Unauthorized,
+                    mapOf("error" to "No database credentials cached for instance " +
+                        "'$exportInstance'; sign in again so the server can authenticate " +
+                        "on your behalf")
+                )
+            }
+
             val config = linkedMapOf<String, Any>(
                 "main" to linkedMapOf<String, Any>(
-                    "username" to call.currentUsernameOrDefault(),
-                    "password" to DAEMON_PASSWORD,
-                    "usingInstance" to (call.instanceHeader() ?: "akiba-instance"),
+                    "username" to exportIdentity.username,
+                    "password" to exportIdentity.secret,
+                    "usingInstance" to exportInstance,
                     "general" to linkedMapOf<String, Any>(
                         "workspaceRoot" to tempDir.toString()
                     ),
@@ -946,6 +976,9 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                 HttpStatusCode.BadRequest,
                 mapOf("error" to "Missing X-Akiba-Instance header")
             )
+        // The instance must belong to the caller: the server authenticates to
+        // the daemon as the instance owner.
+        if (!call.requireInstanceOwnership(instance)) return@post
         val projectDirectory = call.currentUserGhidraProjectsRoot()
         Files.createDirectories(projectDirectory)
 

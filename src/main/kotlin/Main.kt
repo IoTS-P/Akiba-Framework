@@ -24,6 +24,7 @@ import kotlin.system.exitProcess
         DeleteInstance::class,
         StartInstance::class,
         ShutdownInstance::class,
+        ListInstances::class,
         ServerCommand::class,
         MeltdownCommand::class
     ]

@@ -158,7 +158,6 @@ class ServerCommand : Runnable {
                         "sqlSource": {
                           "serverIP": "$daemonHost",
                           "serverPort": $daemonPort,
-                          "useSnapshot": "current",
                           "constraint": "",
                           "disableUpdate": false,
                           "useLocalCache": null

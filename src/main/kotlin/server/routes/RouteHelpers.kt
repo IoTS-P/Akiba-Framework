@@ -19,19 +19,24 @@ private val logger: Logger = LogManager.getLogger("RouteHelpers")
 /**
  * Helpers for HTTP routes that need to talk to the akiba_db_daemon.
  *
- * Each call to [withDaemonSession] creates a **new**, independent
- * [DatabaseClient] instance — login, connect to the requested instance,
- * run the caller's block, then disconnect + logout.
+ * ## Identity model
  *
- * The daemon only allows one active session per instance at a time, so
- * we serialize access with a per-instance lock. Requests targeting
- * **different** instances run in parallel; requests to the **same**
- * instance wait for the previous session to release.
+ * Every request is executed as the **signed-in user**. There used to be a single
+ * hard-coded service account (`akiba`/`akiba`) shared by all requests, which
+ * made per-user instance ownership impossible: as far as the daemon was
+ * concerned, everybody was the same person. Now:
+ *
+ *  - the web user is identified by their JWT (see [currentUsernameOrNull]);
+ *  - at sign-in the server establishes a [DaemonIdentity] for that user — a
+ *    derived credential minted by the daemon, so no password is ever written
+ *    into a generated config file;
+ *  - instance-scoped sessions resolve their credentials from the instance name
+ *    via [DaemonIdentities], because an instance has exactly one owner.
+ *
+ * A session that the daemon rejects (expired/revoked credential) invalidates the
+ * cached identity, so the next request fails loudly instead of acting as the
+ * wrong user.
  */
-
-/** Username used for daemon access. Currently a single hard-coded service account. */
-const val DAEMON_USER = "akiba"
-const val DAEMON_PASSWORD = "akiba"
 
 /**
  * Header that the frontend uses to pin every request to a specific
@@ -50,6 +55,10 @@ fun ApplicationCall.instanceHeader(): String? =
 /**
  * Read the [INSTANCE_HEADER]; if missing, respond with 400 and return null.
  * Use this from routes that strictly require an instance.
+ *
+ * The instance must also belong to the caller: the server authenticates to the
+ * database daemon **as the instance's owner**, so without this check naming
+ * somebody else's instance would be enough to read their data.
  */
 suspend fun ApplicationCall.requireInstanceHeader(): String? {
     val name = instanceHeader()
@@ -58,17 +67,61 @@ suspend fun ApplicationCall.requireInstanceHeader(): String? {
             "error" to "Missing instance selection. " +
                 "Please select an instance in the UI before making this request."
         ))
+        return null
     }
+    if (!requireInstanceOwnership(name)) return null
     return name
 }
 
-/** Current authenticated username, falling back to daemon user for legacy/no-auth calls. */
-fun ApplicationCall.currentUsernameOrDefault(): String {
-    val authHeader = request.header("Authorization") ?: return DAEMON_USER
-    if (!authHeader.startsWith("Bearer ")) return DAEMON_USER
+/**
+ * Verify that the caller owns [instance], answering 401/403 when it does not.
+ *
+ * @return true when the request may proceed; false after a response was sent.
+ */
+suspend fun ApplicationCall.requireInstanceOwnership(instance: String): Boolean {
+    val problem = instanceAccessProblem(this, instance) ?: return true
+    respond(problem.first, mapOf("error" to problem.second))
+    return false
+}
+
+/**
+ * Username of the authenticated caller, or `null` when the request carries no
+ * (or an invalid) session token.
+ */
+fun ApplicationCall.currentUsernameOrNull(): String? {
+    val authHeader = request.header("Authorization") ?: return null
+    if (!authHeader.startsWith("Bearer ")) return null
     val token = authHeader.substring(7)
-    val session = JwtService.validateToken(token) ?: return DAEMON_USER
-    return UserDao.getUserById(session.userId)?.username ?: DAEMON_USER
+    val session = JwtService.validateToken(token) ?: return null
+    return UserDao.getUserById(session.userId)?.username
+}
+
+/** Raw JWT of the current request, if any. */
+fun ApplicationCall.currentTokenOrNull(): String? =
+    request.header("Authorization")
+        ?.takeIf { it.startsWith("Bearer ") }
+        ?.substring(7)
+
+/**
+ * Username of the authenticated caller.
+ *
+ * @throws IllegalStateException when the request is not authenticated. Routes
+ *         behind [org.iotsplab.akiba.server.routes.RouteHelpers] rely on the JWT
+ *         and used to fall back to a shared service account; silently borrowing
+ *         another identity is exactly what enabled cross-user access, so the
+ *         old fallback is gone on purpose — callers now fail instead.
+ */
+fun ApplicationCall.currentUsernameOrDefault(): String =
+    currentUsernameOrNull() ?: throw IllegalStateException(
+        "Authentication required: this endpoint needs a signed-in user"
+    )
+
+/** Whether the authenticated caller is an administrator. */
+fun ApplicationCall.currentUserIsAdmin(): Boolean {
+    val authHeader = request.header("Authorization") ?: return false
+    if (!authHeader.startsWith("Bearer ")) return false
+    val session = JwtService.validateToken(authHeader.substring(7)) ?: return false
+    return UserDao.getUserById(session.userId)?.isAdmin == true
 }
 
 /** Safely-mapped current username that is always safe to embed into a path segment. */
@@ -107,7 +160,7 @@ fun ApplicationCall.currentUserProjectDirectory(): Path =
 private fun safePathSegment(value: String): String =
     value.replace(Regex("[^A-Za-z0-9._-]+"), "_")
         .take(64)
-        .ifBlank { DAEMON_USER }
+        .ifBlank { "anonymous" }
 
 /**
  * Per-instance locks. The daemon only allows one active database session
@@ -120,17 +173,18 @@ private fun lockFor(instanceName: String): ReentrantLock =
     instanceLocks.computeIfAbsent(instanceName) { ReentrantLock() }
 
 /**
- * Run [block] inside a fresh [DatabaseClient] session, serialized per
- * instance so the daemon never sees two concurrent connections to the
- * same instance.
+ * Run [block] inside a fresh [DatabaseClient] session authenticated as the owner
+ * of [instanceName], serialized per instance so the daemon never sees two
+ * concurrent connections to the same instance.
  *
- * The block receives the logged-in [DatabaseClient] as its argument.
- * When [instanceName] is non-null, the client is connected to that
- * instance before the block runs. Cleanup (disconnect + logout) happens
- * in a `finally` block.
+ * The owner (and therefore the credentials) is looked up in [DaemonIdentities],
+ * which is populated at sign-in. A session that the daemon refuses invalidates
+ * the cached identity, so the user is told to sign in again rather than being
+ * silently served as the wrong account.
  *
- * Pass `instanceName = null` only for operations that legitimately work
- * without a database session (login probe, create/delete instance).
+ * @throws DatabaseClient.DatabaseDaemonException when no identity is known for
+ *         the instance (the user is not signed in, or the instance belongs to
+ *         somebody else / does not exist).
  */
 fun <T> withDaemonSession(
     daemonHost: String,
@@ -139,15 +193,74 @@ fun <T> withDaemonSession(
     serialize: Boolean = true,
     block: (DatabaseClient) -> T
 ): T {
-    val lock = if (serialize && instanceName != null) lockFor(instanceName) else null
+    if (instanceName == null) throw DatabaseClient.DatabaseDaemonException(
+        HttpStatusCode.BadRequest,
+        "This operation needs an explicit user identity; use withDaemonSessionForUser()"
+    )
+    val owner = DaemonIdentities.ownerOf(instanceName)
+        ?: throw DatabaseClient.DatabaseDaemonException(
+            HttpStatusCode.BadRequest,
+            "Instance '$instanceName' is not available in this session. " +
+                "Sign in again, or create/select an instance you own."
+        )
+    val identity = DaemonIdentities.forUser(owner)
+        ?: throw DatabaseClient.DatabaseDaemonException(
+            HttpStatusCode.Unauthorized,
+            "No database credentials cached for user '$owner'. Please sign in again."
+        )
+    return runDaemonSession(
+        daemonHost, daemonPort, identity, instanceName, if (serialize) lockFor(instanceName) else null, block
+    )
+}
 
+/**
+ * Run [block] inside a fresh [DatabaseClient] session authenticated as
+ * [username] (used by the routes that manage instances themselves — they cannot
+ * be resolved from an instance name because it may not exist yet).
+ */
+fun <T> withDaemonSessionForUser(
+    daemonHost: String,
+    daemonPort: Int,
+    username: String,
+    instanceName: String? = null,
+    serialize: Boolean = true,
+    block: (DatabaseClient) -> T
+): T {
+    val identity = DaemonIdentities.forUser(username)
+        ?: throw DatabaseClient.DatabaseDaemonException(
+            HttpStatusCode.Unauthorized,
+            "No database credentials cached for user '$username'. Please sign in again."
+        )
+    return runDaemonSession(
+        daemonHost,
+        daemonPort,
+        identity,
+        instanceName,
+        if (serialize && instanceName != null) lockFor(instanceName) else null,
+        block
+    )
+}
+
+private fun <T> runDaemonSession(
+    daemonHost: String,
+    daemonPort: Int,
+    identity: DaemonIdentity,
+    instanceName: String?,
+    lock: ReentrantLock?,
+    block: (DatabaseClient) -> T
+): T {
     fun doSession(): T {
         val dbClient = DatabaseClient(daemonHost, daemonPort)
-        dbClient.login(DAEMON_USER, DAEMON_PASSWORD)
-        val connectedInstance = instanceName?.also {
-            dbClient.connectToInstance(it)
+        try {
+            dbClient.login(identity.username, identity.secret)
+            if (instanceName != null) dbClient.connectToInstance(instanceName)
+        } catch (e: DatabaseClient.DatabaseDaemonException) {
+            if (e.statusCode == HttpStatusCode.Unauthorized) {
+                DaemonIdentities.invalidate(identity.username)
+            }
+            throw e
         }
-        logger.debug("Daemon session established for instance '${instanceName ?: "<none>"}'")
+        logger.debug("Daemon session established as '${identity.username}' for '${instanceName ?: "<none>"}'")
         return try {
             block(dbClient)
         } finally {
@@ -156,12 +269,12 @@ fun <T> withDaemonSession(
             // failures silently — a failed disconnect leaves the daemon
             // session dangling, which causes 423 Locked for the next
             // request targeting the same instance.
-            if (connectedInstance != null) {
+            if (instanceName != null) {
                 try {
-                    dbClient.disconnectToInstance(connectedInstance)
+                    dbClient.disconnectToInstance(instanceName)
                 } catch (e: Exception) {
                     logger.warn(
-                        "disconnectToInstance('$connectedInstance') failed: ${e.message}. " +
+                        "disconnectToInstance('$instanceName') failed: ${e.message}. " +
                         "The daemon may still hold this session.", e
                     )
                 }
@@ -178,6 +291,31 @@ fun <T> withDaemonSession(
     }
 
     return if (lock != null) lock.withLock { doSession() } else doSession()
+}
+
+/**
+ * Whether [call] may act on [instance], expressed as the HTTP answer to send
+ * when it may not.
+ *
+ * Instances are namespaced by owner, and the server now authenticates to the
+ * daemon **as that owner**: without this check any authenticated (or even
+ * anonymous) caller could read another user's analysis data simply by naming
+ * their instance in `X-Akiba-Instance`. It is enforced centrally in
+ * `AkibaServer` for every `/api` request that carries the header.
+ *
+ * @return null when the request may proceed, otherwise the status and message
+ *         to answer with.
+ */
+fun instanceAccessProblem(call: ApplicationCall, instance: String): Pair<HttpStatusCode, String>? {
+    val username = call.currentUsernameOrNull()
+        ?: return HttpStatusCode.Unauthorized to "Authentication required"
+    val owner = DaemonIdentities.ownerOf(instance)
+        ?: return HttpStatusCode.BadRequest to
+            "Instance '$instance' is not available in this session. " +
+            "Sign in again, or create/select an instance you own."
+    if (owner != username)
+        return HttpStatusCode.Forbidden to "Instance '$instance' belongs to another user"
+    return null
 }
 
 /**

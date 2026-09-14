@@ -40,6 +40,7 @@ fun Route.queryRoutes(daemonHost: String, daemonPort: Int) {
                 ))
                 return@post
             }
+            if (!call.requireInstanceOwnership(instance)) return@post
             logger.info("Executing query on '{}': {}", instance, req.sql)
             val result = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 dbClient.getIdInSQL(req.sql)

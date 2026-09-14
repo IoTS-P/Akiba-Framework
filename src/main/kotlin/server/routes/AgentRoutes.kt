@@ -1530,6 +1530,10 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         if (cancelled) {
             // Mark the session as closed so the frontend can recover.
             val instance = call.instanceHeader()
+            // The instance must belong to the caller: the server authenticates
+            // to the daemon as the instance owner.
+            if (instance != null && !call.requireInstanceOwnership(instance))
+                return@post
             if (instance != null) {
                 runCatching {
                     withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
@@ -2153,9 +2157,20 @@ private fun createManualAgentConfig(
         .normalize()
     val projectName = sessionInfo.projectName ?: "manual-agent-${sessionInfo.sessionId.take(8)}"
 
+    // The spawned worker talks to the daemon on its own, as the instance's
+    // owner: there is no shared service account any more. It is handed a
+    // derived credential (not the account password), which the daemon expires
+    // on its own.
+    val daemonIdentity = DaemonIdentities.ownerOf(instanceName)
+        ?.let { DaemonIdentities.forUser(it) }
+        ?: throw IllegalStateException(
+            "No database credentials cached for instance '$instanceName'; " +
+                "sign in again so the server can authenticate on your behalf"
+        )
+
     val mainConfig = linkedMapOf<String, Any?>(
-        "username" to DAEMON_USER,
-        "password" to DAEMON_PASSWORD,
+        "username" to daemonIdentity.username,
+        "password" to daemonIdentity.secret,
         "usingInstance" to instanceName,
         "general" to linkedMapOf(
             "autoAnalysisTimeout" to ConfigManager.mainConf.autoAnalysisTimeout,
@@ -2173,7 +2188,6 @@ private fun createManualAgentConfig(
         "sqlSource" to linkedMapOf(
             "serverIP" to daemonHost,
             "serverPort" to daemonPort,
-            "useSnapshot" to "current",
             "constraint" to (binaryId?.let { "WHERE u.id = $it" } ?: "server"),
             "disableUpdate" to false,
             "useLocalCache" to null

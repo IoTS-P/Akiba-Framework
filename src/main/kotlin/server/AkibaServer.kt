@@ -42,8 +42,7 @@ import org.iotsplab.akiba.server.routes.projectRoutes
 import org.iotsplab.akiba.server.routes.skillRoutes
 import org.iotsplab.akiba.server.routes.moduleRoutes
 import org.iotsplab.akiba.server.routes.updateRoutes
-import org.iotsplab.akiba.server.routes.DAEMON_USER
-import org.iotsplab.akiba.server.routes.DAEMON_PASSWORD
+import org.iotsplab.akiba.server.routes.adminRoutes
 import java.util.concurrent.atomic.AtomicBoolean
 
 object AkibaServer {
@@ -52,21 +51,39 @@ object AkibaServer {
     /**
      * Comma-separated list of daemon instances to reconcile at startup
      * and on JVM shutdown. Override via the `AKIBA_AGENT_RECONCILE_INSTANCES`
-     * environment variable when the deployment uses non-default instance
-     * names; the default covers the standard Docker deployment (the
-     * `akiba-instance` instance created by `dockerfile_needed/entrypoint.sh`).
+     * environment variable; the default is empty, because instances are created
+     * per user on demand and no instance name is baked into a deployment any
+     * more.
      *
-     * Set to the literal string "off" (or empty) to skip reconciliation
+     * Sign-in already reconciles each user's own instances
+     * (see `reconcileUserInstances`), so this environment variable is only
+     * needed for instances that no user ever signs in for — which additionally
+     * requires `AKIBA_DAEMON_USER` / `AKIBA_DAEMON_PASSWORD` (there is no
+     * built-in service account), and that account must own those instances.
+     *
+     * Set to the literal string "off" (or leave empty) to skip reconciliation
      * entirely — useful for tests / debugging.
      */
     private val reconcileInstances: List<String> by lazy {
         val raw = System.getenv("AKIBA_AGENT_RECONCILE_INSTANCES")
             ?.takeIf { it.isNotBlank() }
-            ?: "akiba-instance"
+            ?: ""
         when (raw.trim().lowercase()) {
-            "off", "false", "no", "0" -> emptyList()
+            "", "off", "false", "no", "0" -> emptyList()
             else -> raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }
         }
+    }
+
+    /**
+     * Optional service account for the reconciliation passes, taken **only** from
+     * the environment (no default, no shipped password). When it is not set, the
+     * env-driven passes are skipped with an explanatory log line; per-sign-in
+     * reconciliation is unaffected because it uses the user's own identity.
+     */
+    private val reconcileCredentials: Pair<String, String>? by lazy {
+        val user = System.getenv("AKIBA_DAEMON_USER")?.takeIf { it.isNotBlank() }
+        val password = System.getenv("AKIBA_DAEMON_PASSWORD")?.takeIf { it.isNotBlank() }
+        if (user != null && password != null) user to password else null
     }
 
     /**
@@ -158,7 +175,8 @@ object AkibaServer {
                         call.respond(mapOf("status" to "ok"))
                     }
 
-                    authRoutes()
+                    authRoutes(config.daemonHost, config.daemonPort)
+                    adminRoutes(config.daemonHost, config.daemonPort)
                     instanceRoutes(config.daemonHost, config.daemonPort)
                     fileRoutes(config.daemonHost, config.daemonPort)
                     workflowRoutes(config.daemonHost, config.daemonPort)
@@ -325,12 +343,14 @@ object AkibaServer {
     }
 
     /**
-     * Open a fresh [DatabaseClient] session, log in as the
-     * daemon user, connect to [instance], run the
-     * [AgentSessionReconciler], then disconnect + logout.  The
-     * session is held only for the duration of the call so we
-     * don't keep a daemon slot reserved for the lifetime of the
-     * server.
+     * Open a fresh [DatabaseClient] session, log in with the configured service
+     * account, connect to [instance], run the [AgentSessionReconciler], then
+     * disconnect + logout.  The session is held only for the duration of the call
+     * so we don't keep a daemon slot reserved for the lifetime of the server.
+     *
+     * The service account must own [instance]: the daemon only lets a client
+     * connect to instances it owns. When no service account is configured the
+     * pass is skipped — the per-sign-in reconciliation covers the normal case.
      */
     private fun reconcileOneInstance(
         instance: String,
@@ -338,10 +358,20 @@ object AkibaServer {
         daemonPort: Int,
         reasonTag: String,
     ) {
+        val credentials = reconcileCredentials
+        if (credentials == null) {
+            logger.info(
+                "AkibaServer: skipping reconciliation of instance '$instance' ($reasonTag): " +
+                    "no service account configured (set AKIBA_DAEMON_USER and " +
+                    "AKIBA_DAEMON_PASSWORD, or let the owner sign in so their instances " +
+                    "are reconciled automatically)"
+            )
+            return
+        }
         val client = DatabaseClient(daemonHost, daemonPort)
         var connected = false
         try {
-            client.login(DAEMON_USER, DAEMON_PASSWORD)
+            client.login(credentials.first, credentials.second)
             client.connectToInstance(instance)
             connected = true
             val report = AgentSessionReconciler(

@@ -87,8 +87,6 @@
       "serverIP": "127.0.0.1",
       // serverPort: Akiba 数据库守护程序端口，默认为 31777
       "serverPort": "31777",
-      // useSnapshot: 指定使用的数据库快照。目前该功能尚未支持，保留。
-      "useSnapshot": "current",
       // constraint: ID 筛选约束。默认为空，表示分析数据库中的所有文件。也可填入 SQL 语句片段，如 "WHERE u.ID < 100"
       //             该片段与 "SELECT u.ID FROM using_binaries u" 拼接。
       "constraint": "",

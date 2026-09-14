@@ -230,6 +230,10 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
                 ))
                 return@get
             }
+        // The instance comes from a query parameter or the header; either way it
+        // must belong to the caller, because the server authenticates to the
+        // daemon as its owner.
+        if (!call.requireInstanceOwnership(instance)) return@get
         val query = call.parameters["q"] ?: ""
         logger.debug("File search requested: instance='{}', query='{}'", instance, query)
         try {
@@ -254,6 +258,10 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
                 ))
                 return@get
             }
+        // The instance comes from a query parameter or the header; either way it
+        // must belong to the caller, because the server authenticates to the
+        // daemon as its owner.
+        if (!call.requireInstanceOwnership(instance)) return@get
         val offset = call.parameters["offset"]?.toIntOrNull() ?: 0
         val limit = call.parameters["limit"]?.toIntOrNull() ?: 20
         logger.debug("File list requested: instance='{}', offset={}, limit={}", instance, offset, limit)
@@ -314,6 +322,7 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
                 ))
                 return@delete
             }
+        if (!call.requireInstanceOwnership(instance)) return@delete
         val req = try {
             call.receive<DeleteFileRequest>()
         } catch (e: Exception) {

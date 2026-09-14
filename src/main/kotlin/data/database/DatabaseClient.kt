@@ -72,6 +72,13 @@ class DatabaseClient(
     // ============================================================
 
     companion object {
+        /**
+         * Daemon websocket close code for "conflicts with the current state,
+         * retrying later works" — mirrors `AbstractWebsocketRoute.WS_CLOSE_CONFLICT`
+         * in akiba_db_daemon (the two components share no code, only the wire).
+         */
+        private const val WS_CLOSE_CONFLICT: Short = 4409
+
         val httpClient: HttpClient = HttpClient {
             install(ContentNegotiation) {
                 jackson {
@@ -139,11 +146,14 @@ class DatabaseClient(
         // Surface a meaningful message to callers. Without this the default
         // Exception() ctor leaves `message` null, which has been bubbling up
         // to the HTTP layer as `{"error": null}` for every server route that
-        // catches the exception generically.
+        // catches the exception generically. The status only appears when there
+        // is no message of its own — appending "409 Conflict" to a sentence that
+        // already explains the problem just reads as noise in the UI.
         listOfNotNull(
-            statusMsg?.takeIf { it.isNotBlank() },
-            statusCode?.let { "${it.value} ${it.description}" }
-        ).joinToString(": ").ifBlank { "Database daemon error" }
+            statusMsg?.takeIf { it.isNotBlank() }
+        ).joinToString(": ").ifBlank {
+            statusCode?.let { "${it.value} ${it.description}" } ?: "Database daemon error"
+        }
     )
 
     // ============================================================
@@ -477,8 +487,34 @@ class DatabaseClient(
 
     /*   PGInstances   */
 
+    /** Result of a successful `/instance/login` call. */
+    data class DaemonLoginInfo(
+        val token: String,
+        val username: String,
+        val isAdmin: Boolean,
+        /**
+         * True when the daemon had no credential store yet and registered this
+         * login as its first (administrator) account.
+         */
+        val bootstrapped: Boolean,
+    )
+
     @Throws(DatabaseDaemonException::class)
-    fun login(userName: String, password: String) = runBlocking {
+    fun login(userName: String, password: String) {
+        loginDetailed(userName, password)
+    }
+
+    /**
+     * Log in and return the details of the issued session.
+     *
+     * The daemon verifies the credentials against its own credential store; an
+     * unknown username and a wrong password are reported identically (HTTP 401).
+     * Callers that own a credential source of their own (the HTTP server
+     * verifies the password against its user table first) can use
+     * [registerUser] to create the missing credential and retry.
+     */
+    @Throws(DatabaseDaemonException::class)
+    fun loginDetailed(userName: String, password: String): DaemonLoginInfo = runBlocking {
         val response = post("/instance/login", mapOf(
             "username" to userName,
             "password" to password
@@ -488,8 +524,146 @@ class DatabaseClient(
             else
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
-        this@DatabaseClient.token = jacksonObjectMapper().readValue<Map<String, String>>(response)["token"]
+        val body = jacksonObjectMapper().readValue<Map<String, Any?>>(response)
+        val token = body["token"] as? String
             ?: throw DatabaseDaemonException(HttpStatusCode.InternalServerError, "Failed to get token")
+        this@DatabaseClient.token = token
+        DaemonLoginInfo(
+            token = token,
+            username = body["username"] as? String ?: userName,
+            isAdmin = body["isAdmin"] as? Boolean ?: false,
+            bootstrapped = body["bootstrapped"] as? Boolean ?: false,
+        )
+    }
+
+    /**
+     * Create a daemon credential.
+     *
+     * When this client already holds a token belonging to an administrator, that
+     * token authorizes creating further users. The daemon always accepts the
+     * very first credential without authorization (bootstrap) and accepts new
+     * usernames from unauthenticated callers — a brand-new username owns no
+     * instance and can therefore reach no data (instance ownership is enforced
+     * on `/instance/connect`).
+     *
+     * @return true when the credential was created; false when the username
+     *         already exists (in which case the caller should treat a failed
+     *         [login] as a wrong password).
+     */
+    @Throws(DatabaseDaemonException::class)
+    fun registerUser(userName: String, password: String, isAdmin: Boolean = false): Boolean = runBlocking {
+        post("/instance/register", mapOf(
+            "username" to userName,
+            "password" to password,
+            "isAdmin" to isAdmin,
+        ), putToken = false).let {
+            when (it.first) {
+                HttpStatusCode.OK -> true
+                HttpStatusCode.Conflict -> false
+                else -> throw DatabaseDaemonException(it.first, it.first.description)
+            }
+        }
+    }
+
+    /**
+     * Change the password of an existing credential (administrator token
+     * required). Called by the framework's admin API so that a web password reset
+     * also applies to the daemon copy.
+     *
+     * @return true when the credential was updated; false when the user does not
+     *         exist in the daemon's store.
+     */
+    @Throws(DatabaseDaemonException::class)
+    fun setUserPassword(userName: String, newPassword: String): Boolean = runBlocking {
+        post("/instance/set-password", mapOf(
+            "username" to userName,
+            "password" to newPassword,
+        )).let {
+            when (it.first) {
+                HttpStatusCode.OK -> true
+                HttpStatusCode.NotFound -> false
+                else -> throw DatabaseDaemonException(it.first, it.first.description)
+            }
+        }
+    }
+
+    /**
+     * Lift an account's brute-force lock (administrator token required).
+     *
+     * The daemon applies the same policy as the framework's web login, so an
+     * account unlocked on the web has to be unlocked here as well.
+     *
+     * @return true when the account exists and is unlocked.
+     */
+    @Throws(DatabaseDaemonException::class)
+    fun unlockUser(userName: String): Boolean = runBlocking {
+        post("/instance/unlock", mapOf("username" to userName)).let {
+            when (it.first) {
+                HttpStatusCode.OK -> true
+                HttpStatusCode.NotFound -> false
+                else -> throw DatabaseDaemonException(it.first, it.first.description)
+            }
+        }
+    }
+
+    /** An instance owned by the authenticated user, as reported by the daemon. */
+    data class DaemonInstance(
+        val name: String,
+        val port: Int = 0,
+        val running: Boolean = false,
+        val logicalPrior: String? = null,
+    )
+
+    private data class InstanceListResponse(
+        val username: String? = null,
+        val isAdmin: Boolean = false,
+        val instances: List<DaemonInstance> = emptyList(),
+    )
+
+    /**
+     * List the instances owned by the authenticated user.
+     *
+     * The daemon never exposes other users' instances here, so this is the
+     * authoritative answer to "does this user have any instance yet?".
+     */
+    @Throws(DatabaseDaemonException::class)
+    fun listInstances(): List<DaemonInstance> = runBlocking {
+        val response = post("/instance/list", mapOf<String, String>()).let {
+            if (it.first == HttpStatusCode.OK)
+                it.second
+            else
+                throw DatabaseDaemonException(it.first, it.first.description)
+        }
+        jacksonObjectMapper()
+            .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+            .readValue<InstanceListResponse>(response)
+            .instances
+    }
+
+    /**
+     * Obtain a fresh single-purpose credential bound to the authenticated user.
+     *
+     * Child processes spawned by the server (workflow runs, manual agent
+     * workers) authenticate with the daemon on their own, and they must do so as
+     * the instance's owner. Instead of copying the user's password into a
+     * generated config file, the parent asks the daemon for a derived secret:
+     * logging in with it yields the same identity, while leaving the real
+     * password untouched and letting the daemon expire the secret.
+     *
+     * @param label Free-form label recorded with the credential (diagnostics).
+     * @return the plaintext secret; it is returned exactly once by the daemon.
+     */
+    @Throws(DatabaseDaemonException::class)
+    fun grantWorkerCredential(label: String = "worker"): String = runBlocking {
+        val response = post("/instance/worker-grant", mapOf("label" to label)).let {
+            if (it.first == HttpStatusCode.OK)
+                it.second
+            else
+                throw DatabaseDaemonException(it.first, it.first.description)
+        }
+        jacksonObjectMapper().readValue<Map<String, String>>(response)["secret"]
+            ?: throw DatabaseDaemonException(
+                HttpStatusCode.InternalServerError, "Failed to obtain worker credential")
     }
 
     @Throws(DatabaseDaemonException::class)
@@ -605,17 +779,44 @@ class DatabaseClient(
             } catch (_: ClosedReceiveChannelException) {
                 val closeMsg = closeReason.await()!!
                 throw DatabaseDaemonException(
-                    HttpStatusCode.InternalServerError, "Failed to backup: ${closeMsg.message}"
+                    statusFor(closeMsg), "Failed to backup: ${closeMsg.message}"
                 )
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                // Log it: this branch used to swallow the cause, which is exactly
+                // how "the daemon said no" became an unexplainable 500.
+                globalLogger.warn("Backup request for '$instanceName' failed: ${e.message}", e)
                 throw DatabaseDaemonException(
                     HttpStatusCode.InternalServerError,
-                    "Exception occurred while requesting for backup"
+                    "Exception occurred while requesting for backup: ${e.message}"
                 )
             }
         }
 
         return@runBlocking label!!
+    }
+
+    /** Instances of the caller that currently have a backup/restore in flight. */
+    data class BackupStatus(
+        val busyInstances: List<String> = emptyList(),
+        /** Set only when a single instance was asked about. */
+        val busy: Boolean? = null,
+    )
+
+    /**
+     * Ask the daemon whether a backup or restore is running for [instanceName]
+     * (or, with no argument, which of the caller's instances are busy).
+     *
+     * See `Backups.BackupStatus` in akiba_db_daemon. The UI uses this to disable
+     * "Back up" while a run is in progress — including runs it did not start —
+     * instead of letting the user click into a refusal.
+     */
+    @Throws(DatabaseDaemonException::class)
+    fun backupStatus(instanceName: String? = null): BackupStatus = runBlocking {
+        post("/backup/status", mapOf("instance" to instanceName)).let {
+            if (it.first != HttpStatusCode.OK)
+                throw DatabaseDaemonException(it.first, it.first.description)
+            jacksonObjectMapper().readValue(it.second)
+        }
     }
 
     data class BackupNode(
@@ -691,9 +892,22 @@ class DatabaseClient(
                 val closeMsg = closeReason.await()
                 if (closeMsg?.knownReason != CloseReason.Codes.NORMAL)
                     throw DatabaseDaemonException(
-                        HttpStatusCode.InternalServerError, "Failed to restore: ${closeMsg!!.message}"
+                        statusFor(closeMsg), "Failed to restore: ${closeMsg!!.message}"
                     )
             }
         }
     }
+
+    /**
+     * HTTP status for a daemon websocket close code.
+     *
+     * 4409 is the daemon's "conflicts with the current state, retrying later
+     * works" code (see `AbstractWebsocketRoute.WS_CLOSE_CONFLICT` in
+     * akiba_db_daemon) — the case a second backup/restore of the same instance
+     * hits. Reporting it as a conflict, rather than as an internal error, is what
+     * lets the UI say "a backup is already running" instead of showing a bare 500.
+     */
+    private fun statusFor(reason: CloseReason?): HttpStatusCode =
+        if (reason?.code == WS_CLOSE_CONFLICT) HttpStatusCode.Conflict
+        else HttpStatusCode.InternalServerError
 }

@@ -90,8 +90,6 @@ Example configuration file:
       "serverIP": "127.0.0.1",
       // serverPort: Port of Akiba database daemon, default is 31777
       "serverPort": "31777",
-      // useSnapshot: Specify the database snapshot to use. This feature is not yet supported, reserved.
-      "useSnapshot": "current",
       // constraint: ID filtering constraint. Default is empty, meaning all files in the database will be analyzed.
       //             SQL statement fragments can also be filled in, such as "WHERE u.ID < 100".
       //             This fragment is concatenated with "SELECT u.ID FROM using_binaries u".

@@ -88,8 +88,6 @@ data class SqlSource(
     var serverIP: String = "127.0.0.1",
     // Database username
     var serverPort: Int = 31777,
-    // Database snapshot used, default `current` is the latest snapshot used in the last time
-    var useSnapshot: String = "current",
     // SELECT constraint which determines ids to be processed
     var constraint: String = "",
     // If set true, the database will become read-only and all update requests will be discarded
