@@ -5,55 +5,64 @@ import dev.langchain4j.data.message.AiMessage
 import dev.langchain4j.data.message.ChatMessage
 import dev.langchain4j.data.message.SystemMessage
 import dev.langchain4j.data.message.UserMessage
+import dev.langchain4j.http.client.HttpClientBuilder
+import dev.langchain4j.http.client.jdk.JdkHttpClientBuilder
 import dev.langchain4j.model.chat.ChatModel
 import dev.langchain4j.model.chat.StreamingChatModel
 import dev.langchain4j.model.chat.request.ChatRequest
+import dev.langchain4j.model.chat.request.json.JsonBooleanSchema
+import dev.langchain4j.model.chat.request.json.JsonEnumSchema
+import dev.langchain4j.model.chat.request.json.JsonIntegerSchema
+import dev.langchain4j.model.chat.request.json.JsonObjectSchema
+import dev.langchain4j.model.chat.request.json.JsonSchemaElement
+import dev.langchain4j.model.chat.request.json.JsonStringSchema
 import dev.langchain4j.model.chat.response.ChatResponse
 import dev.langchain4j.model.chat.response.PartialThinking
 import dev.langchain4j.model.chat.response.PartialThinkingContext
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler
-import dev.langchain4j.model.chat.request.json.JsonObjectSchema
-import dev.langchain4j.model.chat.request.json.JsonStringSchema
-import dev.langchain4j.model.chat.request.json.JsonIntegerSchema
-import dev.langchain4j.model.chat.request.json.JsonBooleanSchema
-import dev.langchain4j.model.chat.request.json.JsonEnumSchema
-import dev.langchain4j.model.chat.request.json.JsonSchemaElement
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flow
-import org.apache.logging.log4j.LogManager
+import java.net.http.HttpClient
+import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import org.apache.logging.log4j.LogManager
 
 /**
- * Base class for all langchain4j-backed [AkibaLLMClient] implementations.
- *
- * Subclasses only need to:
- * 1. Initialise [chatModel] and [streamingModel] in their constructor
- * 2. Set [providerTag] for log messages
- * 3. Override [supportsToolCalling] if the provider doesn't support tools
- *
- * All chat/stream/message-conversion logic is handled here.
- *
- * **Native tool calling**: When [tools] are provided, this adapter converts
- * them into langchain4j [ToolSpecification] objects and passes them to the
- * provider via [ChatRequest]. The provider's response may contain
- * [AiMessage.toolExecutionRequests] which are surfaced as
- * [ChatCompletion.toolCalls].
+ * Thrown when a single LLM attempt exceeds
+ * [LLM_ATTEMPT_TIMEOUT_MS][org.iotsplab.akiba.llm.client.LLM_ATTEMPT_TIMEOUT_MS]
+ * (no response, or 30 s of stream silence).
  */
 class LLMTimeoutException(message: String) : RuntimeException(message)
 
 /**
- * How long the streaming chat consumer waits for the *next* chunk
- * before declaring the stream stalled. 45 s tolerates provider-side
- * scheduling pauses while still detecting genuinely dead connections
- * quickly enough for the retry loop.
+ * Deadline for one **streaming** attempt, in milliseconds — both the initial
+ * connection (no first byte) and the stall watchdog, which declares the stream
+ * dead when **no** chunk (content *or* thinking delta) arrives for this long.
+ *
+ * One-shot `chat()` calls are deliberately **not** bounded by this: a summary
+ * compaction has no chunk stream to prove liveness and can legitimately take
+ * minutes, so only [LLMConfig.timeoutSeconds] applies.
+ *
+ * Retries live one layer up in `StrategyContext.callLLM`, which owns the
+ * retry budget.
  */
-private const val PER_CHUNK_TIMEOUT_MS: Long = 45_000L
+const val LLM_ATTEMPT_TIMEOUT_MS: Long = 30_000L
 
+/**
+ * Base class for all langchain4j-backed [AkibaLLMClient] implementations.
+ *
+ * Subclasses initialise [chatModel] and [streamingModel] (passing
+ * [httpClientBuilder] so [close] can release the connection pool) and set
+ * [providerTag]; [supportsToolCalling] is overridden when the provider has no
+ * tools. When [tools] are supplied they reach the provider as langchain4j
+ * [ToolSpecification]s, and [AiMessage.toolExecutionRequests] come back as
+ * [ChatCompletion.toolCalls].
+ */
 abstract class AbstractLangChainAdapter(
     override val config: LLMConfig
 ) : AkibaLLMClient {
@@ -69,28 +78,69 @@ abstract class AbstractLangChainAdapter(
 
     /**
      * Logger for adapter-level messages (chat requests, connection
-     * lifecycle, errors).  Defaults to the per-class logger (which
-     * writes to the global Root.log).  [org.iotsplab.akiba.llm.agent.AgentModule]
-     * overrides it with the module logger right after client creation
-     * so adapter logs land in the module's own log file alongside the
-     * agent's strategy logs.  Assignment happens before any chat call,
-     * so a plain `var` is sufficient.
+     * lifecycle, errors).  Defaults to the per-class logger;
+     * [org.iotsplab.akiba.llm.agent.module.AgentModule] swaps in the module
+     * logger after client creation so these lines land in the module's log
+     * file.  Assignment happens before any chat call, so a plain `var` is
+     * enough.
      */
     var logger: org.apache.logging.log4j.Logger = LogManager.getLogger(this::class.java)
         internal set
 
-    private fun <T> runWithHardTimeout(label: String, block: () -> T): T {
-        val timeoutSeconds = config.timeoutSeconds.coerceAtLeast(1)
+    /**
+     * JDK HTTP clients created through [httpClientBuilder], kept so [close]
+     * can shut their connection pools down.
+     */
+    private val trackedHttpClients = java.util.concurrent.CopyOnWriteArrayList<HttpClient>()
+
+    /**
+     * A model builder argument that records every JDK [HttpClient] langchain4j
+     * creates from it.
+     *
+     * langchain4j's own `HttpClient` SPI has no `close()`, so without this the
+     * underlying `java.net.http.HttpClient` (1200 s keep-alive) outlives the
+     * session and holds the provider's per-IP connection budget hostage — the
+     * "20-30 minute freeze" class of bug.  Subclasses pass this to
+     * `.httpClientBuilder(...)` on each model builder.
+     */
+    protected fun httpClientBuilder(): HttpClientBuilder =
+        TrackingHttpClientBuilder(JdkHttpClientBuilder(), trackedHttpClients::add)
+
+    /**
+     * Transport timeout for the **streaming** model builders.
+     *
+     * Capped at [LLM_ATTEMPT_TIMEOUT_MS]: for SSE this is the per-read timeout,
+     * i.e. "30 s without a chunk = stalled", which must never outlive the
+     * attempt that owns it.
+     */
+    protected fun streamTimeout(): Duration {
+        val secs = minOf(config.timeoutSeconds, (LLM_ATTEMPT_TIMEOUT_MS / 1000).toInt())
+            .coerceAtLeast(1)
+        return Duration.ofSeconds(secs.toLong())
+    }
+
+    /**
+     * Transport timeout for the **one-shot** chat model.
+     *
+     * NOT capped at 30 s: a single completion (summary compaction, BTW
+     * follow-up) can legitimately take minutes, and there is no chunk stream
+     * to prove liveness.  Bounded by [LLMConfig.timeoutSeconds] only.
+     */
+    protected fun chatTimeout(): Duration =
+        Duration.ofSeconds(config.timeoutSeconds.coerceAtLeast(1).toLong())
+
+    private fun <T> runWithHardTimeout(label: String, timeoutMs: Long, block: () -> T): T {
+        val budget = timeoutMs.coerceAtLeast(1)
         val executor = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "akiba-llm-$providerTag-$label-timeout").apply { isDaemon = true }
         }
         val future = executor.submit<T> { block() }
         return try {
-            future.get(timeoutSeconds.toLong(), TimeUnit.SECONDS)
+            future.get(budget, TimeUnit.MILLISECONDS)
         } catch (e: TimeoutException) {
             future.cancel(true)
             throw LLMTimeoutException(
-                "$providerTag $label timed out after ${timeoutSeconds}s " +
+                "$providerTag $label timed out after ${budget}ms " +
                     "(model=${config.modelName})"
             )
         } catch (e: ExecutionException) {
@@ -112,20 +162,18 @@ abstract class AbstractLangChainAdapter(
     override fun chat(
         systemPrompt: String?,
         messages: List<org.iotsplab.akiba.llm.memory.AgentChatMessage>,
-        tools: List<String>?
+        tools: List<ToolSpecification>?
     ): ChatCompletion {
         val lcMessages = toLangChainMessages(systemPrompt, messages)
         if (config.debugLogging) {
             logger.info("[$providerTag] chat request: ${lcMessages.size} messages, model=${config.modelName}")
         }
 
-        val toolSpecs = tools?.mapNotNull { parseToolSpec(it) }
-
-        val response: ChatResponse = runWithHardTimeout("chat") {
-            if (!toolSpecs.isNullOrEmpty() && supportsToolCalling()) {
+        val response: ChatResponse = runWithHardTimeout("chat", config.timeoutSeconds * 1000L) {
+            if (!tools.isNullOrEmpty() && supportsToolCalling()) {
                 val request = ChatRequest.builder()
                     .messages(lcMessages)
-                    .toolSpecifications(toolSpecs)
+                    .toolSpecifications(tools)
                     .build()
                 chatModel.chat(request)
             } else {
@@ -143,10 +191,9 @@ abstract class AbstractLangChainAdapter(
     override fun chatStream(
         systemPrompt: String?,
         messages: List<org.iotsplab.akiba.llm.memory.AgentChatMessage>,
-        tools: List<String>?
+        tools: List<ToolSpecification>?
     ): Flow<ChatChunk> = flow {
         val lcMessages = toLangChainMessages(systemPrompt, messages)
-        val toolSpecs = tools?.mapNotNull { parseToolSpec(it) }
 
         // Channel that bridges the langchain4j callback world (push) into
         // the Kotlin Flow world (pull).  Use UNLIMITED capacity: the
@@ -170,14 +217,27 @@ abstract class AbstractLangChainAdapter(
         // deltas arrive via onPartialThinking, not onPartialResponse.
         val lastActivityAt = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
 
+        // Sent through the same channel as content deltas so the consumer
+        // wakes the moment the provider finishes or errors, instead of
+        // discovering it at the next probe timeout (that lag used to delay the
+        // terminal chunk — and the "stream closed" signal to the UI — by up to
+        // 5 s after the last content token).
+        val terminalSentinel = "\u0000akiba:stream-terminal\u0000"
+
+        // Emit any deltas queued behind the completion signal, skipping the
+        // sentinel itself.  Declared locally so it shares the collector.
+        suspend fun drainPendingDeltas() {
+            while (true) {
+                val rest = chunkChannel.tryReceive().getOrNull() ?: break
+                if (rest != terminalSentinel) {
+                    emit(ChatChunk(delta = rest, isComplete = false))
+                }
+            }
+        }
+
         val handler = object : StreamingChatResponseHandler {
             override fun onPartialResponse(partial: String) {
                 lastActivityAt.set(System.currentTimeMillis())
-                // trySend is non-blocking; if the channel is full we drop
-                // the chunk (which is OK for UI feedback but bad for the
-                // final accumulation).  We therefore also append to a
-                // local buffer inside the synchronized block.  Caller
-                // uses both — flow for UI, buffer for the final result.
                 chunkChannel.trySend(partial)
             }
 
@@ -191,23 +251,25 @@ abstract class AbstractLangChainAdapter(
 
             override fun onCompleteResponse(response: ChatResponse) {
                 completionRef.set(response)
+                chunkChannel.trySend(terminalSentinel)
                 doneLatch.countDown()
             }
 
             override fun onError(error: Throwable) {
                 errorRef.set(error)
+                chunkChannel.trySend(terminalSentinel)
                 doneLatch.countDown()
             }
         }
 
         // Kick off the streaming call in a hard-timeout wrapper so a
         // stuck *initial* connection (no first chunk ever) still times
-        // out within `config.timeoutSeconds`.
-        runWithHardTimeout("stream-start") {
-            if (!toolSpecs.isNullOrEmpty() && supportsToolCalling()) {
+        // out within LLM_ATTEMPT_TIMEOUT_MS.
+        runWithHardTimeout("stream-start", LLM_ATTEMPT_TIMEOUT_MS) {
+            if (!tools.isNullOrEmpty() && supportsToolCalling()) {
                 val request = ChatRequest.builder()
                     .messages(lcMessages)
-                    .toolSpecifications(toolSpecs)
+                    .toolSpecifications(tools)
                     .build()
                 streamingModel.chat(request, handler)
             } else {
@@ -216,15 +278,18 @@ abstract class AbstractLangChainAdapter(
         }
 
         // Stall watchdog: if NO streaming activity (content or thinking
-        // deltas) arrives for PER_CHUNK_TIMEOUT_MS, the stream is dead
+        // deltas) arrives for LLM_ATTEMPT_TIMEOUT_MS, the stream is dead
         // (provider throttling / network half-open) — treat it as a
-        // timeout so the retry loop kicks in.  There is deliberately no
+        // timeout so the retry budget kicks in.  There is deliberately no
         // overall time cap: thinking models can legitimately stream for
         // many minutes, and any activity proves the stream is alive.
         // Short probe interval so completion/error signals are picked up
         // promptly even when no content chunks flow.
-        val stallTimeoutMs = PER_CHUNK_TIMEOUT_MS
-        val probeMs = 5_000L
+        val stallTimeoutMs = LLM_ATTEMPT_TIMEOUT_MS
+        // Probe interval only bounds how late a *silent* stream's completion is
+        // noticed; the terminal sentinel wakes us immediately in the common
+        // case.  1 s keeps the watchdog alarm close to stallTimeoutMs.
+        val probeMs = 1_000L
 
         try {
             while (true) {
@@ -247,18 +312,17 @@ abstract class AbstractLangChainAdapter(
                     if (doneLatch.count == 0L) break
                     continue
                 }
+                if (chunk == terminalSentinel) {
+                    drainPendingDeltas()
+                    break
+                }
                 // Got a chunk — emit it as an incremental delta.
                 emit(ChatChunk(delta = chunk, isComplete = false))
                 // Check if the producer signalled completion while we
                 // were emitting.  If so, drain any remaining queued
                 // chunks and exit.
                 if (doneLatch.count == 0L) {
-                    // Drain any chunks that arrived between our last
-                    // receive and the completion signal.
-                    while (true) {
-                        val rest = chunkChannel.tryReceive().getOrNull() ?: break
-                        emit(ChatChunk(delta = rest, isComplete = false))
-                    }
+                    drainPendingDeltas()
                     break
                 }
             }
@@ -357,160 +421,81 @@ abstract class AbstractLangChainAdapter(
         )
     }
 
-    // ============================================================
-    //  Tool specification parsing
-    // ============================================================
-
-    /**
-     * Parse a tool JSON schema string (as produced by [org.iotsplab.akiba.llm.tool.Tool.toJsonSchema])
-     * into a langchain4j [ToolSpecification].
-     *
-     * Expected input format:
-     * ```json
-     * {"type":"function","function":{"name":"...","description":"...","parameters":{...}}}
-     * ```
-     */
-    private fun parseToolSpec(jsonSchema: String): ToolSpecification? {
-        return try {
-            val mapper = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
-            val root = mapper.readTree(jsonSchema)
-            val fn = root["function"] ?: return null
-
-            val name = fn["name"]?.asText() ?: return null
-            val description = fn["description"]?.asText() ?: ""
-            val paramsNode = fn["parameters"]
-
-            val builder = ToolSpecification.builder()
-                .name(name)
-                .description(description)
-
-            if (paramsNode != null && paramsNode.has("properties")) {
-                val schemaBuilder = JsonObjectSchema.builder()
-                val properties = paramsNode["properties"]
-                val requiredList = paramsNode["required"]?.map { it.asText() } ?: emptyList()
-
-                properties.properties().forEach { (propName, propDef) ->
-                    val type = propDef["type"]?.asText() ?: "string"
-                    val desc = propDef["description"]?.asText() ?: ""
-                    val enumValues = propDef["enum"]?.map { it.asText() }
-
-                    val element: JsonSchemaElement = when {
-                        enumValues != null -> JsonEnumSchema.builder()
-                            .description(desc)
-                            .enumValues(enumValues)
-                            .build()
-                        type == "integer" || type == "number" -> JsonIntegerSchema.builder()
-                            .description(desc)
-                            .build()
-                        type == "boolean" -> JsonBooleanSchema.builder()
-                            .description(desc)
-                            .build()
-                        else -> JsonStringSchema.builder()
-                            .description(desc)
-                            .build()
-                    }
-                    schemaBuilder.addProperty(propName, element)
-                }
-
-                if (requiredList.isNotEmpty()) {
-                    schemaBuilder.required(requiredList)
-                }
-
-                builder.parameters(schemaBuilder.build())
-            }
-
-            builder.build()
-        } catch (e: Exception) {
-            logger.debug("[$providerTag] Failed to parse tool spec: ${e.message}")
-            null
-        }
-    }
-
     override fun close() {
         // langchain4j wraps a JDK java.net.http.HttpClient inside each
-        // model (chatModel + streamingModel); its connection pool has a
-        // 1200 s default keep-alive.  Without an explicit shutdown, pools
-        // linger after the session ends and exhaust the provider's
-        // per-IP connection budget.
+        // model; its connection pool has a 1200 s default keep-alive.
+        // Without an explicit shutdown, pools linger after the session
+        // ends and exhaust the provider's per-IP connection budget.
         //
-        // Walk both models reflectively and call `shutdownNow()` (JDK 21+)
-        // on every java.net.http.HttpClient found, forcibly closing all
-        // idle connections and releasing local FDs and provider slots.
-        val visited = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>())
+        // Every client created through [httpClientBuilder] was recorded, so
+        // this is a direct shutdown of known instances — no object-graph
+        // walking, nothing that silently breaks when langchain4j rearranges
+        // its internals.
         var closed = 0
-        closed += shutdownHttpClients(chatModel, visited)
-        closed += shutdownHttpClients(streamingModel, visited)
-        if (closed > 0) {
-            logger.info("[$providerTag] close(): shut down $closed underlying JDK HttpClient(s), released connection pools")
-        }
-    }
-
-    /**
-     * Recursively walk [root]'s object graph looking for
-     * `java.net.http.HttpClient` instances and call
-     * [java.net.http.HttpClient.shutdownNow] on each.  Tracks visited
-     * objects in [visited] (identity-based) so cyclic references
-     * (very common in langchain4j builders) don't loop forever.
-     *
-     * Returns the number of distinct HttpClient instances shut down.
-     *
-     * Depth is capped at 6 — langchain4j nests HttpClient roughly
-     * 3 levels deep (model → client → httpClient → delegate), so
-     * 6 gives us plenty of slack without risking runaway recursion
-     * on weird object graphs.
-     */
-    private fun shutdownHttpClients(root: Any?, visited: MutableSet<Any>, depth: Int = 0): Int {
-        if (root == null || depth > 6) return 0
-        if (!visited.add(root)) return 0  // already traversed
-
-        // Direct hit
-        if (root is java.net.http.HttpClient) {
-            return try {
-                root.shutdownNow()
-                1
+        for (client in trackedHttpClients) {
+            try {
+                client.shutdownNow()
+                closed++
             } catch (e: Exception) {
                 logger.debug("[$providerTag] shutdownNow() failed: ${e.message}")
-                0
             }
         }
-
-        // Don't descend into JDK / Kotlin / Scala / common immutable
-        // types — they can't hold an HttpClient and scanning them is
-        // slow + can trigger IllegalAccessException on JDK internals.
-        val cls = root.javaClass
-        val pkg = cls.packageName
-        if (pkg.startsWith("java.") || pkg.startsWith("javax.") ||
-            pkg.startsWith("kotlin.") || pkg.startsWith("scala.") ||
-            cls.isEnum || cls.isPrimitive || cls.isArray && cls.componentType.isPrimitive) {
-            return 0
+        trackedHttpClients.clear()
+        if (closed > 0) {
+            logger.info("[$providerTag] close(): shut down $closed underlying JDK HttpClient(s), released connection pools")
+        } else if (config.debugLogging) {
+            logger.debug("[$providerTag] close(): no tracked JDK HttpClient (provider may manage its own pool)")
         }
+    }
+}
 
-        var count = 0
-        // Walk the class hierarchy (langchain4j sometimes puts the
-        // field on a package-private abstract super class).
-        var k: Class<*>? = cls
-        while (k != null && k != Any::class.java) {
-            for (field in k.declaredFields) {
-                // Skip statics — we must NOT close a shared pool.
-                if (java.lang.reflect.Modifier.isStatic(field.modifiers)) continue
-                // Skip synthetic fields (Kotlin's `this$0` etc.) — they
-                // point at the outer class and we already visited it.
-                if (field.isSynthetic) continue
-                try {
-                    field.isAccessible = true
-                    val value = field.get(root)
-                    count += shutdownHttpClients(value, visited, depth + 1)
-                } catch (_: IllegalAccessException) {
-                    // JDK module system blocks reflection on some fields.
-                    // Not fatal — just skip.
-                } catch (_: java.lang.reflect.InaccessibleObjectException) {
-                    // Same, on JDK 17+.  Skip.
-                } catch (_: Exception) {
-                    // Field.get can throw for various reasons; keep going.
-                }
+/**
+ * [HttpClientBuilder] decorator that reports every client it builds.
+ *
+ * langchain4j creates the concrete client internally (`JdkHttpClient` wraps a
+ * `java.net.http.HttpClient`) and its SPI exposes no `close()`, so we read the
+ * one field we need off the object we just built.  If a future langchain4j
+ * release renames it, [delegateField] resolves to null and shutdown is simply
+ * skipped — the failure mode is "pool lingers", never "close() throws".
+ */
+private class TrackingHttpClientBuilder(
+    private val delegate: HttpClientBuilder,
+    private val onBuilt: (HttpClient) -> Unit,
+) : HttpClientBuilder {
+
+    override fun connectTimeout(): Duration? = delegate.connectTimeout()
+
+    override fun connectTimeout(timeout: Duration): HttpClientBuilder {
+        delegate.connectTimeout(timeout)
+        return this
+    }
+
+    override fun readTimeout(): Duration? = delegate.readTimeout()
+
+    override fun readTimeout(timeout: Duration): HttpClientBuilder {
+        delegate.readTimeout(timeout)
+        return this
+    }
+
+    override fun build(): dev.langchain4j.http.client.HttpClient {
+        val client = delegate.build()
+        delegateField?.let { field ->
+            try {
+                (field.get(client) as? HttpClient)?.let(onBuilt)
+            } catch (_: Throwable) {
+                // Inaccessible field — skip tracking, keep the client working.
             }
-            k = k.superclass
         }
-        return count
+        return client
+    }
+
+    private companion object {
+        val delegateField: java.lang.reflect.Field? by lazy {
+            runCatching {
+                Class.forName("dev.langchain4j.http.client.jdk.JdkHttpClient")
+                    .getDeclaredField("delegate")
+                    .apply { isAccessible = true }
+            }.getOrNull()
+        }
     }
 }

@@ -1,6 +1,8 @@
 package org.iotsplab.akiba.server.routes
 
 import io.ktor.http.HttpStatusCode
+import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -8,24 +10,19 @@ import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.data.database.DatabaseClient
-import org.iotsplab.akiba.llm.agent.AgentSessionReconciler
-import java.time.Instant
-import java.util.concurrent.ConcurrentHashMap
+import org.iotsplab.akiba.llm.agent.runtime.AgentSessionReconciler
 
 private val logger: Logger = LogManager.getLogger("DaemonIdentity")
 
 /**
  * The daemon identity a web user acts as.
  *
- * There is deliberately no built-in service account any more: an instance is
- * owned by exactly one daemon username, and the server now speaks to the daemon
- * *as the signed-in user*. That is what makes questions like "does this user
- * have any instance yet?" and "may this user open that instance?" meaningful.
+ * There is no built-in service account: an instance is owned by exactly one
+ * daemon username, and the server speaks to the daemon *as the signed-in user*.
  *
  * [secret] is a derived, single-purpose credential minted by the daemon
- * (`/instance/worker-grant`) rather than the user's password: it authenticates
- * with the same identity, but it can expire on its own and never leaks the
- * account password into generated child-process configs.
+ * (`/instance/worker-grant`), not the account password: it can expire on its
+ * own and never leaks into generated child-process configs.
  */
 data class DaemonIdentity(
     val username: String,
@@ -36,17 +33,13 @@ data class DaemonIdentity(
 
 /**
  * In-memory registry of daemon identities, keyed by username, plus the
- * instance → owner mapping needed to resolve credentials from an instance name
- * alone.
+ * instance → owner mapping needed to resolve credentials from an instance name.
  *
- * Why key by instance: the server's per-request daemon sessions are created all
- * over the route layer (`withDaemonSession(host, port, instance)`), and almost
- * all of them only know the instance name. Since an instance has exactly one
- * owner, the instance name is enough to find the identity to authenticate with.
+ * Per-request daemon sessions are created all over the route layer and almost
+ * all of them only know the instance name; since an instance has exactly one
+ * owner, that name is enough to find the identity to authenticate with.
  *
- * The registry is rebuilt on every sign-in, so it is safe to lose on restart:
- * a user whose identity is missing simply has to sign in again (the routes
- * report a precise error instead of silently acting as somebody else).
+ * Rebuilt on every sign-in, so losing it on restart is safe.
  */
 object DaemonIdentities {
     private val byUser = ConcurrentHashMap<String, DaemonIdentity>()

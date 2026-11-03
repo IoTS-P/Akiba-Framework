@@ -5,14 +5,14 @@ import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.server.db.User
 import org.iotsplab.akiba.server.db.UserDao
 import org.iotsplab.akiba.server.security.JwtService
 import org.iotsplab.akiba.server.security.LoginProtection
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
 
 private val logger: Logger = LogManager.getLogger("AuthRoutes")
 
@@ -30,23 +30,17 @@ data class SetupStatusResponse(val needsSetup: Boolean, val userCount: Int)
 /**
  * Authentication routes.
  *
- * ## First-run setup instead of shipped defaults
+ * Setup instead of shipped defaults: no account or instance is created at
+ * container start any more, because credentials that ship in an image are
+ * credentials everybody knows. The first visit shows a setup form
+ * ([POST /auth/setup]) that creates the first administrator; once an account
+ * exists setup is closed and further accounts come from [adminRoutes].
  *
- * The deployment used to create a default account (`akiba`/`akiba123`) and a
- * default instance at container start. Both are gone: credentials that ship in
- * an image are credentials everybody knows. Instead, the very first visit to the
- * UI shows a setup form ([POST /auth/setup]) that creates the first user, who is
- * an administrator. Once an account exists, setup is closed for good — there is
- * no self-registration any more; administrators create further accounts through
- * [adminRoutes].
- *
- * ## Sign-in also establishes the daemon identity
- *
- * Password verification stays here (bcrypt in the `users` table), but the user
- * is *also* registered/verified against the database daemon and gets a derived
- * credential cached for the session — see [establishDaemonIdentity]. Without
- * that step the daemon would have no idea who the caller is, which is what the
- * old hard-coded service account papered over.
+ * Sign-in also establishes the daemon identity: password verification stays
+ * here (bcrypt in the `users` table), but the user is additionally verified
+ * against the database daemon and a derived credential is cached for the
+ * session — see [establishDaemonIdentity]. Without that the daemon would not
+ * know who the caller is.
  */
 fun Route.authRoutes(daemonHost: String, daemonPort: Int) {
 

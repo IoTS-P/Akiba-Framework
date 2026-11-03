@@ -1,38 +1,16 @@
 package org.iotsplab.akiba.script
 
+import ghidra.program.model.listing.Program
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.module.RuntimeReport
-import ghidra.program.model.listing.Program
 
 /**
- * Abstract base class for Akiba scripts.
+ * Abstract base class for Akiba scripts: implement [execute], which runs
+ * against a single binary, and use the inherited logger / output helpers.
  *
- * Scripts extend this class and implement the [execute] method.
- * They provide a simplified interface for writing analysis code that
- * runs against a single binary.
- *
- * ### Example
- * ```kotlin
- * class MyScript : AkibaScript(
- *     saveResult = true,
- *     maxOutputSize = 1024 * 1024  // 1MB
- * ) {
- *     override suspend fun execute() {
- *         val program = getCurrentProgram()
- *         logger.info("Processing ${program?.name}")
- *         // ... analysis code
- *         appendOutput("Analysis complete!")
- *     }
- * }
- * ```
- *
- * @property saveResult Whether to save the script result to the database
- * @property maxOutputSizeBytes Maximum size for output (in bytes). User can set lower but not exceed this.
- * @property description A brief description of what the script does
- * @property scriptSkipDbWrite When true, all database writes are skipped and results
- *           are only stored in the in-memory [RuntimeReport]. Defaults to `true`
- *           because scripts invoked via the agent tool chain typically only need
- *           their result returned, not persisted to DB.
+ * @property scriptSkipDbWrite When true, all database writes are skipped and
+ *           results only live in the in-memory [RuntimeReport] (default).
+ * @property maxOutputSizeBytes Hard cap on output; callers may set lower.
  */
 abstract class AkibaScript(
     val saveResult: Boolean = true,

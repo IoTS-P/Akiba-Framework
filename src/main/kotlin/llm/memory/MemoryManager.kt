@@ -59,24 +59,9 @@ data class MemoryEntry(
 /**
  * Manages long-term cognitive memories for an agent.
  *
- * Memories are persisted via [AgentDatabaseClient] and can be queried
- * across sessions and binaries.  The manager provides convenience methods
- * for the common memory operations and can inject relevant memories into
- * the system prompt for context enrichment.
- *
- * Typical usage inside an agent:
- * ```kotlin
- * memoryManager.remember(
- *     type = MemoryType.FINDING,
- *     scope = MemoryScope.BINARY,
- *     key = "entry_point",
- *     content = "main() at 0x00401234"
- * )
- * val findings = memoryManager.recall(
- *     type = MemoryType.FINDING,
- *     scope = MemoryScope.BINARY
- * )
- * ```
+ * Memories are persisted via [AgentDatabaseClient] and are queryable across
+ * sessions and binaries.  The manager offers convenience operations and can
+ * inject relevant memories into the system prompt.
  */
 class MemoryManager(
     private val agentDbClient: AgentDatabaseClient,

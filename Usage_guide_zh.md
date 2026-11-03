@@ -347,28 +347,22 @@ Akiba 提供了内置的 LLM agent 基础设施，用于智能二进制分析。
 
 ### Agent 策略
 
-#### ReAct 策略（默认）
+Akiba 只有一个内置策略 **ReAct**，除非模块重写了 `agentStrategy()`，否则都使用它。
 
-ReAct（推理 + 行动）策略遵循显式的 **Thought → Action → Observation** 循环：
+模型用普通文字工作：说明接下来要看什么，然后在需要工具时发出 ```json tool_call 块。
+工具结果作为观察返回，循环继续。**不含工具调用的回复即结束本轮**——这段文字就是答案，
+不需要任何标记、前缀或固定模板。
 
 ```
-THOUGHT: 我需要找到入口点。
-ACTION:  list_functions()
-OBSERVATION: main @ 0x401234, foo @ 0x401256
-THOUGHT: 入口点是 main...
-ACTION:  decompile(address="0x401234")
-OBSERVATION: int main() { return 0; }
-THOUGHT: 我现在有答案了。
-FINAL ANSWER: 二进制的入口点...
+model: "入口点很可能是 main，先看一下函数列表。"
+        -> {"tool_call": {"name": "script_library", "arguments": {...}}}
+tool:  main @ 0x401234, foo @ 0x401256
+model: "入口点是 0x401234 处的 main。"
+        （没有工具调用 → 答案交付，运行结束）
 ```
 
-#### Plan-Execute 策略
-
-Plan-Execute 策略分三个阶段工作：
-
-1. **规划**：创建编号的步骤计划
-2. **执行**：执行每个步骤并收集观察结果
-3. **反思**：反思结果并给出最终答案
+对于没有原生 function calling 的提供方（Ollama、通用 OpenAI 兼容端点），调用以上面的
+JSON 块形式写在文本里。
 
 ### 创建 Agent 模块
 

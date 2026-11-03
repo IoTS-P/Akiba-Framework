@@ -11,29 +11,6 @@ import ghidra.util.exception.CancelledException
 import ghidra.util.task.TaskMonitorAdapter
 import ghidra.util.task.TimeoutTaskMonitor
 import io.ktor.http.HttpStatusCode
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.CoroutineStart
-import kotlinx.coroutines.job
-import kotlinx.coroutines.launch
-import org.apache.logging.log4j.Level
-import org.apache.logging.log4j.LogManager
-import org.apache.logging.log4j.Logger
-import org.apache.logging.log4j.core.LoggerContext
-import org.apache.logging.log4j.core.appender.ConsoleAppender
-import org.apache.logging.log4j.core.appender.FileAppender
-import org.apache.logging.log4j.core.config.LoggerConfig
-import org.apache.logging.log4j.core.layout.PatternLayout
-import org.iotsplab.akiba.data.database.DatabaseClient
-import org.iotsplab.akiba.managers.BinaryMetadata
-import org.iotsplab.akiba.managers.ConfigManager
-import org.iotsplab.akiba.managers.ConfigManager.KEY_SEPARATOR
-import org.iotsplab.akiba.managers.ConfigManager.mainConf
-import org.iotsplab.akiba.managers.ConfigManager.parseModuleConfig
-import org.iotsplab.akiba.managers.ImportManager
-import org.iotsplab.akiba.managers.WorkspaceManager
-import org.iotsplab.akiba.utils.*
-import org.iotsplab.akiba.utils.CoroutineTaskMonitor
-import org.iotsplab.akiba.utils.CoroutineTaskMonitor.Companion.asCoroutineAware
 import java.io.File
 import java.io.FileOutputStream
 import java.io.PrintWriter
@@ -54,6 +31,30 @@ import kotlin.reflect.full.findAnnotation
 import kotlin.reflect.full.primaryConstructor
 import kotlin.system.exitProcess
 import kotlin.system.measureTimeMillis
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
+import org.apache.logging.log4j.Level
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.Logger
+import org.apache.logging.log4j.core.LoggerContext
+import org.apache.logging.log4j.core.appender.ConsoleAppender
+import org.apache.logging.log4j.core.appender.FileAppender
+import org.apache.logging.log4j.core.config.LoggerConfig
+import org.apache.logging.log4j.core.layout.PatternLayout
+import org.iotsplab.akiba.data.database.DatabaseClient
+import org.iotsplab.akiba.llm.agent.stream.StreamingChunkPusher
+import org.iotsplab.akiba.managers.BinaryMetadata
+import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.managers.ConfigManager.KEY_SEPARATOR
+import org.iotsplab.akiba.managers.ConfigManager.mainConf
+import org.iotsplab.akiba.managers.ConfigManager.parseModuleConfig
+import org.iotsplab.akiba.managers.ImportManager
+import org.iotsplab.akiba.managers.WorkspaceManager
+import org.iotsplab.akiba.utils.*
+import org.iotsplab.akiba.utils.CoroutineTaskMonitor
+import org.iotsplab.akiba.utils.CoroutineTaskMonitor.Companion.asCoroutineAware
 
 private fun describeModuleThrowable(t: Throwable): String {
     var root = t
@@ -74,35 +75,14 @@ private fun moduleTracebackOf(t: Throwable): String {
 }
 
 /**
- * Abstract class for auto-processing tasks, providing basic functionality for loading configurations and logging.
- * It also defines a template for starting processes and handling timeouts.
+ * Abstract base for auto-processing modules: config loading, logging, process
+ * start/timeout handling and result-table plumbing.
  *
- * @param configPath Path to the configuration file, optional.
- * @param defaultConfig The default configuration, optional.
- * @param id The unique identifier for the program, required.
- * @param program The Ghidra program, required.
- * @param properties Other properties of the program, optional.
- * @param consoleLogLevel The log level for the console, optional and default INFO.
- * @param fileLogLevel The log level for the file, optional and default INFO.
- * @param tableName Override for the result table name, optional.
- * @param runtimeReport Optional sink that mirrors this module's runtime side effects
- *                      ([updateData], [updateErr], `startTask` / `finishTask` timestamps and
- *                      total execution time) into an in-memory map. The parent module that
- *                      invoked this one via [callModule] uses it to inspect what the child
- *                      did *without* round-tripping through the database. Top-level modules
- *                      launched by `ProcedureManager` receive `null`, in which case nothing
- *                      is mirrored and behavior is identical to before this parameter was
- *                      added. See [RuntimeReport] for the schema.
- * @param skipDbWrite When `true`, [updateData], [updateErr] and [clearErr] will **only**
- *                    write to the in-memory [RuntimeReport] and skip all database
- *                    operations ([DatabaseClient.updateData], [DatabaseClient.startTask],
- *                    [DatabaseClient.finishTask], table creation/locking).
- *                    This is useful when a module is invoked via [callModule] by an
- *                    agent that only needs the result returned through the
- *                    [runtimeReportView] and does not want side effects in the
- *                    database (e.g. to avoid stale rows or to keep the analysis
- *                    transient).
- *                    Default is `false` — data is written to the database as usual.
+ * `runtimeReport` mirrors this module's side effects ([updateData], [updateErr],
+ * task timestamps and total execution time) into an in-memory map that a parent
+ * invoking it via [callModule] can read without a database round-trip — see
+ * [RuntimeReport]; top-level modules pass `null` and nothing is mirrored.
+ * `skipDbWrite` keeps those writes in that report only, with no database access.
  */
 abstract class AkibaModule (
     private val configPath: String? = null,
@@ -129,13 +109,13 @@ abstract class AkibaModule (
     var failureSign: Int = SUCCESS
 
     /**
-     * Read-only view of this module's [RuntimeReport], if one was supplied at construction
-     * time (typically by [callModule]). Returns `null` for top-level modules launched
-     * directly by `ProcedureManager`, since they have no parent to report to.
+     * Read-only view of this module's [RuntimeReport], if one was supplied at
+     * construction time (typically by [callModule]); `null` for top-level
+     * modules launched directly by `ProcedureManager`, which have no parent.
      *
-     * Reading this map *before* `startProcess` returns is supported but the contents are
-     * still being filled in; the parent should normally consume it only after the
-     * [callModule] coroutine call has resumed. See [RuntimeReport] for the schema.
+     * Reading it *before* `startProcess` returns is supported, but the map is
+     * still being filled in, so the parent should consume it only after the
+     * [callModule] coroutine has resumed. See [RuntimeReport] for the schema.
      */
     val runtimeReportView: Map<String, Any?>?
         get() = runtimeReport?.view
@@ -149,11 +129,10 @@ abstract class AkibaModule (
     val configClass: KClass<*>?
         get() = this::class.findAnnotation<WithConfigClass>() ?.clazz
 
-    // Lazy: `id` may be injected via reflection AFTER construction
-    // (dynamically-compiled scripts are built with the no-arg
-    // constructor, where id is still the -1 default).  Eagerly computed
-    // paths would then permanently point at `-1.bin` — see
-    // ScriptClassLoader.instantiateScript.
+    // Lazy on purpose: `id` may be injected via reflection AFTER construction
+    // (dynamically-compiled scripts use the no-arg constructor, where id is
+    // still the -1 default), so eagerly built paths would stay at `-1.bin` —
+    // see ScriptClassLoader.instantiateScript.
     val originalFile: File by lazy { File("${mainConf.binariesRoot}/original/$id.bin") }
     val processedFile: File? by lazy {
         File("${mainConf.binariesRoot}/processed/$id.bin").let {
@@ -167,24 +146,15 @@ abstract class AkibaModule (
     // ============================================================
 
     /**
-     * Per-module workspace directory.
+     * Per-module workspace directory, created lazily on first access:
+     * `<workspaceRoot>/<projectName>/<id>/<ModuleClassName>/` (the root
+     * defaults to `~/.akiba/workspace`, overridable via `general.workspaceRoot`).
      *
-     * Path: `<workspaceRoot>/<projectName>/<id>/<ModuleClassName>/`
-     *
-     * Modules can use this to persist intermediate results, downloaded
-     * resources, temp scripts, shell command outputs, etc. The directory
-     * is created lazily on first access.
-     *
-     * A read-only copy of the binary file is placed at
-     * `<workspaceRoot>/<projectName>/<id>/binary` (copied once per
-     * project+id, not per module).  Each module's workspace gets a
-     * symbolic link `binary` pointing to that copy, so tools/scripts
-     * running in the workspace can access the binary via `./binary`
-     * without risking modification of the original file in
-     * `binariesRoot`.
-     *
-     * The root (`workspaceRoot`) defaults to `~/.akiba/workspace` and can
-     * be overridden in the main config JSON via `general.workspaceRoot`.
+     * Modules persist intermediate results, downloads, temp scripts and shell
+     * output here. A read-only copy of the binary sits one level up at
+     * `<workspaceRoot>/<projectName>/<id>/binary` and is linked into this
+     * workspace as `binary`, so scripts can use `./binary` without risking the
+     * original file in `binariesRoot`.
      */
     val workspaceDir: Path by lazy {
         val projectName = WorkspaceManager.projectName ?: "default"
@@ -366,20 +336,14 @@ abstract class AkibaModule (
     }
 
     /**
-     * Override the config object that was loaded during construction.
+     * Override the config object that was loaded during construction: the
+     * constructor only reads from disk ([configPath] / [parseModuleConfig]) or
+     * from the [defaultConfig] fallback, while a caller invoking this module via
+     * [callModule] usually has an in-memory object to hand over.
      *
-     * `AkibaModule`'s constructor only knows how to read configs from disk (via [configPath] /
-     * [parseModuleConfig]) or from the [defaultConfig] fallback. When a module is invoked
-     * dynamically by another module via [callModule], the caller usually wants to pass an
-     * in-memory config object directly — without round-tripping through a temp file. This
-     * method is the supported entry point for doing that.
-     *
-     * The new value MUST be either `null` or an instance of the class declared by the module's
-     * [WithConfigClass] annotation. If [WithConfigClass] is absent (i.e. the module does not
-     * declare a config class), this method is a no-op except for logging.
-     *
-     * Calling this after the module's `startProcess` has already started has undefined effects
-     * and is not supported.
+     * The value must be `null` or an instance of the module's [WithConfigClass]
+     * type; without that annotation the call only logs. Calling this after
+     * `startProcess` has begun is unsupported.
      *
      * @param newConfig The replacement config. Pass `null` to clear the config.
      * @throws IllegalArgumentException If [newConfig] is not assignable to the module's declared
@@ -420,46 +384,28 @@ abstract class AkibaModule (
     }
 
     /**
-     * Dynamically invoke another module on the binary currently being analyzed by this module
-     * (or on an arbitrary binary id, if [targetId] is supplied).
+     * Dynamically invoke another module on the binary currently under analysis
+     * (or on an arbitrary binary id, if [targetId] is supplied) — unlike the
+     * static `config.tasks` list, which is resolved before any analysis starts.
      *
-     * Unlike the static task list in `config.tasks` (which is resolved before any analysis
-     * starts), this method allows a running module to schedule another module on demand. The
-     * called module shares this module's coroutine context — including the [ModuleContext] that
-     * holds the per-binary task data and the registered task APIs — so that data exchange via
-     * [setTaskData] / [getTaskData] keeps working as expected.
+     * The child shares this module's coroutine context, including the
+     * [ModuleContext] that holds the per-binary task data and the registered
+     * task APIs, so data exchange via [setTaskData] / [getTaskData] keeps
+     * working.
      *
-     * The called module's lifecycle is fully run here: it is constructed, [startProcess] is
-     * invoked (subject to [timeout]), and the instance is closed unless it is annotated with
-     * [NoNeedToClose]. Its task interfaces are registered into the current [ModuleContext] via
-     * [ModuleContext.lookup] just as `ProcedureManager.invokeProcedure` does, so this module can
-     * then call its `@TaskInterface` methods through [callTaskAPI] after the call returns.
+     * Its lifecycle runs fully here: it is constructed, [startProcess] is
+     * invoked (subject to [timeout]), and the instance is closed unless it is
+     * annotated [NoNeedToClose]; its task interfaces are registered into the
+     * current [ModuleContext] via [ModuleContext.lookup] just as
+     * `ProcedureManager.invokeProcedure` does, so this module can call its
+     * `@TaskInterface` methods through [callTaskAPI] after the call returns.
      *
-     * ### Configuration
-     *
-     * Three mutually-exclusive ways to provide the called module's configuration are supported,
-     * listed here in priority order (the first non-null wins; later parameters are ignored):
-     *
-     *  1. **[config] — in-memory object.**
-     *      Pass an already-constructed instance of the called module's `@WithConfigClass`. This
-     *      avoids any disk I/O. The object is installed into the new module via [replaceConfig]
-     *      *after* construction, replacing whatever the constructor's default-loading path
-     *      produced. This is the recommended path for runtime/programmatic invocations.
-     *
-     *  2. **[configJson] — JSON snippet.**
-     *      Pass a raw JSON string. It is parsed using the called module's own
-     *      `@WithConfigDeserializer` (via [getDeserializerMapper]) into the declared config
-     *      class, then installed via [replaceConfig]. Useful when the parent has a JSON tree on
-     *      hand (e.g. forwarded from the user) but does not want to write it to disk first.
-     *
-     *  3. **[configKey] — disk-file pointer.**
-     *      The traditional `<file>@<json-pointer>` form (or `@@<json-pointer>` to refer to a
-     *      key in the main config file). This is forwarded to the called module's constructor
-     *      and read by it the usual way. Provided for parity with the static config path.
-     *
-     * If all three are null, the called module is constructed with no `configPath`, falling
-     * back to whatever its constructor does for the no-config case (typically `defaultConfig`,
-     * i.e. `null`).
+     * Configuration comes from the first non-null of [config] (in-memory object,
+     * no disk I/O, installed via [replaceConfig]), [configJson] (parsed with the
+     * child's own `@WithConfigDeserializer` via [getDeserializerMapper]) or
+     * [configKey] (`<file>@<json-pointer>`, or `@@<json-pointer>` for a key in
+     * the main config file). If all three are null the child is constructed with
+     * no `configPath` and falls back to its constructor's default.
      *
      * @param mainClassName Fully-qualified class name of the [AkibaModule] subclass to invoke.
      *                      The corresponding jar must be present under `modules/`.
@@ -630,18 +576,16 @@ abstract class AkibaModule (
     }
 
     /**
-     * Import a new binary file at runtime and register it in the database.
+     * Import a new binary file at runtime and register it in the database — the
+     * runtime counterpart of the static import config consumed by
+     * `ImportManager`, for modules that discover or generate extra binaries
+     * while analyzing another file (e.g. unpacked payloads, embedded firmware).
      *
-     * This is the runtime counterpart of the static import config consumed by `ImportManager`.
-     * It is intended for modules that discover or generate additional binaries while analyzing
-     * another file (e.g. unpacked payloads, embedded firmware blobs, decrypted images). The new
-     * binary is recorded with provenance information — `source_id` set to this module's [id] and
-     * `source_module` set to this module's simple class name — so the imported file can be
-     * traced back to the analysis run that produced it.
-     *
-     * The file is copied to `<binariesRoot>/original/<newId>.bin` (and, if preprocessing is
-     * applied, to `<binariesRoot>/processed/<newId>.bin`) just like a top-level import. The
-     * caller may continue analyzing the new binary by passing the returned id to [callModule].
+     * Provenance is recorded (`source_id` = this module's [id], `source_module` =
+     * its simple class name), and the file is copied to
+     * `<binariesRoot>/original/<newId>.bin` (plus `processed/` when preprocessing
+     * applies) just like a top-level import, so the returned id can be fed back
+     * to [callModule].
      *
      * @param path Absolute path to the file to import.
      * @param arch Optional language hint. If null, Ghidra format auto-detection is attempted
@@ -816,7 +760,7 @@ abstract class AkibaModule (
                 // the `done` marker can be discarded at process exit —
                 // the browser then shows the final answer truncated.
                 runCatching {
-                    org.iotsplab.akiba.llm.agent.StreamingChunkPusher.awaitQuiescence(3_000)
+                    org.iotsplab.akiba.llm.agent.stream.StreamingChunkPusher.awaitQuiescence(3_000)
                 }
             }
         }

@@ -5,20 +5,12 @@ import kotlinx.coroutines.flow.Flow
 /**
  * Provider-agnostic interface for LLM chat completion.
  *
- * Each concrete implementation wraps a specific vendor SDK (langchain4j
- * provider module, raw HTTP client, etc.) and translates between the
- * Akiba domain types ([ChatCompletion], [ChatChunk], …) and the vendor's
- * native API.
+ * Each implementation wraps one vendor SDK (langchain4j provider module, raw
+ * HTTP client, …) and translates between the Akiba domain types
+ * ([ChatCompletion], [ChatChunk], …) and the vendor's native API.
  *
- * Typical lifecycle:
- * ```
- *   val client = LLMClientFactory.create(config)
- *   val result = client.chat(systemPrompt, messages)
- *   client.close()
- * ```
- *
- * Instances are **not** thread-safe; use one client per session or
- * serialize access externally.
+ * Instances are **not** thread-safe; use one client per session or serialize
+ * access externally.
  */
 interface AkibaLLMClient : AutoCloseable {
 
@@ -36,13 +28,14 @@ interface AkibaLLMClient : AutoCloseable {
      * @param systemPrompt  Optional system-level instructions.
      * @param messages      Ordered conversation history as [AgentChatMessage] list.
      *                      Role is one of "user", "assistant", "tool".
-     * @param tools         Optional tool definitions in the provider's native JSON schema format.
+     * @param tools         Optional tool definitions, already converted to the
+     *                      provider-facing schema by [Tool.toToolSpecification].
      * @return the completed response.
      */
     fun chat(
         systemPrompt: String? = null,
         messages: List<org.iotsplab.akiba.llm.memory.AgentChatMessage>,
-        tools: List<String>? = null
+        tools: List<dev.langchain4j.agent.tool.ToolSpecification>? = null
     ): ChatCompletion
 
     // ============================================================
@@ -57,13 +50,14 @@ interface AkibaLLMClient : AutoCloseable {
      *
      * @param systemPrompt  Optional system-level instructions.
      * @param messages      Ordered conversation history as [AgentChatMessage] list.
-     * @param tools         Optional tool definitions in the provider's native JSON schema format.
+     * @param tools         Optional tool definitions, already converted to the
+     *                      provider-facing schema by [Tool.toToolSpecification].
      * @return a flow of response chunks.
      */
     fun chatStream(
         systemPrompt: String? = null,
         messages: List<org.iotsplab.akiba.llm.memory.AgentChatMessage>,
-        tools: List<String>? = null
+        tools: List<dev.langchain4j.agent.tool.ToolSpecification>? = null
     ): Flow<ChatChunk>
 
     // ============================================================

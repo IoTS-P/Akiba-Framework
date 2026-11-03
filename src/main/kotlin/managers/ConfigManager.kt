@@ -7,6 +7,12 @@ import com.fasterxml.jackson.databind.node.ObjectNode
 import com.fasterxml.jackson.databind.node.TextNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.jsonMapper
+import java.io.File
+import java.io.IOException
+import java.nio.file.Path
+import kotlin.io.path.isRegularFile
+import kotlin.reflect.full.findAnnotation
+import kotlin.system.exitProcess
 import org.iotsplab.akiba.Main
 import org.iotsplab.akiba.Main.Companion.mainConfigPath
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
@@ -21,12 +27,6 @@ import org.iotsplab.akiba.utils.ProcedureArgumentsSerializer
 import org.iotsplab.akiba.utils.SqlSource
 import org.iotsplab.akiba.utils.WithConfigClass
 import org.iotsplab.akiba.utils.WithGhidraProject
-import java.io.File
-import java.io.IOException
-import java.nio.file.Path
-import kotlin.io.path.isRegularFile
-import kotlin.reflect.full.findAnnotation
-import kotlin.system.exitProcess
 
 object ConfigManager {
     lateinit var config: Configs

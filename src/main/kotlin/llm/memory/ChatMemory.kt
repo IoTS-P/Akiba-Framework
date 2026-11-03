@@ -2,8 +2,8 @@ package org.iotsplab.akiba.llm.memory
 
 import org.apache.logging.log4j.LogManager
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.llm.agent.LLM_RETRY_STATUS_PREFIX
-import org.iotsplab.akiba.llm.agent.LLM_PROGRESS_PREFIX
+import org.iotsplab.akiba.llm.agent.core.LLM_PROGRESS_PREFIX
+import org.iotsplab.akiba.llm.agent.core.LLM_RETRY_STATUS_PREFIX
 
 // ============================================================
 //  ChatMemory — interface
@@ -11,26 +11,13 @@ import org.iotsplab.akiba.llm.agent.LLM_PROGRESS_PREFIX
 
 /**
  * A single message in an agent conversation.
- *
  * @param role One of "user", "assistant", "tool", "system".
  * @param content The textual content of the message.
  * @param toolCallId For tool-result messages, the ID of the corresponding tool call.
  * @param toolName For tool-result messages, the name of the tool that was invoked.
- */
-/**
- * A single message in an agent conversation.
- *
- * @param role One of "user", "assistant", "tool", "system".
- * @param content The textual content of the message.
- * @param toolCallId For tool-result messages, the ID of the corresponding tool call.
- * @param toolName For tool-result messages, the name of the tool that was invoked.
- * @param messageIndex Per-session monotonically increasing row index in
- *        `agent_messages`.  Populated by [PersistentChatMemory] so that
- *        operations such as [ChatMemory.removeLast] can target the exact
- *        DB row by its index even when the local buffer is a sub-range
- *        of the full DB transcript (e.g. after a compaction).  `null`
- *        means the index is not known to the buffer (the row was added
- *        outside [PersistentChatMemory] or has not been persisted yet).
+ * @param messageIndex Row index in `agent_messages`, assigned by
+ *        [PersistentChatMemory] so [ChatMemory.removeLast] can target it after
+ *        compaction; `null` = unknown.
  */
 data class AgentChatMessage(
     val role: String,
@@ -161,17 +148,12 @@ class InMemoryChatMemory(
 /**
  * Database-backed [ChatMemory] using [AgentDatabaseClient].
  *
- * New messages are appended to the `agent_messages` table.  On construction,
- * existing messages for the given [sessionId] are loaded from the database
- * so that a resumed session retains its full conversation history.
+ * New messages are appended to `agent_messages`; on construction the existing
+ * rows for [sessionId] are loaded so a resumed session keeps its history.
  *
- * Two eviction strategies are available:
- * - **Message-count window** ([maxMessages]): keeps only the last *n* messages.
- *   Excess rows are deleted from the database.
- * - **Token-budget window** ([maxTokens]): evicts the oldest messages until
- *   the estimated token count falls below the budget.
- *
- * Both strategies can be combined; the stricter limit wins.
+ * Eviction: [maxMessages] keeps the last *n* rows (deleting the excess), and
+ * [maxTokens] drops the oldest messages until the estimate fits the budget.
+ * Both can be combined — the stricter limit wins.
  */
 class PersistentChatMemory(
     private val agentDbClient: AgentDatabaseClient,
@@ -191,16 +173,11 @@ class PersistentChatMemory(
     private val buffer: MutableList<AgentChatMessage> = mutableListOf()
 
     /**
-     * The next `message_index` value the daemon will assign to our next
-     * `appendMessages` call.  We track this locally so each buffered
-     * [AgentChatMessage] knows its real DB row index — that index is the
-     * only reliable handle for [removeLast] once the local buffer has
-     * been compacted into a summary and no longer maps 1:1 to DB rows.
-     *
-     * It is initialised from `MAX(messageIndex) + 1` after a full DB scan
-     * (see [loadFromDatabase]).  [clear] does NOT reset it, because the
-     * DB rows we skipped during a compaction still exist and continue to
-     * occupy their original indices.
+     * The next `message_index` the daemon will assign, tracked because it is
+     * the only reliable handle for [removeLast] once the buffer has been
+     * compacted into a summary and no longer maps 1:1 to DB rows.  Initialised
+     * from `MAX(messageIndex) + 1` (see [loadFromDatabase]).  [clear] does NOT
+     * reset it: the skipped rows still exist and keep their indices.
      */
     private var nextMessageIndex: Int = 1
 
@@ -428,18 +405,13 @@ class PersistentChatMemory(
 
     override fun clear() {
         // IMPORTANT: do NOT delete messages from the database here.
-        //
-        // [AkibaAgent.compact] calls clear() and then re-adds the system
-        // prompt + <previous_summary> + kept rounds.  If we deleted the
-        // old rows, the frontend (which reads agent_messages directly)
-        // would lose all pre-compaction history — every previous user /
-        // assistant / tool message would vanish from the UI.
-        //
-        // Instead, we only clear the in-memory buffer.  The summary
-        // message that compact() writes next carries a <previous_summary>
-        // marker; loadFromDatabase() uses that marker as a compaction
-        // boundary so the LLM only sees post-compaction messages, while
-        // the DB retains the full history for frontend display.
+        // [AkibaAgent.compact] calls clear() then re-adds the system prompt +
+        // <previous_summary> + kept rounds; deleting the old rows would make
+        // all pre-compaction history vanish from the frontend, which reads
+        // agent_messages directly.  Only the in-memory buffer is cleared — the
+        // <previous_summary> marker in the summary compact() writes next is the
+        // boundary loadFromDatabase() uses, so the LLM sees only
+        // post-compaction messages while the DB keeps the full transcript.
         buffer.clear()
     }
 

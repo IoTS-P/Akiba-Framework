@@ -4,38 +4,31 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.header
 import io.ktor.server.response.respond
+import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.server.db.UserDao
 import org.iotsplab.akiba.server.security.JwtService
-import java.nio.file.Path
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 private val logger: Logger = LogManager.getLogger("RouteHelpers")
 
 /**
  * Helpers for HTTP routes that need to talk to the akiba_db_daemon.
  *
- * ## Identity model
+ * Every request runs as the **signed-in user**, identified by their JWT (see
+ * [currentUsernameOrNull]); there is no shared service account any more, which
+ * is what makes per-user instance ownership possible.
  *
- * Every request is executed as the **signed-in user**. There used to be a single
- * hard-coded service account (`akiba`/`akiba`) shared by all requests, which
- * made per-user instance ownership impossible: as far as the daemon was
- * concerned, everybody was the same person. Now:
- *
- *  - the web user is identified by their JWT (see [currentUsernameOrNull]);
- *  - at sign-in the server establishes a [DaemonIdentity] for that user — a
- *    derived credential minted by the daemon, so no password is ever written
- *    into a generated config file;
- *  - instance-scoped sessions resolve their credentials from the instance name
- *    via [DaemonIdentities], because an instance has exactly one owner.
- *
- * A session that the daemon rejects (expired/revoked credential) invalidates the
- * cached identity, so the next request fails loudly instead of acting as the
- * wrong user.
+ * Sign-in establishes a [DaemonIdentity] — a derived credential minted by the
+ * daemon, so no password is ever written into a generated config file — and
+ * instance-scoped sessions resolve theirs from the instance name via
+ * [DaemonIdentities], because an instance has exactly one owner; a session the
+ * daemon rejects invalidates the cached identity, so the next request fails
+ * loudly instead of acting as the wrong user.
  */
 
 /**

@@ -5,8 +5,6 @@ import ghidra.framework.model.DomainFile
 import ghidra.framework.model.DomainFolder
 import ghidra.program.database.mem.FileBytes
 import ghidra.program.model.listing.Program
-import org.apache.logging.log4j.Logger
-import org.iotsplab.akiba.data.database.DatabaseClient
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.Path
@@ -16,65 +14,22 @@ import java.util.jar.JarFile
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.isDirectory
 import kotlin.io.path.isRegularFile
+import org.apache.logging.log4j.Logger
+import org.iotsplab.akiba.data.database.DatabaseClient
 
 // ============================================================
 //  GarImporter — import a Ghidra Archive (.gar) as a standalone project
 // ============================================================
 
 /**
- * Imports a `.gar` (Ghidra Archive) file as a **standalone** project under
- * the caller's Ghidra project directory, and registers every program it
- * contains in the `binaries` table.
- *
- * The `.gar` layout (mirrored by [ProjectRoutes.archiveProject]) is:
- *
- * ```
- *   entry 0 : <origName>.gpr   # project marker (content ignored on restore)
- *   entry 1 : JAR_FORMAT        # magic entry, skipped
- *   entry 2+: <subdir>/...      # contents of the project's .rep/ directory
- * ```
- *
- * On restore we extract `<origName>.gpr` as `<newName>.gpr` and every other
- * non-magic, non-lock entry under `<newName>.rep/`, then open the project
- * with [GhidraProject.openProject].
- *
- * For each program found in the restored project:
- *
- *  1. Open it and read the original imported bytes via
- *     `Program.getMemory().getAllFileBytes()` (the same path used by Ghidra's
- *     own `ExportProgramScript` for "Original File" export). The MD5 of those
- *     bytes is the dedup key.
- *  2. If the MD5 already exists in `binaries`, look up the existing id via
- *     the `/get/id/sql` route (`WHERE u.checksum = '<md5>'`). No file import
- *     happens — the binary file is already on disk under the existing id.
- *  3. If the MD5 is new, export the original bytes to a temp file, call
- *     [DatabaseClient.insertBinary] with metadata extracted from the program
- *     (language / format / compiler), and copy the temp file to
- *     `<binaryRoot>/<id>.bin`.
- *  4. Rename the program's domain file to `<id>-<originalFileName>` so the
- *     existing `AkibaModule.getProgram(id)` lookup (`"$id-${file.name}"`)
- *     keeps working.
- *
- * Auto-analysis is intentionally skipped: the `.gar` already carries the
- * analysis state produced on the source machine, and re-running it would
- * discard that work.
- *
- * This class is self-contained: it opens its own [GhidraProject] handle
- * (via [WorkspaceManager.initializeGhidra], which is idempotent and does
- * not touch the active project) and does not mutate
- * [WorkspaceManager.project]. It is therefore safe to call from the server
- * JVM while another project is active, and equally usable from a CLI entry
- * point.
- *
+ * Imports a `.gar` archive as a standalone project, registering each program
+ * in `binaries` deduped by original-file MD5. Auto-analysis is skipped: the
+ * archive already carries it, and the active project is never touched.
  * @param garFile        Path to the uploaded `.gar` archive.
- * @param newProjectName Sanitized name for the restored project. Must match
- *                       `^[A-Za-z0-9._-]{1,64}$`.
- * @param projectRoot    Directory that holds the user's `.gpr` / `.rep`
- *                       pairs (typically `ghidra_projects/<username>/`).
+ * @param newProjectName Sanitized project name (`^[A-Za-z0-9._-]{1,64}$`).
+ * @param projectRoot    Directory holding the user's `.gpr` / `.rep` pairs.
  * @param dbClient       Connected [DatabaseClient] for the target instance.
- * @param binaryRoot     The `original/` directory under the instance's
- *                       binaries root — newly-imported binaries are copied
- *                       here as `<id>.bin`.
+ * @param binaryRoot     `original/` dir; new binaries land here as `<id>.bin`.
  */
 object GarImporter {
 

@@ -2,27 +2,20 @@ package org.iotsplab.akiba.llm.config
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
-import org.apache.logging.log4j.LogManager
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermissions
+import org.apache.logging.log4j.LogManager
 
 /**
- * On-disk persistent store for LLM API keys.
+ * On-disk store for LLM API keys in `~/.akiba/llm_keys.json`.
  *
- * Keys are saved as a JSON array in `~/.akiba/llm_keys.json`. Each entry
- * records a provider / modelNames / baseUrl / apiKey tuple so that a user can
- * keep credentials for multiple vendors at the same time. A single API key
- * may cover several models, therefore [modelNames] is a list.
+ * Each entry holds a provider / modelNames / baseUrl / apiKey tuple, so several
+ * vendors can coexist; one key may cover many models, so `modelNames` is a list.
  *
- * Security notes
- * --------------
- * - The file is created with POSIX 600 permissions (owner read/write only)
- *   whenever it is written.
- * - On non-POSIX systems a best-effort Windows ACL restriction is applied.
- * - This is **not** encryption at rest; any process running as the same
- *   Unix user can still read the file. For stronger protection use an
- *   external secrets manager (HashiCorp Vault, OS keychain, …).
+ * Written with POSIX 600 permissions (best-effort ACL elsewhere).  This is
+ * **not** encryption at rest — any process running as the same Unix user can
+ * read it.
  */
 object LLMKeyFileStore {
 

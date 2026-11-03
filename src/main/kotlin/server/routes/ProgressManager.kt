@@ -1,26 +1,22 @@
 package org.iotsplab.akiba.server.routes
 
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 
 /**
  * Singleton manager for tracking import / workflow task progress.
  *
- * The flow:
- * 1. Server launches a child process with AKIBA_PROGRESS_URL and AKIBA_PROGRESS_TOKEN env vars
- * 2. Child process HTTP POSTs progress messages to POST /api/progress
- * 3. This manager receives the messages and pushes them to per-task SharedFlows
- * 4. The flows are consumed by SSE endpoints; multiple consumers can subscribe independently
- *
- * Messages received via [onProgress] are also written to the optional log file
- * (set via [registerTask]) for persistence — this allows new SSE subscribers
- * to read historical messages by fetching the log file first.
+ * A child process launched with `AKIBA_PROGRESS_URL` and `AKIBA_PROGRESS_TOKEN`
+ * POSTs messages to `/api/progress`; [onProgress] pushes them into per-task
+ * SharedFlows consumed by independent SSE subscribers, and also appends them to
+ * the task's optional log file (set via [registerTask]) so a late subscriber can
+ * replay history by reading that file.
  */
 object ProgressManager {
 

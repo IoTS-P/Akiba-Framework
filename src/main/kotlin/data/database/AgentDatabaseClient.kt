@@ -8,20 +8,14 @@ import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.module.Log
 
 /**
- * Client for Agent-related database operations.
+ * Client for Agent-related database operations, sending HTTP POST requests to
+ * the `akiba_db_daemon`'s `/agent/` routes.  Framework-side counterpart of
+ * [org.iotsplab.akiba.dbDaemon.operations.AgentOps].
  *
- * This class extends the existing [DatabaseClient] pattern, sending HTTP POST
- * requests to the `akiba_db_daemon`'s `/agent/ *` routes.  It is the framework-side
- * counterpart of [org.iotsplab.akiba.dbDaemon.operations.AgentOps].
- *
- * Each instance is bound to a single [DatabaseClient] and therefore to a single
- * daemon session (host/port + auth token). This makes it safe for concurrent
- * multi-tenant use when the surrounding code creates one
- * [AgentDatabaseClient] per request/session.
- *
- * All methods are synchronous (runBlocking) to match the existing [DatabaseClient] API.
- *
- * @param dbClient The underlying [DatabaseClient] used to issue HTTP requests.
+ * Each instance is bound to one [DatabaseClient] and therefore one daemon
+ * session (host/port + token), so concurrent multi-tenant use is safe as long
+ * as one instance is created per request/session.  All methods are synchronous
+ * (`runBlocking`), matching [DatabaseClient].
  */
 class AgentDatabaseClient(private val dbClient: DatabaseClient) {
 
@@ -450,7 +444,7 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
      * Snapshot of a session's runtime state. The [runtimeState] field
      * is one of `running / standby / msghandle / cancelling / closed`;
      * the daemon returns the raw string and the caller is expected to
-     * map it through [org.iotsplab.akiba.llm.agent.RuntimeState.fromWire].
+     * map it through [org.iotsplab.akiba.llm.agent.runtime.RuntimeState.fromWire].
      */
     data class RuntimeStateInfo(
         val sessionId: String,
@@ -464,7 +458,7 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
     /**
      * Update the session's `runtime_state` and optional `closing_reason`.
      * Caller is responsible for ensuring the transition is legal
-     * (see [org.iotsplab.akiba.llm.agent.RuntimeState.canTransition]);
+     * (see [org.iotsplab.akiba.llm.agent.runtime.RuntimeState.canTransition]);
      * the daemon merely mirrors the new value.
      */
     @Throws(DatabaseClient.DatabaseDaemonException::class)
@@ -579,18 +573,13 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
     // ============================================================
 
     /**
-     * Relationship between the calling session and the target
-     * session.  Auto-detected by the daemon from
-     * `parent_session_id` so the caller never has to declare
-     * it.  See
-     * [org.iotsplab.akiba.dbDaemon.operations.AgentOps.GetAgentStatus]
-     * for the detection rules.
+     * Relationship between the calling session and the target session, detected
+     * by the daemon from `parent_session_id` so the caller never declares it
+     * (rules in [org.iotsplab.akiba.dbDaemon.operations.AgentOps.GetAgentStatus]).
      *
-     * The current default policy admits [SELF] and [DIRECT_CHILD]
-     * only; [DIRECT_PARENT] / [SIBLING] / [OTHER] are detected
-     * (so the LLM can see WHY access was denied) but currently
-     * rejected.  Adding more admitted relationships will
-     * require an explicit permission model.
+     * Default policy admits [SELF] and [DIRECT_CHILD] only; [DIRECT_PARENT] /
+     * [SIBLING] / [OTHER] are detected so the LLM can see WHY access was denied,
+     * but are currently rejected.
      */
     enum class AgentRelationship {
         /** target == caller. */
@@ -791,16 +780,11 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
     }
 
     /**
-     * Tagged union returned by [getAgentStatus].  The
-     * `get_agent_status` tool branches on this to pick the
-     * right LLM-facing wording:
-     *
-     *   * [Ok]            — return the snapshot.
-     *   * [NotFound]      — surface as a structured "not found" error.
-     *   * [AccessDenied]  — surface the daemon's hint so the LLM
-     *                        knows the relationship was detected
-     *                        but access is not granted yet.
-     *   * [BadRequest]    — surface as a validation error.
+     * Tagged union returned by [getAgentStatus]; the `get_agent_status` tool
+     * branches on it to pick the LLM-facing wording: [Ok] returns the snapshot,
+     * [NotFound] is a structured "not found" error, [BadRequest] a validation
+     * error, and [AccessDenied] surfaces the daemon's hint so the LLM knows the
+     * relationship was detected but access is not granted yet.
      */
     sealed class AgentStatusResult {
         data class Ok(val info: AgentStatusInfo) : AgentStatusResult()

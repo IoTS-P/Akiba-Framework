@@ -11,8 +11,8 @@ import io.ktor.server.routing.Route
 import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
-import org.iotsplab.akiba.llm.skill.SkillManager
 import java.nio.file.Files
+import org.iotsplab.akiba.llm.skill.SkillManager
 
 fun Route.skillRoutes() {
     get("/skills") {

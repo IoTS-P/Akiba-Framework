@@ -1,7 +1,5 @@
 package org.iotsplab.akiba.module
 
-import org.apache.logging.log4j.LogManager
-import org.apache.logging.log4j.Logger
 import java.io.File
 import java.net.URLClassLoader
 import java.nio.file.Files
@@ -10,22 +8,15 @@ import java.nio.file.StandardCopyOption
 import java.util.jar.JarFile
 import kotlin.io.path.exists
 import kotlin.io.path.isDirectory
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.Logger
 
 /**
- * Manages module jar files stored under the `modules/` directory.
+ * Manages module jar files under `modules/`: `modules/<name>.jar` is available
+ * to every user, `modules/<username>/<name>.jar` only to that user.
  *
- * Directory layout:
- * ```
- * modules/
- *   ├── PublicModule.jar          ← available to all users
- *   ├── AnotherPublic.jar
- *   └── <username>/
- *       ├── PrivateModule.jar     ← available only to <username>
- *       └── AnotherPrivate.jar
- * ```
- *
- * All operations enforce path-traversal protection: usernames are sanitised
- * via [safeSegment] before being used as directory names.
+ * All operations enforce path-traversal protection — usernames go through
+ * [safeSegment] before being used as directory names.
  */
 object ModuleJarManager {
     private val logger: Logger = LogManager.getLogger("ModuleJarManager")
@@ -119,15 +110,12 @@ object ModuleJarManager {
     // ── Upload / install ──────────────────────────────────────────
 
     /**
-     * Validate and install a module jar for [username].
+     * Validate and install a module jar for [username]: the file must be within
+     * the size limit, be a valid jar with a `Main-Class` manifest attribute, and
+     * that class must extend [AkibaModule].
      *
-     * Validation steps:
-     * 1. File size check
-     * 2. Valid jar with a `Main-Class` manifest attribute
-     * 3. The main class extends [AkibaModule]
-     *
-     * The jar is saved to `modules/<username>/<originalFileName>`. If a jar
-     * with the same name already exists, it is overwritten.
+     * The jar is saved to `modules/<username>/<originalFileName>`, overwriting
+     * any jar of the same name.
      *
      * @return The installed [ModuleEntry].
      * @throws IllegalArgumentException If validation fails.

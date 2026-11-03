@@ -4,40 +4,14 @@ import java.time.Instant
 import java.util.Collections
 
 /**
- * In-memory, write-only-from-the-child / read-only-from-the-parent record of what an
- * [AkibaModule] did during a single `startProcess` invocation.
+ * In-memory record of what an [AkibaModule] did during a single `startProcess`
+ * call, so a parent can react to the child's side-effects instead of querying
+ * the database for them.
  *
- * Until now, a module's runtime side-effects (database writes via `updateData` /
- * `updateErr`, plus the `startTask` / `finishTask` timing pair recorded via
- * [org.iotsplab.akiba.data.database.DatabaseClient]) were only observable from outside the
- * Akiba process — by querying the database. That is fine for offline post-processing but
- * very awkward when a parent module just spawned a child via [AkibaModule.callModule] and
- * wants to react to what the child produced *in this same run*.
- *
- * `RuntimeReport` plugs that gap by mirroring a fixed set of side-effects into a plain
- * in-memory map as they happen:
- *
- *  | Key                 | Value type            | Written by                               |
- *  | ------------------- | --------------------- | ---------------------------------------- |
- *  | `"data"`            | `Map<String, Any?>`   | every [AkibaModule.updateData] call (cumulative; later writes overwrite earlier values for the same column) |
- *  | `"err_msg"`         | `String?`             | [AkibaModule.updateErr] / [AkibaModule.clearErr] |
- *  | `"start_time"`      | [Instant]             | the moment `startTask` is reported to the daemon |
- *  | `"end_time"`        | [Instant]             | the moment `finishTask` is reported to the daemon |
- *  | `"execution_time_ms"` | [Long]              | total wall time spent inside `startProcess()` |
- *
- * The map is constructed by the parent (typically [AkibaModule.callModule]) and passed
- * into the child via the new `runtimeReport` constructor parameter; the child's base-class
- * machinery does the populating, so module authors don't have to do anything special — the
- * report is filled in automatically. The parent reads the result via
- * [AkibaModule.runtimeReportView] *after* `startProcess` has returned.
- *
- * ### Concurrency
- *
- * A child module runs to completion before the parent observes the report (that is the
- * contract of [AkibaModule.callModule]: the call is `suspend` and only returns after the
- * child finished). No locking is therefore required between the child's writes and the
- * parent's reads. Within the child itself, all writes happen on the module's own coroutine
- * and are sequential, so a plain mutable map is enough.
+ * Keys: `"data"` (cumulative `updateData` writes), `"err_msg"`, `"start_time"`,
+ * `"end_time"` and `"execution_time_ms"`. The parent creates the map and passes
+ * it to the child via the `runtimeReport` constructor parameter. No locking is
+ * needed: `callModule` is suspend and finishes the child before the parent reads.
  */
 class RuntimeReport {
     private val backing: MutableMap<String, Any?> = mutableMapOf()

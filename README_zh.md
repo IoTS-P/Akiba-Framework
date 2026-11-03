@@ -316,19 +316,26 @@ Akiba 提供了内置的 LLM agent 基础设施，用于智能二进制分析。
 
 ### Agent 策略
 
-- **ReAct 策略**（默认）：显式的 Thought → Action → Observation 循环，用于逐步推理
-- **Plan-Execute 策略**：先制定计划，再执行每个步骤，最后进行反思
+- **ReAct**（唯一内置策略）：需要证据时调用工具，证据充分时直接回答。回复中不含工具调用即视为本轮结束。
 
 ### 内置工具
 
-使用 `AgentModule` 时，以下内置工具自动可用：
+使用 `AgentModule` 时，`BuiltInTools.all(...)` 会注册以下工具：
 
-- `run_module` — 委托工作给另一个 AkibaModule
-- `spawn_sub_agent` — 异步生成子 LLM agent（模板或自由）
-- `await_multiple_children` — 等待异步子 agent 达到目标状态
-- `query_module_data` — 从数据库查询分析结果
-- `query_session_history` — 查看过去的 agent 会话
-- `query_memories` — 搜索长期记忆存储
+- **模块与脚本**：`run_module`、`list_modules`、`query_module_data`、
+  `script_library`、`run_script`、`query_ghidra_api`
+- **子 agent 协调**：`spawn_sub_agent`、`list_sub_agents`、
+  `await_multiple_children`、`get_agent_status`、`agent_builder_alternatives`
+- **历史与记忆**：`query_session_history`、`read_history_tool_call`、
+  `search_history_tool_calls`、`query_memories`
+- **技能**：`search_skill`、`read_skill`
+- **工作区**：`read_workspace_file`、`write_workspace_file`、`list_workspace_dir`、
+  `create_workspace_dir`、`move_workspace_file`、`delete_workspace_file`、`grep_workspace`
+- **Shell 与交互**：`run_shell`、`ask_user_choice`
+
+邮箱 / 工件类工具（`send_agent_message`、`read_agent_messages`、
+`ack_agent_message`、`await_condition`、`publish_agent_artifact` 等）**默认不注册**，
+需要在 `defineTools()` 中追加 `AgentMailboxTools(...)`。
 
 ### LLM 提供者
 

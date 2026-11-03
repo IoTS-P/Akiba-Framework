@@ -34,12 +34,14 @@
 //             "description": "Akiba Test"
 //           },
 //           "main": {
+
 //             "general": {
 //               "binariesRoot": "/data/all-results-combined",
 //               "processor": "n/a",
 //               "autoAnalysisTimeout": 600,
 //               "threads": 1
 //             },
+
 //             "withGhidraProject": {
 //               "projectRoot": "./ghidra_projects",
 //               "name": "analyzed_base_2",
@@ -51,6 +53,7 @@
 //               "saveProject": true,
 //               "noCreateProgram": false
 //             },
+
 //             "sqlSource": {
 //               "serverIP": "127.0.0.1",
 //               "serverPort": "31777",
@@ -61,6 +64,7 @@
 //               "firmxray_results",
 //               "convert_firm_to_elf_results"
 //             ],
+
 //             "tasks": [
 //               {
 //                 "mainClassName": "org.iotsplab.akiba.process.TestModule",
@@ -71,6 +75,7 @@
 //               }
 //             ]
 //           },
+
 //           "TestModule": {
 //             "name": "Akiba",
 //             "age": 18,

@@ -1,43 +1,23 @@
 package org.iotsplab.akiba.script
 
 import ghidra.program.model.listing.Program
-import org.iotsplab.akiba.module.AkibaModule
-import org.iotsplab.akiba.module.RuntimeReport
-import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import java.io.File
 import java.net.URL
 import java.net.URLClassLoader
 import java.security.ProtectionDomain
+import org.iotsplab.akiba.module.AkibaModule
+import org.iotsplab.akiba.module.RuntimeReport
+import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 
 /**
  * Isolating ClassLoader for dynamically compiled scripts.
+ * Each instance is an **isolated namespace**, so classes from different
+ * instances cannot clash — hot-reload is just a new [ScriptClassLoader].
  *
- * Each [ScriptClassLoader] instance represents an **isolated namespace**:
- * classes loaded by different instances cannot conflict with each other.
- * This enables hot-reload — simply create a new [ScriptClassLoader] and
- * compile/load the updated script.
- *
- * The parent ClassLoader is set to the dynamic-module loader
- * ([ProcedureArgumentsDeserializer.loader]) when it has been initialized,
- * so framework classes, the Ghidra API **and any dynamically loaded
- * module classes** are shared across all script instances. When the
- * module loader is not yet available (e.g. during early startup), the
- * loader of [AkibaScript] (the App CL) is used as a fallback. Each
- * script's own classes always remain isolated within its own loader.
- *
- * ### ClassLoader isolation model
- *
- * ```
- * Bootstrap CL
- *   └── App CL (Ghidra, framework jars, …)
- *         └── ProcedureArgumentsDeserializer.loader (modules/ *.jar)
- *               ├── ScriptClassLoader-1  →  ScriptA, ScriptA$1, ScriptA$inner
- *               ├── ScriptClassLoader-2  →  ScriptB, ScriptB$1
- *               └── ...
- * ```
- *
- * Framework / module classes are resolved by the parent CL (shared).
- * Script classes are resolved **only** within this CL (isolated).
+ * The parent is the dynamic-module loader
+ * ([ProcedureArgumentsDeserializer.loader]) once initialized, else the
+ * [AkibaScript] loader.  Framework, Ghidra and module classes are shared;
+ * each script's own classes stay isolated.
  */
 class ScriptClassLoader private constructor(
     private val parentLoader: ClassLoader,
@@ -206,18 +186,14 @@ class ScriptClassLoader private constructor(
 
     companion object {
         /**
-         * Resolve the parent ClassLoader for script loaders.
+         * Resolve the parent ClassLoader for script loaders: the dynamic-module
+         * loader (`ProcedureArgumentsDeserializer.loader`) once initialized, so
+         * scripts can use classes from loaded modules, else the framework's own
+         * ClassLoader (App CL).
          *
-         * If the dynamic-module loader (`ProcedureArgumentsDeserializer.loader`)
-         * has already been initialized, use it as the parent so that scripts
-         * can resolve classes from dynamically loaded modules. Otherwise fall
-         * back to the framework's own ClassLoader (the App CL).
-         *
-         * Using the module loader as the parent is critical for two reasons:
-         * 1. Scripts can `import` and use classes from any loaded module.
-         * 2. Module classes loaded by the framework and seen by the script
-         *    are the **same** `Class` instance, avoiding `ClassCastException`
-         *    caused by parallel loading.
+         * The module loader matters because it makes module classes the **same**
+         * `Class` instance the framework sees, avoiding `ClassCastException`
+         * from parallel loading.
          */
         private fun resolveParentLoader(): ClassLoader {
             return if (ProcedureArgumentsDeserializer.isLoaderInitialized()) {

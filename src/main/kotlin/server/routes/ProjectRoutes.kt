@@ -15,20 +15,14 @@ import ghidra.program.model.listing.Program
 import ghidra.util.task.ConsoleTaskMonitor
 import ghidra.util.task.TaskMonitor
 import io.ktor.http.*
-import io.ktor.server.application.*
 import io.ktor.http.content.PartData
 import io.ktor.http.content.forEachPart
 import io.ktor.http.content.streamProvider
+import io.ktor.server.application.*
 import io.ktor.server.request.receiveMultipart
 import io.ktor.server.request.receiveText
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import org.apache.logging.log4j.LogManager
-import org.apache.logging.log4j.Logger
-import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.managers.ConfigManager
-import org.iotsplab.akiba.managers.GarImporter
-import org.iotsplab.akiba.managers.WorkspaceManager
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -42,6 +36,12 @@ import java.util.zip.ZipOutputStream
 import kotlin.io.path.isDirectory
 import kotlin.io.path.isRegularFile
 import kotlin.io.path.name
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.Logger
+import org.iotsplab.akiba.data.database.AgentDatabaseClient
+import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.managers.GarImporter
+import org.iotsplab.akiba.managers.WorkspaceManager
 
 data class GhidraProjectInfo(
     val name: String,
@@ -501,13 +501,13 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
     }
 
     /**
-     * Batch-export agent sessions of a project as a ZIP of Markdown
-     * documents. Body: `{ "sessionIds": ["<uuid>", ...] }`. Each entry
-     * is the full agent-TREE export (root session + sub-agents) for one
-     * selected session. Sessions whose project does not match the path
-     * parameter are skipped (ownership check), and sessions that fail
-     * mid-export produce a small `.error.txt` entry instead of aborting
-     * the whole archive.
+     * Batch-export agent sessions of a project as a ZIP of Markdown documents,
+     * one full agent-TREE export (root session + sub-agents) per selected id in
+     * `{ "sessionIds": [...] }`.
+     *
+     * Sessions from another project are skipped (ownership check), and a
+     * session that fails mid-export yields a small `.error.txt` entry instead
+     * of aborting the whole archive.
      */
     post("/projects/{name}/export_sessions") {
         val projectName = call.parameters["name"]
@@ -593,29 +593,17 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
         }
     }
      /*
-     * The implementation mirrors Ghidra's own `ArchiveTask.writeProject`
-     * (see `ghidra/app/plugin/core/archive/ArchiveTask.java` in the upstream
-     * repo). The resulting layout is:
+     * Mirrors Ghidra's own `ArchiveTask.writeProject` layout: `<projectName>.gpr`
+     * first, then the `JAR_FORMAT` magic entry consumed by `isJarFormat()`, then
+     * every sub-directory of the project's `.rep/`.
      *
-     *   <projectName>.gpr      # project marker file (must be the first entry)
-     *   JAR_FORMAT             # magic entry consumed by `isJarFormat()`
-     *   <subdir-of-.rep>/...   # every sub-directory under the project's .rep/
-     *
-     * Earlier versions of this route called `GhidraProject.openProject(...)` —
-     * which is what `ArchiveTask` does upstream too — but that path requires
-     * the Ghidra `Application` to be initialized. In server mode the
-     * application is only initialized lazily inside `initWorkspace()`, so
-     * the export HTTP handler blew up with `AssertException` (500) when
-     * invoked from the Projects UI without a prior agent run.
-     *
-     * To make the export reliable and headless-friendly we therefore operate
-     * **directly on the filesystem**: we never call `GhidraProject.openProject`.
-     * This matches what `ArchiveTask.writeProject` does once it has a
-     * `ProjectLocator`; we just compute the `ProjectLocator` ourselves from
-     * the per-user project directory. As a bonus, projects with malformed
-     * or empty `.gpr` marker files (which previously made `openProject`
-     * throw `NotFoundException`) can now still be exported as long as the
-     * underlying `.rep/` directory tree is intact.
+     * `GhidraProject.openProject(...)` (what upstream uses) needs the Ghidra
+     * `Application`, which in server mode is only initialized lazily inside
+     * `initWorkspace()`, so calling it from this handler without a prior agent
+     * run threw `AssertException` (500). We therefore work on the filesystem
+     * directly and compute the `ProjectLocator` from the per-user project
+     * directory, which also lets projects with a malformed or empty `.gpr`
+     * marker export as long as the underlying `.rep/` tree is intact.
      */
     get("/projects/{name}/export") {
         val projectName = call.parameters["name"]
@@ -791,18 +779,14 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
         }
 
         try {
-            // Spawn a child process to do the export.  The server JVM
-            // cannot reliably open projects created/modified by child
-            // processes (stale ProjectData index), so we delegate the
-            // entire export to a fresh `akiba --export` subprocess
-            // which opens the project the same way normal module
-            // execution does.
+            // Spawn a child process to do the export: the server JVM cannot
+            // reliably open projects touched by child processes (stale
+            // ProjectData index), so a fresh `akiba --export` subprocess opens
+            // the project the way normal module execution does.
             //
-            // Export options are passed via the config file's
-            // "textExport" section, which AkibaUtils parses as its
-            // module config (via @WithConfigClass).  This reuses the
-            // standard module-config pipeline — no environment
-            // variables needed.
+            // Export options ride in the config file's "textExport" section,
+            // which AkibaUtils parses as its module config (via
+            // @WithConfigClass) — the standard pipeline, no env vars.
             val scriptPath = findAkibaScript()
             val tempDir = Files.createTempDirectory("akiba_text_export_")
             val configPath = tempDir.resolve("config.json")
@@ -957,18 +941,16 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
     }
 
     /**
-     * Import a `.gar` (Ghidra Archive) as a standalone project.
+     * Import a `.gar` (Ghidra Archive) as a standalone project, from a
+     * multipart form with `file` (the archive) and optional `projectName`
+     * (defaults to the archive's base name).
      *
-     * Multipart form: `file` = the .gar archive, `projectName` = optional
-     * name (defaults to the archive's base name). The archive is extracted
-     * under the caller's project directory, every program is registered in
-     * the `binaries` table (hash-deduped), and programs are renamed to
-     * `<id>-<originalName>` so existing `getProgram(id)` lookups keep
-     * working.
-     *
-     * Requires the `X-Akiba-Instance` header so a database session can be
-     * opened for binary registration. Auto-analysis is skipped — the `.gar`
-     * already carries the analysis state from the source machine.
+     * Programs are extracted under the caller's project directory, registered
+     * in the `binaries` table (hash-deduped) and renamed to
+     * `<id>-<originalName>` so existing `getProgram(id)` lookups keep working;
+     * auto-analysis is skipped because the archive already carries it. The
+     * `X-Akiba-Instance` header is required to open a database session for the
+     * registration.
      */
     post("/projects/import-gar") {
         val instance = call.instanceHeader()
@@ -1114,30 +1096,14 @@ private fun archiveProject(
         // meaningless in an archive.
         val writer = JarWriter(jarOut, arrayOf(GarFormat.DB_LOCK_EXT))
 
-        // 1. Write the `<projectName>.gpr` marker file as the FIRST entry.
-        //    ArchiveTask unconditionally writes this entry — even if the
-        //    on-disk `.gpr` is empty (0 bytes). The reason is strict:
-        //    `ArchivePlugin.isJarFormat` validates the archive by reading
-        //    the **second** entry and comparing its name to
-        //    `ArchivePlugin.JAR_VERSION_TAG = "JAR_FORMAT"`. Therefore:
-        //
-        //      - Entry 0 must be `<name>.gpr` (its content is ignored —
-        //        `RestoreTask.processFile` actively filters `.gpr` files
-        //        and `createProjectMarkerFile()` creates a fresh empty
-        //        one from scratch during restore).
-        //      - Entry 1 must be `JAR_FORMAT` (see step 2 below).
-        //
-        //    Skipping the `.gpr` entry when it is empty (a common test
-        //    scaffolding case) shifts `JAR_FORMAT` to entry 0, so the
-        //    validator reads a `.rep/...` filename into `format` and
-        //    Ghidra rejects the file with "File Format Error" /
-        //    "Can't read the file".
-        //
-        //    If the marker file does not exist at all on disk (e.g. the
-        //    project tree is partially initialized), we still must
-        //    emit a 0-byte placeholder so the entry-count arithmetic
-        //    above stays correct; otherwise the archive is structurally
-        //    invalid even though everything else is fine.
+        // 1. Write the `<projectName>.gpr` marker file as the FIRST entry, even
+        //    when it is empty: `ArchivePlugin.isJarFormat` validates an archive
+        //    by reading the SECOND entry and comparing its name with
+        //    `JAR_VERSION_TAG = "JAR_FORMAT"`, so omitting `.gpr` shifts
+        //    `JAR_FORMAT` to index 0 and Ghidra rejects the file.
+        //    The content is ignored (`RestoreTask.processFile` filters `.gpr`
+        //    and `createProjectMarkerFile()` recreates it), so a marker missing
+        //    on disk still gets a 0-byte placeholder to keep indices correct.
         val markerBytes = if (markerFile.isFile) {
             try { Files.readAllBytes(markerFile.toPath()) } catch (_: Exception) { ByteArray(0) }
         } else {
@@ -1420,15 +1386,12 @@ private fun writeProjectTextExportZip(
     val exportedAt = Instant.now().toString()
     val warnings = mutableListOf<String>()
 
-    // Force-refresh the project data index from disk.  Programs may
-    // have been added or modified by child processes (module
-    // subprocesses) after the server JVM last had the project open.
-    // Without a refresh, the in-memory DomainFolder index can be stale
-    // and report 0 domain files even though the .rep/ directory on
-    // disk contains program files — which is why .gar export (which
-    // reads .rep/ directly) works while text export produces an empty
-    // zip.  The boolean parameter requests a deep refresh (all
-    // subfolders recursively).
+    // Force-refresh the project data index from disk: child processes (module
+    // subprocesses) may have added or modified programs since the server JVM
+    // last opened the project, and a stale in-memory DomainFolder index reports
+    // 0 domain files even though .rep/ holds them — which is why .gar export
+    // (reading .rep/ directly) works while text export yields an empty zip.
+    // `true` requests a deep refresh of all subfolders.
     try {
         WorkspaceManager.project.projectData.refresh(true)
     } catch (e: Exception) {

@@ -349,30 +349,26 @@ Tip: In Linux, you can add a `&` to the command line to run the command in the b
 
 Akiba provides a built-in LLM agent infrastructure for intelligent binary analysis. The agent system allows you to create modules that use Large Language Models to analyze binaries with step-by-step reasoning.
 
-### Agent Strategies
+### Agent Strategy
 
-#### ReAct Strategy (Default)
+Akiba ships a single built-in strategy, **ReAct**, and every module uses it unless it
+overrides `agentStrategy()`.
 
-The ReAct (Reasoning + Acting) strategy follows an explicit **Thought → Action → Observation** cycle:
+The model works in plain prose: it says what it is about to inspect, then emits a
+```json tool_call block when it needs a tool. Tool results come back as observations and
+the loop continues. **A reply that contains no tool call ends the turn** — that text is
+the answer. There is no required marker, prefix, or template.
 
 ```
-THOUGHT: I need to find the entry point.
-ACTION:  list_functions()
-OBSERVATION: main @ 0x401234, foo @ 0x401256
-THOUGHT: The entry point is main...
-ACTION:  decompile(address="0x401234")
-OBSERVATION: int main() { return 0; }
-THOUGHT: I now have the answer.
-FINAL ANSWER: The binary's entry point...
+model: "The entry point is likely `main`. Checking the function list."
+        -> {"tool_call": {"name": "script_library", "arguments": {...}}}
+tool:  main @ 0x401234, foo @ 0x401256
+model: "The entry point is main at 0x401234."
+        (no tool call -> answer delivered, run ends)
 ```
 
-#### Plan-Execute Strategy
-
-The Plan-Execute strategy works in three phases:
-
-1. **Planning**: Create a numbered plan of steps
-2. **Execution**: Execute each step and gather observations
-3. **Reflection**: Reflect on results and provide final answer
+Providers without native function calling (Ollama, generic OpenAI-compatible endpoints)
+carry the call in the text as the JSON block shown above.
 
 ### Creating an Agent Module
 

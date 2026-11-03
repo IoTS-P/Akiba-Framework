@@ -7,6 +7,26 @@ import ghidra.framework.Application
 import ghidra.framework.ApplicationConfiguration
 import ghidra.framework.HeadlessGhidraApplicationConfiguration
 import ghidra.program.model.lang.LanguageProvider
+import java.io.Closeable
+import java.io.File
+import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.Path
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import kotlin.io.path.ExperimentalPathApi
+import kotlin.io.path.absolutePathString
+import kotlin.io.path.copyTo
+import kotlin.io.path.copyToRecursively
+import kotlin.io.path.createDirectories
+import kotlin.io.path.deleteExisting
+import kotlin.io.path.deleteRecursively
+import kotlin.io.path.exists
+import kotlin.io.path.isDirectory
+import kotlin.io.path.isRegularFile
+import kotlin.io.path.name
+import kotlin.io.path.notExists
+import kotlin.io.path.writeText
 import kotlinx.coroutines.runBlocking
 import org.apache.logging.log4j.Level
 import org.apache.logging.log4j.LogManager
@@ -28,26 +48,6 @@ import org.iotsplab.akiba.managers.ConfigManager.mainConf
 import org.iotsplab.akiba.managers.ConfigManager.mergeConfigs
 import org.iotsplab.akiba.managers.ConfigManager.projectConf
 import org.iotsplab.akiba.utils.LoggerFactory
-import java.io.Closeable
-import java.io.File
-import java.io.IOException
-import java.nio.file.Files
-import java.nio.file.Path
-import java.time.LocalDateTime
-import java.time.format.DateTimeFormatter
-import kotlin.io.path.ExperimentalPathApi
-import kotlin.io.path.absolutePathString
-import kotlin.io.path.copyTo
-import kotlin.io.path.copyToRecursively
-import kotlin.io.path.createDirectories
-import kotlin.io.path.deleteExisting
-import kotlin.io.path.deleteRecursively
-import kotlin.io.path.exists
-import kotlin.io.path.isDirectory
-import kotlin.io.path.isRegularFile
-import kotlin.io.path.name
-import kotlin.io.path.notExists
-import kotlin.io.path.writeText
 
 object WorkspaceManager: Closeable {
     lateinit var logRootDir: Path
@@ -121,15 +121,12 @@ object WorkspaceManager: Closeable {
     }
 
     /**
-     * Initialize the workspace, including:
-     * 1. Confirm project name (need to consider restore mode)
-     * 2. Initialize root logger (need to consider restore mode)
-     * 3. Find all modules (.jar files in /process) and load dynamically
-     * 4. Read and save all MD5 file checksums in database (if specified)
-     * 5. If it's not restore mode, create workspace directory for log files and other files
-     * 6. Initialize Ghidra application
-     * 7. Initialize global language provider (for arch languages)
-     * 8. Create Ghidra project if it's not restore mode
+     * Initialize the workspace: pick the project name and root logger (restore
+     * mode aware), load module JARs from `/process`, import MD5 checksums, then
+     * create the log directories unless restoring, initialize Ghidra and the
+     * language provider, and open or create the Ghidra project.
+     *
+     * Returns `false` on the first step that fails.
      */
     @OptIn(ExperimentalPathApi::class)
     fun initWorkspace(): Boolean {
@@ -453,23 +450,16 @@ object WorkspaceManager: Closeable {
     }
 
     /**
-     * Release the singleton [GhidraProject] handle.
+     * Release the singleton [GhidraProject] handle, the inverse of
+     * [openOrCreateInteractiveProject] / [initializeGhidraProject].
      *
-     * This is the inverse of [openOrCreateInteractiveProject] / [initializeGhidraProject].
-     * It exists because akiba_server runs as a long-lived JVM process and
-     * task execution happens in **child processes**. Each child process opens
-     * its own `GhidraProject` against the same on-disk `<name>.rep/`; if the
-     * main JVM kept the project loaded indefinitely, Ghidra's `.ulock` file
-     * would block every child from acquiring the project, and every workflow
-     * would fail with `FileInUseException`.
+     * akiba_server is long-lived but tasks run in **child** processes that open
+     * the same on-disk `<name>.rep/`; holding the project here would keep
+     * Ghidra's `.ulock` and make every child fail with `FileInUseException`, so
+     * whoever opened it must release it in `finally`.
      *
-     * Export endpoints (and any other short-lived read against a project) must
-     * call this in their `finally` block when they were the one who opened the
-     * project, so subsequent child-process invocations are not starved.
-     *
-     * Safe to call when nothing is loaded — returns `false` and is a no-op.
-     * Never throws: any close-time error is logged at WARN and the state is
-     * still reset, so the caller can move on to a fresh open.
+     * Safe when nothing is loaded (`false`, no-op); never throws — close errors
+     * are logged at WARN and the state is still reset.
      */
     fun releaseActiveProject(): Boolean {
         val current = proj ?: run {

@@ -2,12 +2,12 @@ package org.iotsplab.akiba.server.security
 
 import io.jsonwebtoken.Jwts
 import io.jsonwebtoken.security.Keys
-import org.iotsplab.akiba.server.db.Session
-import org.iotsplab.akiba.server.db.UserDao
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.*
 import javax.crypto.SecretKey
+import org.iotsplab.akiba.server.db.Session
+import org.iotsplab.akiba.server.db.UserDao
 
 object JwtService {
     private lateinit var secretKey: SecretKey

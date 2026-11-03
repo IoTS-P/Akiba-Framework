@@ -1,27 +1,19 @@
 package org.iotsplab.akiba.server.security
 
-import kotlinx.coroutines.delay
 import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.delay
 
 /**
  * Brute-force protection for the sign-in endpoint.
  *
- * Policy:
+ * Every rejected sign-in — wrong password *or* unknown username — waits for
+ * [FAILURE_DELAY]; [MAX_FAILED_ATTEMPTS] failures within [FAILURE_WINDOW] lock
+ * the account for [LOCK_DURATION], releasable early by an administrator.
  *
- *  - every rejected sign-in — wrong password *or* unknown username — is answered
- *    only after [FAILURE_DELAY], so `/auth/login` cannot be used as a fast oracle
- *    to guess passwords or to hammer the server;
- *  - [MAX_FAILED_ATTEMPTS] consecutive failures within [FAILURE_WINDOW] lock that
- *    account for [LOCK_DURATION]; an administrator can lift the lock earlier,
- *    otherwise it expires on its own.
- *
- * Per-account counters live in the `users` table (see
- * [org.iotsplab.akiba.server.db.UserDao]), so a restart does not reset them.
- * Usernames that do not exist have no row to hang state on, so they are counted
- * in memory instead — enough to stop a loop that guesses names, and harmless if
- * the process restarts.
+ * Counters live in the `users` table ([org.iotsplab.akiba.server.db.UserDao]) and
+ * survive a restart; usernames with no row are counted in memory instead.
  */
 object LoginProtection {
 

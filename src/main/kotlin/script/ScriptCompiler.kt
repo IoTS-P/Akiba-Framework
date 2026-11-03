@@ -1,12 +1,12 @@
 package org.iotsplab.akiba.script
 
-import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.PrintStream
 import java.net.URL
 import java.nio.file.Files
 import kotlin.reflect.KClass
+import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 
 /**
  * Immutable data class representing a successfully compiled script.
@@ -28,15 +28,11 @@ data class CompiledScript(
 class CompilationException(message: String) : Exception(message)
 
 /**
- * Kotlin-only script compiler.
+ * Kotlin-only script compiler, using the embedded `kotlin-compiler-embeddable`.
  *
- * Compiles Kotlin source code into JVM bytecode using the embedded
- * Kotlin compiler (`kotlin-compiler-embeddable`). The source must
- * define a class that extends [AkibaScript].
- *
- * The resulting [CompiledScript] contains **all** class files produced
- * by the compiler (the main class + any inner classes / lambdas),
- * keyed by their binary class name.
+ * The source must define a class extending [AkibaScript].  The resulting
+ * [CompiledScript] holds **all** class files the compiler produced (main class
+ * plus inner classes / lambdas), keyed by binary class name.
  */
 object ScriptCompiler {
 

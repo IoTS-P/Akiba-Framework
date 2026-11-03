@@ -6,13 +6,6 @@ import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
-import org.apache.logging.log4j.LogManager
-import org.apache.logging.log4j.Logger
-import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.llm.config.LLMKeyFileStore
-import org.iotsplab.akiba.managers.WorkspaceManager
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
@@ -20,6 +13,14 @@ import java.nio.file.Paths
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.Logger
+import org.iotsplab.akiba.data.database.AgentDatabaseClient
+import org.iotsplab.akiba.llm.agent.runtime.RuntimeState
+import org.iotsplab.akiba.llm.config.LLMKeyFileStore
+import org.iotsplab.akiba.managers.WorkspaceManager
 
 private val logger: Logger = LogManager.getLogger("WorkflowRoutes")
 private val mapper = jacksonObjectMapper()
@@ -111,12 +112,12 @@ object WorkflowManager {
                 // sessions at the daemon level).
                 fullEnv["AKIBA_WORKFLOW_ID"] = workflowId
 
-                // Resolve LLM API key from the saved config if present.
-                // The frontend sets "llm.apiKeyEnv" to the first 8 hex chars
-                // of the UUID for the saved key entry in ~/.akiba/llm_keys.json.
-                // We set that env var with the actual API key value.
-                // If the user provided a literal "llm.apiKey", the child reads
-                // it from the JSON config directly — nothing to do here.
+                // Resolve the LLM API key from the saved config when present:
+                // "llm.apiKeyEnv" holds the first 8 hex chars of the key entry's
+                // UUID in ~/.akiba/llm_keys.json, and we set that env var to the
+                // real key value.
+                // A literal "llm.apiKey" is read from the JSON config by the
+                // child, so there is nothing to do in that case.
                 try {
                     val configRoot = mapper.readTree(java.io.File(configFile))
                     val llmNode = configRoot.at("/main/llm")
@@ -199,22 +200,15 @@ object WorkflowManager {
                     )
                 }
 
-                // NOTE: do NOT call reconcileAgentSessions here.
-                // When the process exits normally, all agents should
-                // already be in a terminal state, so cleanup is
-                // unnecessary.  When the process crashes, the
-                // AgentSessionReconciler (startup-time) will clean
-                // up stale sessions on the next server start.
+                // NOTE: do NOT call reconcileAgentSessions here. Normal exits
+                // leave every agent terminal, and after a crash the
+                // startup-time AgentSessionReconciler reaps the stale rows.
                 //
-                // Calling reconcileAgentSessions here would create a
-                // new daemon session via withDaemonSession →
-                // connectToInstance, which can force-disconnect the
-                // workflow process's existing daemon session before
-                // the daemon has detected the process's death.  This
-                // breaks in-flight mailbox operations (including
-                // child→parent wake-up messages) and also creates a
-                // race with stopWorkflow's own reconcileAgentSessions
-                // call when the user clicks Stop.
+                // A call here would open a new daemon session via
+                // withDaemonSession → connectToInstance, force-disconnecting the
+                // workflow process's own session before the daemon has noticed
+                // it died, which breaks in-flight mailbox traffic (including
+                // child→parent wake-ups) and races stopWorkflow's own reconcile.
             } catch (e: Exception) {
                 logger.error("[workflow $workflowId] Error: {}", e.message, e)
                 ProgressManager.updateStatus(progressToken, "failed")
@@ -305,29 +299,22 @@ object WorkflowManager {
     fun getAllWorkflowStatuses(): List<WorkflowStatusEntry> = workflowStatuses.values.toList()
 
     /**
-     * Close non-terminal agent sessions owned by the workflow process
-     * that has just been stopped.
+     * Close non-terminal agent sessions owned by the workflow process that has
+     * just been stopped.
      *
-     * Session→workflow attribution is EXACT: every module-spawned
-     * session carries `agent_sessions.workflow_id` (propagated through
-     * the `AKIBA_WORKFLOW_ID` env var set at workflow launch, and
-     * inherited by child sessions at the daemon level), so cleanup only
-     * touches rows whose `workflow_id` equals [workflowId].  Stopping
-     * one workflow can therefore never flip another PARALLEL workflow's
-     * live agents to `closed` — the previous creation-window heuristic
-     * did exactly that whenever two workflows overlapped in time.
+     * Attribution is EXACT: every module-spawned session carries
+     * `agent_sessions.workflow_id` (propagated through the `AKIBA_WORKFLOW_ID`
+     * env var set at launch and inherited by child sessions at the daemon
+     * level), so only rows matching [workflowId] are touched and stopping one
+     * workflow can never close another PARALLEL workflow's live agents — the
+     * previous creation-window heuristic did exactly that whenever two
+     * workflows overlapped. Legacy rows with a NULL `workflow_id` are left
+     * alone; the startup-time AgentSessionReconciler reaps them once their
+     * `updated_at` goes stale.
      *
-     * Legacy rows with a NULL `workflow_id` (interactive sessions and
-     * anything spawned before the column existed) are deliberately left
-     * alone; the startup-time AgentSessionReconciler reaps them once
-     * their `updated_at` goes stale.
-     *
-     * The [reasonTag] is embedded in the `closing_reason` column so
-     * an operator can tell the trigger (e.g. `"workflow_stopped"`).
-     *
-     * Failures are logged at WARN and never thrown — the workflow
-     * itself has already exited/stopped; the session cleanup is
-     * best-effort.
+     * [reasonTag] is embedded in `closing_reason` so an operator can tell the
+     * trigger (e.g. `"workflow_stopped"`). Failures are logged at WARN and
+     * never thrown: the workflow has already exited, so cleanup is best-effort.
      */
     private fun reconcileAgentSessions(
         info: DaemonInfo,
@@ -347,10 +334,10 @@ object WorkflowManager {
                     parentSessionId = "ALL",
                 )
                 val nonTerminalStates = setOf(
-                    org.iotsplab.akiba.llm.agent.RuntimeState.RUNNING.wire(),
-                    org.iotsplab.akiba.llm.agent.RuntimeState.STANDBY.wire(),
-                    org.iotsplab.akiba.llm.agent.RuntimeState.MSGHANDLE.wire(),
-                    org.iotsplab.akiba.llm.agent.RuntimeState.CANCELLING.wire(),
+                    org.iotsplab.akiba.llm.agent.runtime.RuntimeState.RUNNING.wire(),
+                    org.iotsplab.akiba.llm.agent.runtime.RuntimeState.STANDBY.wire(),
+                    org.iotsplab.akiba.llm.agent.runtime.RuntimeState.MSGHANDLE.wire(),
+                    org.iotsplab.akiba.llm.agent.runtime.RuntimeState.CANCELLING.wire(),
                 )
                 var closed = 0
                 for (s in sessions) {
@@ -363,7 +350,7 @@ object WorkflowManager {
                     try {
                         agentDbClient.setRuntimeState(
                             s.sessionId,
-                            org.iotsplab.akiba.llm.agent.RuntimeState.CLOSED.wire(),
+                            org.iotsplab.akiba.llm.agent.runtime.RuntimeState.CLOSED.wire(),
                             reason,
                         )
                         runCatching {

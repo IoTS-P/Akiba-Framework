@@ -1,6 +1,9 @@
 package org.iotsplab.akiba.server
 
+import com.fasterxml.jackson.databind.DeserializationFeature
+import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.ktor.http.*
+import io.ktor.serialization.jackson.*
 import io.ktor.server.application.*
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
@@ -10,9 +13,7 @@ import io.ktor.server.plugins.statuspages.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.websocket.*
-import io.ktor.serialization.jackson.*
-import com.fasterxml.jackson.databind.DeserializationFeature
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import java.util.concurrent.atomic.AtomicBoolean
 import org.apache.logging.log4j.Level
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
@@ -23,46 +24,40 @@ import org.apache.logging.log4j.core.appender.rolling.SizeBasedTriggeringPolicy
 import org.apache.logging.log4j.core.layout.PatternLayout
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.data.database.DatabaseClient
-import org.iotsplab.akiba.llm.agent.AgentSessionReconciler
-import org.iotsplab.akiba.llm.agent.ModelContextLengthService
+import org.iotsplab.akiba.llm.agent.runtime.AgentSessionReconciler
+import org.iotsplab.akiba.llm.agent.stream.StreamingChunkPusher
 import org.iotsplab.akiba.managers.WorkspaceManager
-import org.iotsplab.akiba.server.db.ServerDbConfig
 import org.iotsplab.akiba.server.db.ServerDatabase
-import org.iotsplab.akiba.server.security.JwtService
-import org.iotsplab.akiba.server.routes.authRoutes
-import org.iotsplab.akiba.server.routes.instanceRoutes
-import org.iotsplab.akiba.server.routes.fileRoutes
-import org.iotsplab.akiba.server.routes.workflowRoutes
-import org.iotsplab.akiba.server.routes.scriptRoutes
-import org.iotsplab.akiba.server.routes.queryRoutes
-import org.iotsplab.akiba.server.routes.agentRoutes
-import org.iotsplab.akiba.server.routes.llmConfigRoutes
-import org.iotsplab.akiba.server.routes.runtimeConfigRoutes
-import org.iotsplab.akiba.server.routes.projectRoutes
-import org.iotsplab.akiba.server.routes.skillRoutes
-import org.iotsplab.akiba.server.routes.moduleRoutes
-import org.iotsplab.akiba.server.routes.updateRoutes
+import org.iotsplab.akiba.server.db.ServerDbConfig
 import org.iotsplab.akiba.server.routes.adminRoutes
-import java.util.concurrent.atomic.AtomicBoolean
+import org.iotsplab.akiba.server.routes.agentRoutes
+import org.iotsplab.akiba.server.routes.authRoutes
+import org.iotsplab.akiba.server.routes.fileRoutes
+import org.iotsplab.akiba.server.routes.instanceRoutes
+import org.iotsplab.akiba.server.routes.llmConfigRoutes
+import org.iotsplab.akiba.server.routes.moduleRoutes
+import org.iotsplab.akiba.server.routes.projectRoutes
+import org.iotsplab.akiba.server.routes.queryRoutes
+import org.iotsplab.akiba.server.routes.runtimeConfigRoutes
+import org.iotsplab.akiba.server.routes.scriptRoutes
+import org.iotsplab.akiba.server.routes.skillRoutes
+import org.iotsplab.akiba.server.routes.updateRoutes
+import org.iotsplab.akiba.server.routes.workflowRoutes
+import org.iotsplab.akiba.server.security.JwtService
 
 object AkibaServer {
     private val logger: Logger = LogManager.getLogger("AkibaServer")
 
     /**
-     * Comma-separated list of daemon instances to reconcile at startup
-     * and on JVM shutdown. Override via the `AKIBA_AGENT_RECONCILE_INSTANCES`
-     * environment variable; the default is empty, because instances are created
-     * per user on demand and no instance name is baked into a deployment any
-     * more.
+     * Comma-separated daemon instances to reconcile at startup and on JVM
+     * shutdown, overridable via `AKIBA_AGENT_RECONCILE_INSTANCES`; empty by
+     * default because instances are created per user on demand.
      *
-     * Sign-in already reconciles each user's own instances
-     * (see `reconcileUserInstances`), so this environment variable is only
-     * needed for instances that no user ever signs in for — which additionally
-     * requires `AKIBA_DAEMON_USER` / `AKIBA_DAEMON_PASSWORD` (there is no
-     * built-in service account), and that account must own those instances.
+     * Sign-in already reconciles each user's own instances, so this is only
+     * needed for instances no user ever signs in for, which additionally
+     * requires `AKIBA_DAEMON_USER` / `AKIBA_DAEMON_PASSWORD` owning them.
      *
-     * Set to the literal string "off" (or leave empty) to skip reconciliation
-     * entirely — useful for tests / debugging.
+     * Set to "off" (or leave empty) to skip reconciliation entirely.
      */
     private val reconcileInstances: List<String> by lazy {
         val raw = System.getenv("AKIBA_AGENT_RECONCILE_INSTANCES")
@@ -102,18 +97,14 @@ object AkibaServer {
         JwtService.init(config.jwtSecret)
 
         // ── Startup reconciliation ─────────────────────────────────────
-        // Mark any session rows left in a non-terminal state by a
-        // previous (possibly crashed) process as "closed" with a
-        // "reconciled:startup" reason. Without this step the frontend's
-        // status pill stays on "Running" / "Cancelling" forever when
-        // the server was taken down by SIGKILL, OOM, or container
-        // restart — the per-agent terminationHook never ran, so the
-        // DB still shows the pre-kill state.
+        // Mark session rows left non-terminal by a previous (possibly
+        // crashed) process as "closed" with a "reconciled:startup" reason:
+        // after SIGKILL, OOM or a container restart the terminationHook
+        // never ran, so the frontend's status pill would otherwise stay on
+        // "Running" / "Cancelling" forever.
         //
-        // Best-effort: DB / daemon may be slow to start, so a failure
-        // here is logged and the server still starts. The
-        // [AgentWatchdog] + [OrphanReaper] running inside this JVM
-        // will catch whatever the startup pass missed.
+        // Best-effort only — failures are logged and the server still
+        // starts; [AgentWatchdog] + [OrphanReaper] catch what this misses.
         runStartupReconciliation(config)
 
         // ── JVM shutdown hook ─────────────────────────────────────────
@@ -140,7 +131,7 @@ object AkibaServer {
         // process spawns directly, the file reaches every launch
         // path.  Also marks this JVM as the in-process server so
         // its own chunk publishes stay in memory.
-        org.iotsplab.akiba.llm.agent.StreamingChunkPusher.publishServerPortFile(config.port)
+        org.iotsplab.akiba.llm.agent.stream.StreamingChunkPusher.publishServerPortFile(config.port)
 
         embeddedServer(Netty, config.port, config.host) {
             install(ContentNegotiation) {
@@ -244,20 +235,14 @@ object AkibaServer {
     //  Startup-time / shutdown-time agent session reconciliation
     // ============================================================
     //
-    // See the long comment on [AgentSessionReconciler] for the
-    // design rationale.  In short: when the JVM is taken down
-    // ungracefully (SIGKILL, OOM, container restart), the per-
-    // agent terminationHook never runs, so the DB rows for the
-    // in-flight sessions stay on `runtime_state='running' / 'cancelling'
-    // / 'standby' / 'msghandle'` forever and the frontend's status
-    // pill freezes on the wrong state.  These two helpers run the
-    // startup pass (catches ungraceful exits) and the shutdown
-    // pass (catches graceful SIGTERM exits that Ktor doesn't run
-    // our cleanup for) respectively.
+    // Uncontrolled exits (SIGKILL, OOM, container restart) skip the
+    // per-agent terminationHook, leaving rows on `runtime_state='running'`
+    // etc. forever and freezing the frontend status pill; a graceful
+    // SIGTERM also needs help because Ktor does not run our cleanup.
+    // See [AgentSessionReconciler] for the full rationale.
     //
-    // Both helpers are best-effort: errors are caught and logged
-    // at WARN.  The server starts (resp. stops) regardless of the
-    // reconciler outcome.
+    // Both passes are best-effort: errors are logged at WARN and the
+    // server starts (resp. stops) regardless of the reconciler outcome.
 
     /**
      * Run the [AgentSessionReconciler] once per configured

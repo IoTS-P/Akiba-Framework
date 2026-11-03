@@ -6,9 +6,9 @@ import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import org.apache.logging.log4j.LogManager
 import java.nio.file.Files
 import java.nio.file.Path
+import org.apache.logging.log4j.LogManager
 
 private val logger = LogManager.getLogger("RuntimeConfigRoutes")
 

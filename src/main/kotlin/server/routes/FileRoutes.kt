@@ -8,16 +8,16 @@ import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
-import org.apache.logging.log4j.LogManager
-import org.apache.logging.log4j.Logger
-import org.iotsplab.akiba.managers.WorkspaceManager
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.util.UUID
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.Logger
+import org.iotsplab.akiba.managers.WorkspaceManager
 
 private val logger: Logger = LogManager.getLogger("FileRoutes")
 
@@ -48,11 +48,10 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
         Files.createDirectories(uploadDir)
 
         try {
-            // 1. Receive uploaded files.  Ktor's default form-field
-            // limit is 50 MiB — smaller than our own 100 MB cap, so a
-            // 57 MB upload died inside the multipart parser with an
-            // opaque 400.  Pass our cap explicitly; the per-file
-            // accounting below still enforces the total.
+            // 1. Receive the uploaded files — Ktor's default form-field limit
+            //    is 50 MiB, under our own 100 MB cap, so a 57 MB upload died
+            //    inside the multipart parser with an opaque 400. Pass our cap
+            //    explicitly; the per-file accounting still enforces the total.
             var totalBytes = 0L
             call.receiveMultipart(MAX_UPLOAD_SIZE).forEachPart { part ->
                 when (part) {
@@ -348,12 +347,11 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
                 dbClient.deleteBinaries(ids)
             }
 
-            // 2. Best-effort physical cleanup of the stored copies
-            //    ("<id>.bin" under the binaries root).  Filenames are
-            //    server-generated and ids come from the database, so
-            //    there is no path-traversal surface here.  Failures are
-            //    logged but do not fail the request — the rows are
-            //    already gone and a stale file is harmless.
+            // 2. Best-effort physical cleanup of the stored copies ("<id>.bin"
+            //    under the binaries root) — filenames are server-generated and
+            //    ids come from the database, so there is no path-traversal
+            //    surface. Failures are logged but do not fail the request: the
+            //    rows are gone and a stale file is harmless.
             WorkspaceManager.initBinDirectories()
             deleted.forEach { id ->
                 listOf(

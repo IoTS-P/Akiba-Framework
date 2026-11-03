@@ -311,21 +311,31 @@ Akiba also provides the following subcommands for managing database instances:
 
 Akiba provides a built-in LLM agent infrastructure for intelligent binary analysis. The agent system supports:
 
-### Agent Strategies
+### Agent Strategy
 
-- **ReAct Strategy** (default): Explicit Thought → Action → Observation cycle for step-by-step reasoning
-- **Plan-Execute Strategy**: Plan first, then execute each step, with reflection phase
+- **ReAct** (the only built-in strategy): the model calls tools when it needs evidence and
+  answers once it has enough. A reply containing no tool call ends the turn.
 
 ### Built-in Tools
 
-When using `AgentModule`, the following built-in tools are automatically available:
+When using `AgentModule`, `BuiltInTools.all(...)` registers the following tools:
 
-- `run_module` — Delegate work to another AkibaModule
-- `spawn_sub_agent` — Async-spawn a child LLM agent (template or freeform)
-- `await_multiple_children` — Wait for async child agents to reach target states
-- `query_module_data` — Query analysis results from the database
-- `query_session_history` — Review past agent sessions
-- `query_memories` — Search the long-term memory store
+- **Modules and scripts**: `run_module`, `list_modules`, `query_module_data`,
+  `script_library`, `run_script`, `query_ghidra_api`
+- **Sub-agent coordination**: `spawn_sub_agent`, `list_sub_agents`,
+  `await_multiple_children`, `get_agent_status`, `agent_builder_alternatives`
+- **History and memory**: `query_session_history`, `read_history_tool_call`,
+  `search_history_tool_calls`, `query_memories`
+- **Skills**: `search_skill`, `read_skill`
+- **Workspace**: `read_workspace_file`, `write_workspace_file`,
+  `list_workspace_dir`, `create_workspace_dir`, `move_workspace_file`,
+  `delete_workspace_file`, `grep_workspace`
+- **Shell and interaction**: `run_shell`, `ask_user_choice`
+
+The mailbox / artifact tools (`send_agent_message`, `read_agent_messages`,
+`ack_agent_message`, `await_condition`, `publish_agent_artifact`, …) are **not**
+registered by default — append `AgentMailboxTools(...)` in `defineTools()` to
+get them.
 
 ### LLM Providers
 

@@ -8,32 +8,12 @@ import java.net.http.HttpResponse
 import java.time.Duration
 
 /**
- * Generic progress reporter that sends structured status messages to the
- * parent server process via HTTP.
+ * Sends structured progress messages to the parent server process over HTTP.
  *
- * ### How it works
- *
- * When the server spawns a child process (e.g. an import subprocess or a
- * workflow task), it sets two environment variables:
- * - `AKIBA_PROGRESS_URL`   — e.g. `http://127.0.0.1:8080/api/progress`
- * - `AKIBA_PROGRESS_TOKEN` — unique token identifying this task
- *
- * Any code that wants to report progress simply calls:
- * ```kotlin
- * ProgressReporter.report("Importing file 3/5")
- * ```
- *
- * If the environment variables are not set (e.g. CLI-only mode without a
- * server), the call is silently ignored — no progress is reported.
- *
- * ### JSON payload format
- *
- * ```json
- * {"token": "<token>", "type": "progress", "message": "..."}
- * ```
- *
- * The server's `POST /api/progress` endpoint validates the token and pushes
- * the message into the corresponding SSE stream for the frontend.
+ * The parent sets `AKIBA_PROGRESS_URL` and `AKIBA_PROGRESS_TOKEN`; when they are
+ * absent (CLI-only mode) reports are silently dropped. Payload is
+ * `{"token": "<token>", "type": "progress", "message": "..."}`, which
+ * `POST /api/progress` validates and pushes into the task's SSE stream.
  */
 object ProgressReporter {
 

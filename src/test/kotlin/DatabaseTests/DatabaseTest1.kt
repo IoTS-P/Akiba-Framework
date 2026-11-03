@@ -65,10 +65,12 @@
 //           "metadata": {
 //             "description": "Akiba Test"
 //           },
+
 //           "main": {
 //             "username": "akiba",
 //             "password": "akiba",
 //             "usingInstance": "firmware_dataset",
+
 //             "general": {
 //               "binariesRoot": "/tmp/binaries",
 //               "importRoot": "./src/test/resources/binary_examples",
@@ -76,6 +78,7 @@
 //               "autoAnalysisTimeout": 600,
 //               "threads": 1
 //             },
+
 //             "withGhidraProject": {
 //               "projectRoot": "./ghidra_projects",
 //               "name": "akiba_test_1",
@@ -86,12 +89,14 @@
 //               "saveProject": true,
 //               "noCreateProgram": false
 //             },
+
 //             "sqlSource": {
 //               "serverIP": "127.0.0.1",
 //               "serverPort": "31777",
 //               "constraint": "",
 //               "disableUpdate": false
 //             },
+
 //             "dbImports": [],
 //             "tasks": []
 //           }

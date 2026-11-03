@@ -3,8 +3,8 @@ package org.iotsplab.akiba.utils
 import ghidra.util.exception.CancelledException
 import ghidra.util.task.CancelledListener
 import ghidra.util.task.TaskMonitor
-import kotlinx.coroutines.Job
 import kotlin.coroutines.cancellation.CancellationException
+import kotlinx.coroutines.Job
 
 /**
  * A wrapper for TaskMonitor that cancels the coroutine job when the task is cancelled.

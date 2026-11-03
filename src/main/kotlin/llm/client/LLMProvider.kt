@@ -87,10 +87,24 @@ data class LLMConfig(
     /** Stop sequences.  null = no custom stop. */
     val stopSequences: List<String>? = null,
 
-    /** Request timeout in seconds. */
+    /**
+     * Transport timeout in seconds.
+     *
+     * Used as-is for one-shot `chat()` calls (compaction summaries, BTW
+     * follow-ups), and capped at `LLM_ATTEMPT_TIMEOUT_MS` (30 s) for streaming
+     * calls, where it doubles as the per-read "no chunk = stalled" timeout.
+     */
     val timeoutSeconds: Int = 120,
 
-    /** Number of retries on transient failures. */
+    /**
+     * Retry budget for one LLM message.
+     *
+     * Consumed by `StrategyContext.callLLM`: the call is attempted
+     * `1 + maxRetries` times with 3/5/7 s backoff before it aborts and the
+     * error propagates up the agent tree.  Not passed to langchain4j — the
+     * model builders are pinned to a single internal attempt so the two
+     * layers cannot multiply into a retry storm.
+     */
     val maxRetries: Int = 3,
 
     /** Whether to log full request/response bodies for debugging. */

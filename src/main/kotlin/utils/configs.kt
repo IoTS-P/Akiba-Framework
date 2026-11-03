@@ -7,16 +7,16 @@ import com.fasterxml.jackson.databind.JsonDeserializer
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.JsonSerializer
 import com.fasterxml.jackson.databind.SerializerProvider
-import org.apache.logging.log4j.Level
-import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
-import org.iotsplab.akiba.module.AkibaModule
-import org.iotsplab.akiba.module.AkibaModule.Companion.DEFAULT_TIMEOUT
 import java.io.File
 import java.net.URL
 import java.net.URLClassLoader
 import java.nio.file.Path
 import java.util.jar.JarFile
 import kotlin.io.path.isRegularFile
+import org.apache.logging.log4j.Level
+import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
+import org.iotsplab.akiba.module.AkibaModule
+import org.iotsplab.akiba.module.AkibaModule.Companion.DEFAULT_TIMEOUT
 
 data class Configs (
     var username: String? = null,
@@ -97,23 +97,9 @@ data class SqlSource(
 )
 
 /**
- * Global LLM configuration for AgentModules.
- *
- * Defined in the main config JSON under the `"llm"` key.  All fields are
- * optional so that users only need to specify what the chosen provider requires;
- * sensible defaults are applied by [toLLMConfig].
- *
- * Example JSON:
- * ```json
- * {
- *   "llm": {
- *     "provider": "DEEP_SEEK",
- *     "modelName": "deepseek-v4-flash",
- *     "apiKeyEnv": "DEEPSEEK_API_KEY",
- *     "baseUrl": "https://api.deepseek.com"
- *   }
- * }
- * ```
+ * Global LLM configuration for AgentModules, read from the `"llm"` key of the
+ * main config JSON. Every field is optional; [toLLMConfig] fills provider
+ * defaults, so a config only needs the fields its provider requires.
  */
 data class LLMSource(
     /** Provider identifier (matches [LLMProvider] enum name, case-insensitive). E.g. `"DEEP_SEEK"`, `"OLLAMA"`. */
@@ -132,9 +118,9 @@ data class LLMSource(
     var topP: Double? = null,
     /** Maximum tokens the model may generate in a single response. */
     var maxTokens: Int? = null,
-    /** Request timeout in seconds. */
+    /** Request timeout in seconds (adapters cap this at 30 s). */
     var timeoutSeconds: Int = 120,
-    /** Number of retries on transient failures. */
+    /** Retry budget per message: attempts = 1 + maxRetries, 3/5/7 s backoff. */
     var maxRetries: Int = 3,
     /** Whether to log full request/response bodies for debugging. */
     var debugLogging: Boolean = false

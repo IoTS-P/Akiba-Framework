@@ -7,43 +7,11 @@ import java.util.concurrent.atomic.AtomicInteger
 /**
  * Global registry of in-flight module task monitors.
  *
- * Each [AkibaModule.startProcess] creates a [CoroutineTaskMonitor] that
- * wraps both a Ghidra `TaskMonitor` and a Kotlin coroutine `Job`. Calling
- * `taskGlobalMonitor.cancel()` propagates to **both** layers:
- *
- *   - the underlying Ghidra `TaskMonitor` is cancelled, so the next
- *     `checkCancelled()` inside a Ghidra analyzer or import pass throws
- *     `CancelledException` and the Ghidra code unwinds cleanly;
- *   - the wrapped coroutine `Job` is cancelled, so any coroutine
- *     suspension point (e.g. `dbClient.startTask`, `withContext { ... }`)
- *     throws `CancellationException` and the coroutine code unwinds.
- *
- * The Ghidra stack alone is *not* cancellable from a coroutine: a Ghidra
- * analyzer that has already been entered runs to its next
- * `checkCancelled()` call, which the Ghidra threading model invokes
- * periodically. The wrapping makes the **whole** module run cancellable
- * in a single, predictable hop.
- *
- * Stop-button flow:
- *   1. User clicks Stop in the UI.
- *   2. `/workflow/stop/:id` sends `SIGINT` to the `akiba` subprocess.
- *   3. The subprocess's `Main.interruptHandler` runs.
- *   4. `interruptHandler` calls [cancelAll] on this registry, which
- *      cancels every in-flight monitor in O(N) where N is the number of
- *      concurrent modules (typically 1, but can be higher if the user's
- *      workflow runs modules in parallel).
- *   5. Each `workOnBinary` coroutine's `taskGlobalMonitor.cancel()`
- *      unwinds the Ghidra stack and the coroutine inside the module's
- *      `startProcess`, then the `try { ... } finally { ... }` block
- *      in `ProgramManager.workOnBinary` moves the logDir to
- *      `runtime_error/` and reports `[FILE:id] stopped` to the
- *      progress stream.
- *   6. The subprocess then exits cleanly with `exitProcess(0)`.
- *
- * Without this registry, the stop signal would only reach the
- * coroutine boundary and Ghidra analyzers would happily run to
- * completion, leaving logDirs orphaned at the temporary work location
- * (and the parent never seeing `[FILE:id] stopped`).
+ * `cancel()` must reach **both** the Ghidra `TaskMonitor` and the wrapping
+ * coroutine `Job`: a Ghidra analyzer only unwinds at its next
+ * `checkCancelled()`, so cancelling the coroutine alone would let analyzers run
+ * to completion and orphan logDirs. `Main.interruptHandler` calls [cancelAll]
+ * on SIGINT to stop every in-flight module.
  */
 object ActiveTaskMonitors {
 

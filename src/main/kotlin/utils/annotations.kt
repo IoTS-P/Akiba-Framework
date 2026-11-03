@@ -144,7 +144,7 @@ annotation class FailOnCancelled
 // ============================================================
 
 /**
- * Declare the maximum ReAct iterations for an [org.iotsplab.akiba.llm.agent.AgentModule].
+ * Declare the maximum ReAct iterations for an [org.iotsplab.akiba.llm.agent.module.AgentModule].
  *
  * The annotation is read by `AgentModule.resolveMaxIterations()` and overrides
  * the protected `maxAgentIterations()` method when present.
@@ -154,31 +154,14 @@ annotation class FailOnCancelled
 annotation class WithAgentMaxIterations(val iterations: Int = 10)
 
 /**
- * Declare skills bundled with an [org.iotsplab.akiba.llm.agent.AgentModule].
+ * Declare skills bundled with an [org.iotsplab.akiba.llm.agent.module.AgentModule].
  *
- * Each entry in [resourcePaths] is a path relative to the module's
- * distribution root (its JAR or extracted directory). The default
- * `AgentModule.startProcess` resolves the module's distribution and
- * installs every listed skill into the per-user skill namespace
- * before the agent runs its first turn. Subclasses that override
- * `startProcess` can either rely on the default install (by calling
- * `super.startProcess()`) or call
- * `AgentModule.installBundledSkill` / `AgentModule.installAnnotatedBundledSkills`
- * directly.
+ * Each [resourcePaths] entry is a path inside the module's distribution root;
+ * `AgentModule.startProcess` installs them into the per-user skill namespace
+ * before the first turn.
  *
- * Example:
- * ```kotlin
- * @WithBundledSkills(["skills/binary-vuln-audit/", "skills/orchestrator/"])
- * class MyAgent(...) : AgentModule(...) {
- *     // ...
- * }
- * ```
- *
- * @property resourcePaths paths inside the module JAR / directory
- *                         where the skill folders are stored. Each
- *                         entry must end with `/`.
- * @property username      user namespace to install the skills under.
- *                         Defaults to the global `akiba` namespace.
+ * @property resourcePaths path inside the module JAR / directory, ending in `/`.
+ * @property username      target namespace; defaults to the global `akiba`.
  */
 @Target(AnnotationTarget.CLASS)
 @Retention(AnnotationRetention.RUNTIME)
@@ -189,52 +172,13 @@ annotation class WithBundledSkills(
 
 /**
  * Declare `script_library/<file>.kts` files bundled with an
- * [org.iotsplab.akiba.llm.agent.AgentModule].
+ * [org.iotsplab.akiba.llm.agent.module.AgentModule].
  *
- * Each entry in [resourcePaths] is the path of a **single `.kts` file**
- * relative to the module's distribution root (its JAR or extracted
- * directory). The default `AgentModule.startProcess` resolves the
- * module's distribution and registers every listed script against
- * `AgentDatabaseClient.createScript` before the agent runs its first
- * turn, so child agents and other modules that later call
- * `script_library action=run scriptName=...` can find the script by
- * name. Subclasses that override `startProcess` can either rely on
- * the default install (by calling `super.startProcess()`) or call
- * `AgentModule.installBundledScript` /
- * `AgentModule.installAnnotatedBundledScripts` directly.
- *
- * For each entry the file is read, its `// @name:` /
- * `// @description:` header comments are parsed, and a single script
- * record is created. Entries that end with `/` are interpreted as
- * directory paths and are **rejected** — they are logged at WARN
- * level and skipped. The framework does not auto-discover scripts
- * from a directory; each script must be listed explicitly.
- *
- * Example:
- * ```kotlin
- * // Pass a single .kts file per entry. Entries that end in "/"
- * // are rejected; there is no directory auto-discovery.
- * @WithScriptFile([
- *     "script_library/group_functions.kts",
- *     "script_library/decompile_function.kts",
- * ])
- * class MyAgent(...) : AgentModule(...)
- * ```
- *
- * The default [author] is the module's simple class name. Scripts
- * registered with the same `(name, author)` pair overwrite prior
- * versions, so an updated JAR / directory silently refreshes the
- * stored script. To force a different author tag (e.g. to make a
- * module-shared override win over an upstream copy), override
- * [author] explicitly.
- *
- * @property resourcePaths paths to `.kts` files inside the module
- *                         JAR / directory. Each entry must NOT end
- *                         in `/`. Entries ending in `/` are logged
- *                         as warnings and skipped.
- * @property author        author tag passed to
- *                         `AgentDatabaseClient.createScript`.
- *                         Defaults to the module's simple class name.
+ * `startProcess` registers each one via `AgentDatabaseClient.createScript`;
+ * entries ending in `/` are rejected (no directory auto-discovery), and a
+ * repeated `(name, author)` pair overwrites the stored script.
+ * @property resourcePaths `.kts` file path inside the module JAR / directory.
+ * @property author        `createScript` author tag; defaults to the class name.
  */
 @Target(AnnotationTarget.CLASS)
 @Retention(AnnotationRetention.RUNTIME)

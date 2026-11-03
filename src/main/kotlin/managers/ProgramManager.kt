@@ -1,5 +1,6 @@
 package org.iotsplab.akiba.managers
 
+import com.google.errorprone.annotations.FormatString
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager
 import ghidra.app.util.importer.ProgramLoader
 import ghidra.app.util.opinion.*
@@ -13,9 +14,20 @@ import ghidra.util.exception.DuplicateFileException
 import ghidra.util.task.TaskMonitor
 import ghidra.util.task.TimeoutTaskMonitor
 import io.ktor.http.HttpStatusCode
+import java.io.BufferedInputStream
+import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.Path
+import java.security.MessageDigest
+import java.util.*
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+import kotlin.io.path.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.serialization.json.Json
+import org.apache.logging.log4j.Level
 import org.iotsplab.akiba.Main
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.ConfigManager.config
@@ -28,24 +40,12 @@ import org.iotsplab.akiba.managers.WorkspaceManager.logRootDir
 import org.iotsplab.akiba.managers.WorkspaceManager.projectName
 import org.iotsplab.akiba.module.*
 import org.iotsplab.akiba.module.AkibaModule.Companion.pascalToSnake
-import org.apache.logging.log4j.Level
 import org.iotsplab.akiba.utils.DoNotCreateTable
-import org.iotsplab.akiba.utils.WithTableColumn
 import org.iotsplab.akiba.utils.ProcedureArguments
 import org.iotsplab.akiba.utils.ProgressReporter
+import org.iotsplab.akiba.utils.WithTableColumn
 import org.iotsplab.akiba.utils.WithView
 import sun.misc.Signal
-import java.io.BufferedInputStream
-import java.io.IOException
-import java.nio.file.Files
-import java.nio.file.Path
-import java.security.MessageDigest
-import java.util.*
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
-import kotlin.io.path.*
-import com.google.errorprone.annotations.FormatString
 
 object ProgramManager {
     private val db: DatabaseClient get() = DatabaseClient.global!!
@@ -626,23 +626,12 @@ object ProgramManager {
                 "Exception occurred while running #${metadata.id}: ${e.message} (${e.javaClass.simpleName})")
             e.printStackTrace()
         } finally {
-            // Catch-all: if this binary was interrupted mid-flight (signal
-            // arrived between module launches, Ghidra save threw, etc.)
-            // and we never reached the success/failed logDir move above,
-            // promote the log directory to `runtime_error/` so the
-            // parent's skip-set logic and the user's audit trail both
-            // stay consistent. We only do this when:
-            //
-            //   1. The log directory still exists at its original
-            //      location (i.e. we did not already move it).
-            //   2. The binary was not skipped via `skipList` (those return
-            //      early and never create a logDir).
-            //   3. We are not still inside an early-bail-out path where
-            //      the dir was already handled in the `if (stopRequested)`
-            //      block above.
-            //
-            // Best-effort: any failure here is logged but does not
-            // propagate, so we can never make a bad situation worse.
+            // Catch-all: if the binary was interrupted mid-flight and its logDir
+            // was never moved above, promote it to `runtime_error/` so the
+            // parent's skip-set logic and the audit trail stay consistent. Only
+            // when the dir still exists, the binary was not skipped, and no
+            // earlier block handled it. Best-effort: failures are logged, never
+            // propagated.
             if (!finalized && logDir.exists()) {
                 val destination = if (stopRequested) {
                     runtimeErrorDir.resolve(logDir.fileName)

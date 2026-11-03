@@ -1,5 +1,6 @@
 package org.iotsplab.akiba.utils
 
+import java.util.*
 import org.apache.logging.log4j.Level
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
@@ -9,7 +10,6 @@ import org.apache.logging.log4j.core.appender.ConsoleAppender
 import org.apache.logging.log4j.core.appender.FileAppender
 import org.apache.logging.log4j.core.config.LoggerConfig
 import org.apache.logging.log4j.core.layout.PatternLayout
-import java.util.*
 
 object LoggerFactory {
     fun getLogger(name: String, appender: List<Appender>, logLevels: List<Level>): Logger {

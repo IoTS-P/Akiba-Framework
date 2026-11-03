@@ -72,6 +72,10 @@ dependencies {
     implementation("dev.langchain4j:langchain4j-mistral-ai:1.18.1")
     implementation("dev.langchain4j:langchain4j-ollama:1.18.1")
     implementation("dev.langchain4j:langchain4j-azure-open-ai:1.18.1")
+    // Declared explicitly (it is already a runtime dependency of the provider
+    // modules): the adapters build the JDK HTTP client through it so their
+    // connection pools can be shut down in close().
+    implementation("dev.langchain4j:langchain4j-http-client-jdk:1.18.1")
 
     // JWT for authentication
     implementation("io.jsonwebtoken:jjwt:0.12.6")

@@ -32,25 +32,23 @@ import io.ktor.serialization.jackson.JacksonWebsocketContentConverter
 import io.ktor.serialization.jackson.jackson
 import io.ktor.websocket.CloseReason
 import io.ktor.websocket.Frame
+import java.nio.file.Path
+import java.time.Instant
+import java.time.OffsetDateTime
+import java.time.ZoneOffset
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.managers.BinaryMetadata
 import org.iotsplab.akiba.managers.ProgramManager
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 import org.iotsplab.akiba.module.Log
-import java.nio.file.Path
-import java.time.Instant
-import java.time.OffsetDateTime
-import java.time.ZoneOffset
-import kotlin.time.Duration.Companion.seconds
 
 /**
- * Database daemon client. Each instance holds its own connection URL, auth token,
- * and locked-tables set, making it safe for concurrent multi-tenant use (e.g. in
- * the Akiba HTTP server where every request can carry a different instance/token).
- *
- * For CLI (single-task) usage a global instance is typically placed in
- * [DatabaseClient.Companion.global] and reused by all managers.
+ * Database daemon client.  Each instance holds its own URL, auth token and
+ * locked-tables set, so concurrent multi-tenant use is safe (e.g. in the Akiba
+ * HTTP server, where every request can carry a different instance/token).
+ * CLI usage reuses a single global instance from [DatabaseClient.Companion.global].
  *
  * @param host  Daemon hostname or IP (e.g. "127.0.0.1")
  * @param port  Daemon port (e.g. 31777)

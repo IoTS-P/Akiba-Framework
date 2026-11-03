@@ -1,23 +1,19 @@
 package org.iotsplab.akiba.llm.client
 
 import org.apache.logging.log4j.LogManager
+import org.iotsplab.akiba.llm.client.adapter.AnthropicAdapter
+import org.iotsplab.akiba.llm.client.adapter.AzureOpenAIAdapter
+import org.iotsplab.akiba.llm.client.adapter.GeminiAdapter
+import org.iotsplab.akiba.llm.client.adapter.MistralAdapter
+import org.iotsplab.akiba.llm.client.adapter.OllamaAdapter
+import org.iotsplab.akiba.llm.client.adapter.OpenAiFamilyAdapter
 
 /**
  * Factory that creates the appropriate [AkibaLLMClient] implementation
  * based on [LLMConfig.provider].
  *
- * Usage:
- * ```
- *   val client = LLMClientFactory.create(config)
- * ```
- *
- * To register a custom provider, call [register] before the first
- * `create` invocation:
- * ```
- *   LLMClientFactory.register(LLMProvider.OPEN_AI_COMPATIBLE) { config ->
- *       MyCustomAdapter(config)
- *   }
- * ```
+ * Built-in providers are registered up front.  To add a custom one, call
+ * [register] before the first `create` invocation.
  */
 object LLMClientFactory {
 
@@ -31,22 +27,22 @@ object LLMClientFactory {
     // ---- Built-in provider registry --------------------------------
 
     private val registry: MutableMap<LLMProvider, ClientFactory> = mutableMapOf(
-        // Native langchain4j providers
-        LLMProvider.OPEN_AI          to { config -> OpenAIAdapter(config) },
+        // Native langchain4j providers (own protocol / own model classes)
         LLMProvider.ANTHROPIC        to { config -> AnthropicAdapter(config) },
         LLMProvider.GOOGLE_GEMINI    to { config -> GeminiAdapter(config) },
         LLMProvider.MISTRAL          to { config -> MistralAdapter(config) },
         LLMProvider.OLLAMA           to { config -> OllamaAdapter(config) },
         LLMProvider.AZURE_OPEN_AI    to { config -> AzureOpenAIAdapter(config) },
 
-        // OpenAI-compatible Chinese providers (pre-configured default URLs)
-        LLMProvider.DEEP_SEEK        to { config -> DeepSeekAdapter(config) },
-        LLMProvider.MOONSHOT         to { config -> MoonshotAdapter(config) },
-        LLMProvider.ZHIPU            to { config -> ZhipuAdapter(config) },
-        LLMProvider.QWEN             to { config -> QwenAdapter(config) },
-
-        // Generic OpenAI-compatible fallback
-        LLMProvider.OPEN_AI_COMPATIBLE to { config -> OpenAICompatibleAdapter(config) }
+        // OpenAI-compatible family.  All of them share one adapter; the
+        // vendor-specific base URL and `/v1` policy live in
+        // [OpenAiFamilyDefaultsTable].
+        LLMProvider.OPEN_AI           to { config -> OpenAiFamilyAdapter(config) },
+        LLMProvider.DEEP_SEEK         to { config -> OpenAiFamilyAdapter(config) },
+        LLMProvider.MOONSHOT          to { config -> OpenAiFamilyAdapter(config) },
+        LLMProvider.ZHIPU             to { config -> OpenAiFamilyAdapter(config) },
+        LLMProvider.QWEN              to { config -> OpenAiFamilyAdapter(config) },
+        LLMProvider.OPEN_AI_COMPATIBLE to { config -> OpenAiFamilyAdapter(config) }
     )
 
     /**
@@ -62,18 +58,11 @@ object LLMClientFactory {
     /**
      * Weak set of every [AkibaLLMClient] currently alive in this JVM.
      *
-     * Motivation: `AbstractLangChainAdapter.close()` is what actually
-     * releases the underlying JDK `HttpClient` connection pool (default
-     * keep-alive 1200 s, exactly the "20-30 minute freeze" the user
-     * reported).  But `close()` is only invoked if the agent that owns
-     * the client reaches its cleanup path — and on JVM shutdown / a
-     * crash-loop restart, that path is skipped.  Without a registry,
-     * there is no way to force-close every active client at once
-     * before exit, and the lingering keep-alive connections hold the
-     * provider's per-IP connection budget hostage across restarts.
-     *
-     * Uses weak references so a leaked client doesn't prevent GC
-     * (which would itself leak connections).
+     * `close()` is what releases the JDK `HttpClient` pool (1200 s keep-alive —
+     * the "20-30 minute freeze" bug), but it is skipped on JVM shutdown or a
+     * crash-loop restart; this registry is the only way to force-close every
+     * client before exit.  Weak references keep a leaked client from blocking
+     * GC, which would itself leak connections.
      */
     private val liveClients: MutableSet<AkibaLLMClient> =
         java.util.Collections.synchronizedSet(

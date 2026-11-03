@@ -1,5 +1,7 @@
 package org.iotsplab.akiba
 
+import java.util.*
+import kotlin.system.exitProcess
 import kotlinx.coroutines.*
 import org.fusesource.jansi.AnsiConsole
 import org.iotsplab.akiba.data.database.DatabaseClient
@@ -10,8 +12,6 @@ import org.iotsplab.akiba.subcommands.*
 import picocli.CommandLine
 import picocli.CommandLine.ArgGroup
 import sun.misc.Signal
-import java.util.*
-import kotlin.system.exitProcess
 
 @CommandLine.Command(
     name = "Akiba",
@@ -163,23 +163,16 @@ class Main : Runnable {
         @JvmStatic
         fun interruptHandler() {
             globalLogger.error("Interrupted by user")
-            // 1. Tell ProgramManager to stop accepting new binaries. New
-            //    jobs launched after this flag is set will bail out
-            //    immediately (see ProgramManager.startProcess), so we
-            //    never start work that cannot finish.
+            // Step 1 — stop accepting new binaries: jobs started after this
+            // flag is set bail out in ProgramManager.startProcess, so no work
+            // begins that cannot finish.
             try {
                 ProgramManager.stopRequested = true
             } catch (_: Exception) {}
-            // 2. Cancel every in-flight module's task monitor. This is
-            //    the key step: each registered `taskGlobalMonitor` in
-            //    `ActiveTaskMonitors` wraps both a Ghidra `TaskMonitor`
-            //    and a coroutine `Job`. Calling `cancel()` propagates
-            //    to both layers, so the Ghidra analyzer stack unwinds
-            //    at its next `checkCancelled()` checkpoint and the
-            //    coroutine unwinds at its next suspension point. This
-            //    is much faster than waiting for the analyzer to
-            //    finish on its own (which can take minutes for deep
-            //    disassembly).
+            // Step 2 — cancel every in-flight module's task monitor: each one
+            // wraps a Ghidra `TaskMonitor` and a coroutine `Job`, so a single
+            // `cancel()` unwinds both at their next checkpoint instead of
+            // waiting out a deep disassembly.
             try {
                 val cancelled = org.iotsplab.akiba.utils.ActiveTaskMonitors.cancelAll()
                 globalLogger.info(
@@ -188,22 +181,16 @@ class Main : Runnable {
             } catch (e: Exception) {
                 globalLogger.warn("cancelAll() failed: ${e.message}")
             }
-            // 3. Drain in-flight coroutines. With the monitors
-            //    cancelled, Ghidra analyzers and module coroutines
-            //    unwind quickly (a few seconds), so the drain window
-            //    can be much shorter than the 60-second timeout in the
-            //    previous design. We still cap at 30 seconds so a
-            //    pathological module cannot hang the JVM indefinitely.
+            // Step 3 — drain in-flight coroutines (they unwind within seconds
+            // once the monitors are cancelled), capped at 30 s so a
+            // pathological module cannot hang the JVM.
             try {
                 ProgramManager.drainGracefully(timeoutMs = 30_000L)
             } catch (e: Exception) {
                 globalLogger.warn("Drain failed: ${e.message}")
             }
-            // 4. Now safe to flush the DB connection, close the Ghidra
-            //    project, and exit. `finally()` is unchanged from before;
-            //    it just runs *after* the in-flight binaries have
-            //    completed their cleanup, so the saved counts and log
-            //    directory layout match the actual on-disk state.
+            // Step 4 — flush the DB and close the Ghidra project after the
+            // in-flight work has cleaned up, so saved counts match disk.
             try {
                 finally()
             } catch (_: Exception) {}

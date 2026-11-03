@@ -6,42 +6,41 @@ import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import org.apache.logging.log4j.LogManager
-import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.data.database.AgentDatabaseClient.SessionInfo
-import org.iotsplab.akiba.data.database.DatabaseClient
-import org.iotsplab.akiba.llm.agent.AgentMailboxService
-import org.iotsplab.akiba.llm.tool.ConfirmationManager
-import org.iotsplab.akiba.llm.tool.UserChoiceManager
-import org.iotsplab.akiba.llm.agent.AgentPrompts
-import org.iotsplab.akiba.llm.agent.ModelContextLengthService
-import org.iotsplab.akiba.llm.agent.akibaAgent
-import org.iotsplab.akiba.llm.client.LLMConfig
-import org.iotsplab.akiba.llm.client.LLMProvider
-import org.iotsplab.akiba.llm.config.LLMKeyFileStore
-import org.iotsplab.akiba.llm.memory.persistentChatMemory
-import org.iotsplab.akiba.llm.agent.AgentModule
-import org.iotsplab.akiba.llm.agent.SYSTEM_SESSION_UUID
-import org.iotsplab.akiba.llm.agent.LLM_RETRY_STATUS_PREFIX
-import org.iotsplab.akiba.llm.agent.LLM_PROGRESS_PREFIX
-import org.iotsplab.akiba.llm.tool.BuiltInTools
-import org.iotsplab.akiba.llm.tool.ListModulesTool
-import org.iotsplab.akiba.llm.tool.QueryGhidraAPITool
-import org.iotsplab.akiba.llm.tool.QuerySessionHistoryTool
-import org.iotsplab.akiba.llm.tool.QueryMemoriesTool
-import org.iotsplab.akiba.llm.tool.Tool
-import org.iotsplab.akiba.llm.tool.RunScriptTool
-import org.iotsplab.akiba.managers.ConfigManager
-import org.iotsplab.akiba.managers.WorkspaceManager
-import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.apache.logging.log4j.LogManager
+import org.iotsplab.akiba.data.database.AgentDatabaseClient
+import org.iotsplab.akiba.data.database.AgentDatabaseClient.SessionInfo
+import org.iotsplab.akiba.data.database.DatabaseClient
+import org.iotsplab.akiba.llm.agent.context.ContextLengthObserver
+import org.iotsplab.akiba.llm.agent.context.ModelContextLengthService
+import org.iotsplab.akiba.llm.agent.core.AgentPrompts
+import org.iotsplab.akiba.llm.agent.core.LLM_PROGRESS_PREFIX
+import org.iotsplab.akiba.llm.agent.core.LLM_RETRY_STATUS_PREFIX
+import org.iotsplab.akiba.llm.agent.core.SYSTEM_SESSION_UUID
+import org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxService
+import org.iotsplab.akiba.llm.agent.module.AgentModule
+import org.iotsplab.akiba.llm.agent.module.tool
+import org.iotsplab.akiba.llm.agent.runtime.AgentRuntime
+import org.iotsplab.akiba.llm.agent.runtime.RuntimeState
+import org.iotsplab.akiba.llm.agent.stream.StreamChunkBus
+import org.iotsplab.akiba.llm.client.LLMProvider
+import org.iotsplab.akiba.llm.config.LLMKeyFileStore
+import org.iotsplab.akiba.llm.tool.core.BuiltInTools
+import org.iotsplab.akiba.llm.tool.core.ConfirmationManager
+import org.iotsplab.akiba.llm.tool.core.Tool
+import org.iotsplab.akiba.llm.tool.ui.PendingChoiceSnapshot
+import org.iotsplab.akiba.llm.tool.ui.UserChoiceEvent
+import org.iotsplab.akiba.llm.tool.ui.UserChoiceManager
+import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.managers.WorkspaceManager
+import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 
 // ============================================================
 //  Request / Response DTOs
@@ -105,10 +104,9 @@ data class AgentSessionResponse(
     /**
      * Pending human-confirmation request for this session, if any.
      *
-     * Populated from [ConfirmationManager] when a tool (e.g. `run_shell`)
-     * is blocked waiting for the user to approve/deny an action. The
-     * frontend detects this via the existing session status poll and
-     * shows a confirmation modal. `null` when no confirmation is pending.
+     * Set by [ConfirmationManager] when a tool (e.g. `run_shell`) is blocked
+     * waiting for the user to approve/deny an action; the frontend surfaces it
+     * as a modal from the session status poll. `null` when nothing is pending.
      */
     val pendingConfirmation: PendingConfirmationDto? = null,
     /**
@@ -196,7 +194,7 @@ data class UserChoiceBtwRequest(
 )
 
 /** Map a manager snapshot to its wire DTO. */
-private fun org.iotsplab.akiba.llm.tool.PendingChoiceSnapshot.toDto() = PendingUserChoiceDto(
+private fun org.iotsplab.akiba.llm.tool.ui.PendingChoiceSnapshot.toDto() = PendingUserChoiceDto(
     requestId = choice.requestId,
     question = choice.question,
     options = choice.options,
@@ -265,7 +263,7 @@ data class ManualAgentStartResponse(
  * Payload sent by a worker (or the in-process runtime) to
  * `POST /agent/internal/stream-chunk` for every live LLM streaming
  * chunk.  The server fans it out to every SSE subscriber via
- * [org.iotsplab.akiba.llm.agent.StreamChunkBus].
+ * [org.iotsplab.akiba.llm.agent.stream.StreamChunkBus].
  */
 data class StreamChunkRequest(
     val sessionId: String,
@@ -326,7 +324,7 @@ private object ManualAgentProcessRegistry {
         // End the live stream generation: the killed worker will never
         // publish its own terminal chunk, so without this the frontend
         // streaming bubble stalls on "waiting for model…" forever.
-        org.iotsplab.akiba.llm.agent.StreamChunkBus.finish(sessionId, USER_CANCELLED_STREAM_ERROR)
+        org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.finish(sessionId, USER_CANCELLED_STREAM_ERROR)
         return true
     }
 
@@ -455,23 +453,16 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
 
     // ------ Internal: force-close all live LLM clients -----------------------
     //
-    // Motivation: each AkibaAgent holds an LLM client wrapping a JDK
-    // `java.net.http.HttpClient` whose connection pool keep-alive defaults
-    // to **1200 seconds**.  When many sessions accumulate, the per-IP
-    // connection budget at the LLM provider is exhausted, and the provider
-    // starts deliberately slowing responses — which looks like a 20-30
-    // minute "hang" on the frontend.
+    // Each AkibaAgent's LLM client keeps a `java.net.http.HttpClient`
+    // connection pool alive for **1200 seconds**; when sessions accumulate,
+    // the provider's per-IP connection budget is exhausted and it deliberately
+    // slows responses, which the frontend sees as a 20-30 minute "hang".
+    // `LLMClientFactory`'s shutdown hook only closes them on graceful
+    // shutdown, so this endpoint lets an operator release the slots before a
+    // rolling restart.
     //
-    // The JVM shutdown hook in `LLMClientFactory` already calls
-    // `closeAllLiveClients("JVM shutdown hook")`, but that only fires on
-    // graceful shutdown.  This endpoint lets an operator / orchestrator
-    // force-close every live LLM connection **before** a rolling restart,
-    // releasing the provider's connection slots immediately.
-    //
-    // Security: this is an *internal* endpoint (under `/agent/internal/`),
-    // but it's still bound to the public HTTP listener.  We therefore
-    // require the same instance header as every other agent route to
-    // prevent unauthenticated internet-facing invocation.
+    // It is *internal* (`/agent/internal/`) but still bound to the public
+    // listener, so it requires the same instance header as every agent route.
     post("/agent/internal/llm/close-all") {
         val instance = call.requireInstanceHeader() ?: return@post
         if (instance.isBlank()) {
@@ -491,18 +482,12 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
 
     // ------ Internal: receive a live LLM streaming chunk from a worker ----
     //
-    // Called by manual-agent worker JVMs (and the in-process runtime)
-    // on every streaming chunk from the LLM.  The server records the
-    // chunk in [StreamChunkBus]'s per-session history, which the
-    // frontend drains via `GET /agent/sessions/{id}/stream-chunks`,
-    // giving the user a true per-token live view of the response
-    // being generated.  No DB write — the worker writes the final
-    // assistant message itself once the stream completes.
-    //
-    // Security: this endpoint is exposed on the public listener, but
-    // requires the same instance header as every other agent route.
-    // The payload is bounded (a few hundred bytes per chunk) so a
-    // malicious caller can't easily DoS the bus.
+    // Callers (manual-agent worker JVMs and the in-process runtime) POST every
+    // chunk, which is kept in [StreamChunkBus]'s per-session history and
+    // drained by `GET /agent/sessions/{id}/stream-chunks` for a per-token live
+    // view.  No DB write happens here — the worker persists the final message.
+    // The endpoint is on the public listener but requires the instance header,
+    // and chunks are small so the bus is not easily flooded.
     post("/agent/internal/stream-chunk") {
         val instance = call.requireInstanceHeader() ?: return@post
         if (instance.isBlank()) {
@@ -519,8 +504,8 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to "sessionId is required"))
             return@post
         }
-        org.iotsplab.akiba.llm.agent.StreamChunkBus.publish(
-            org.iotsplab.akiba.llm.agent.StreamChunkBus.Chunk(
+        org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.publish(
+            org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.Chunk(
                 sessionId = req.sessionId,
                 delta = req.delta,
                 chunkCount = req.chunkCount,
@@ -563,7 +548,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             return@get
         }
         val since = call.request.queryParameters["since"]?.toIntOrNull()?.coerceAtLeast(0) ?: 0
-        val snap = org.iotsplab.akiba.llm.agent.StreamChunkBus.historySince(sessionId, since)
+        val snap = org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.historySince(sessionId, since)
         if (snap == null) {
             call.respond(mapOf(
                 "active" to false,
@@ -651,14 +636,14 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             UserChoiceManager.completeBtw(req.sessionId, req.btwId, req.btwAnswer)
         }
         when (val ev = UserChoiceManager.awaitEvent(entry)) {
-            is org.iotsplab.akiba.llm.tool.UserChoiceEvent.Resolved ->
+            is org.iotsplab.akiba.llm.tool.ui.UserChoiceEvent.Resolved ->
                 call.respond(mapOf(
                     "status" to if (ev.answer != null) "answered" else "cancelled",
                     "choice" to ev.answer
                 ))
-            org.iotsplab.akiba.llm.tool.UserChoiceEvent.TimedOut ->
+            org.iotsplab.akiba.llm.tool.ui.UserChoiceEvent.TimedOut ->
                 call.respond(mapOf("status" to "timeout", "choice" to null))
-            is org.iotsplab.akiba.llm.tool.UserChoiceEvent.Btw ->
+            is org.iotsplab.akiba.llm.tool.ui.UserChoiceEvent.Btw ->
                 call.respond(mapOf(
                     "status" to "btw",
                     "btwId" to ev.exchange.btwId,
@@ -854,13 +839,12 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             val info = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
 
-                // Determine the project name and whether to create a new project.
+                // Determine the project name and whether to create a project.
                 //
-                // Path A: binaryId is provided → legacy flow: import binary
-                //         into a (possibly new) project on first chat turn.
-                // Path B: projectName + programName provided (no binaryId) →
-                //         open an existing project and use the specified
-                //         program directly.  No binary import needed.
+                // Path A: binaryId is provided → legacy flow, import the binary
+                //         into a (possibly new) project on the first chat turn.
+                // Path B: projectName + programName (no binaryId) → open an
+                //         existing project and use that program; no import.
                 val resolvedProjectName: String?
                 val createNewProject: Boolean
 
@@ -900,7 +884,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 runCatching {
                     agentDbClient.setRuntimeState(
                         sessionId,
-                        org.iotsplab.akiba.llm.agent.RuntimeState.CLOSED.wire(),
+                        org.iotsplab.akiba.llm.agent.runtime.RuntimeState.CLOSED.wire(),
                         "session_created_idle",
                     )
                 }
@@ -983,7 +967,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     val provider = LLMProvider.fromString(entry.provider)
                     if (provider != null) {
                         ModelContextLengthService.getContextLength(provider, modelName)
-                            ?: org.iotsplab.akiba.llm.agent.ContextLengthObserver
+                            ?: org.iotsplab.akiba.llm.agent.context.ContextLengthObserver
                                 .bound(provider, modelName)
                                 ?.also { contextLengthObserved = true }
                     } else null
@@ -1018,7 +1002,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
     // right-side conversation panel.
     //
     // The summary derivation lives in
-    // [org.iotsplab.akiba.llm.agent.AgentMailboxService.listConversations]
+    // [org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxService.listConversations]
     // so the LLM `query_conversations` tool and this HTTP route
     // always return the same data.
     get("/agent/sessions/{id}/conversations") {
@@ -1074,7 +1058,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
     // user expands a conversation in the side panel.
     //
     // The chain-walking / participation filter lives in
-    // [org.iotsplab.akiba.llm.agent.AgentMailboxService.getConversationMessages]
+    // [org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxService.getConversationMessages]
     // so the LLM `query_conversation` tool and this HTTP route
     // always return the same data.
     get("/agent/sessions/{id}/conversations/{convId}") {
@@ -1178,7 +1162,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 agentDbClient.updateSession(id, status = "running")
                 agentDbClient.setRuntimeState(
                     id,
-                    org.iotsplab.akiba.llm.agent.RuntimeState.RUNNING.wire(),
+                    org.iotsplab.akiba.llm.agent.runtime.RuntimeState.RUNNING.wire(),
                     "manual_chat_start"
                 )
                 info
@@ -1236,7 +1220,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     runCatching {
                         agentDbClient.setRuntimeState(
                             id,
-                            org.iotsplab.akiba.llm.agent.RuntimeState.CLOSED.wire(),
+                            org.iotsplab.akiba.llm.agent.runtime.RuntimeState.CLOSED.wire(),
                             "manual_chat_done",
                         )
                     }
@@ -1289,12 +1273,10 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
 
     // ------ Inject a user hint into a running/standby/closed/error session --
     //
-    // Unlike /chat (which starts a synchronous manual agent turn),
-    // /inject sends an asynchronous mailbox message to the session.
-    // For RUNNING agents, the message is picked up by
-    // applyMailboxDrain in the next beforeIteration.  For STANDBY
-    // agents, the AgentMailboxDispatcher wakes them up.  For
-    // CLOSED/ERROR agents, the runtime restarts the session.
+    // Unlike /chat (a synchronous manual turn), /inject posts an asynchronous
+    // mailbox message: RUNNING sessions pick it up in applyMailboxDrain at the
+    // next beforeIteration, STANDBY ones are woken by AgentMailboxDispatcher,
+    // and CLOSED/ERROR ones make the runtime restart the session.
     post("/agent/sessions/{id}/inject") {
         val instance = call.requireInstanceHeader() ?: return@post
         val id = call.parameters["id"].orEmpty()
@@ -1327,7 +1309,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             // Send the mailbox message.
             withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
-                val mailboxService = org.iotsplab.akiba.llm.agent.AgentMailboxService(agentDbClient)
+                val mailboxService = org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxService(agentDbClient)
                 mailboxService.send(
                     senderSessionId = "system",
                     recipientSessionId = id,
@@ -1352,7 +1334,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 try {
                     withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                         val agentDbClient = AgentDatabaseClient(dbClient)
-                        val runtime = org.iotsplab.akiba.llm.agent.AgentRuntime.forBinary(binaryId, agentDbClient)
+                        val runtime = org.iotsplab.akiba.llm.agent.runtime.AgentRuntime.forBinary(binaryId, agentDbClient)
                         if (runtime.canResume(id)) {
                             runtime.resumeForUserInjection(id) != null
                         } else {
@@ -1390,10 +1372,9 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
 
     // ------ Pause / Resume a session -----------------------------------------
     //
-    // The user can pause a running agent to temporarily halt its LLM
-    // loop.  The agent finishes the current iteration, then blocks
-    // before the next LLM call.  Other agents can still send messages
-    // (they accumulate in the mailbox).  Resume un-blocks the loop.
+    // Pausing halts the LLM loop: the agent finishes the current iteration,
+    // then blocks before the next LLM call, while messages from other agents
+    // keep accumulating in the mailbox.  Resume un-blocks the loop.
 
     post("/agent/sessions/{id}/pause") {
         val instance = call.requireInstanceHeader() ?: return@post
@@ -1414,7 +1395,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
 
             val paused = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
-                val runtime = org.iotsplab.akiba.llm.agent.AgentRuntime.forBinary(binaryId, agentDbClient)
+                val runtime = org.iotsplab.akiba.llm.agent.runtime.AgentRuntime.forBinary(binaryId, agentDbClient)
                 runtime.pause(id)
             }
 
@@ -1450,7 +1431,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
 
             val resumed = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
-                val runtime = org.iotsplab.akiba.llm.agent.AgentRuntime.forBinary(binaryId, agentDbClient)
+                val runtime = org.iotsplab.akiba.llm.agent.runtime.AgentRuntime.forBinary(binaryId, agentDbClient)
                 runtime.resume(id)
             }
 
@@ -1492,7 +1473,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
 
             val applied = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
-                val runtime = org.iotsplab.akiba.llm.agent.AgentRuntime.forBinary(binaryId, agentDbClient)
+                val runtime = org.iotsplab.akiba.llm.agent.runtime.AgentRuntime.forBinary(binaryId, agentDbClient)
                 runtime.retryNow(id)
             }
 
@@ -1542,7 +1523,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                         runCatching {
                             agentDbClient.setRuntimeState(
                                 id,
-                                org.iotsplab.akiba.llm.agent.RuntimeState.CLOSED.wire(),
+                                org.iotsplab.akiba.llm.agent.runtime.RuntimeState.CLOSED.wire(),
                                 "user_cancelled_chat"
                             )
                         }
@@ -1774,13 +1755,10 @@ private data class ExportTreeNode(
 )
 
 /**
- * Build a Markdown document that contains:
- *   1. A header with overall export metadata.
- *   2. An "Agent Tree" section with:
- *        - per-layer statistics (token usage, tool calls)
- *        - a textual ASCII tree diagram
- *   3. A peer section per agent in DFS pre-order, each containing the
- *      session's own statistics and its full transcript.
+ * Build the Markdown export of an agent hierarchy: a metadata header, an
+ * "Agent Tree" section with per-layer statistics (tokens, tool calls) and an
+ * ASCII tree, then one section per agent in DFS pre-order holding that
+ * session's statistics and full transcript.
  *
  * Cycles are detected via a `seen` set and silently skipped so a malformed
  * hierarchy cannot crash the export.
@@ -2128,7 +2106,7 @@ private fun markManualChatFailed(
                 agentDbClient.updateSession(sessionId, status = "error")
                 agentDbClient.setRuntimeState(
                     sessionId,
-                    org.iotsplab.akiba.llm.agent.RuntimeState.ERROR.wire(),
+                    org.iotsplab.akiba.llm.agent.runtime.RuntimeState.ERROR.wire(),
                     reason?.take(200) ?: "manual_chat_failed",
                 )
             }
