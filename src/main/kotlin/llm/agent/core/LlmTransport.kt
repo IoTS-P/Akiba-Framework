@@ -3,7 +3,6 @@ package org.iotsplab.akiba.llm.agent.core
 import kotlinx.coroutines.delay
 import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.llm.agent.context.ContextLengthObserver
 import org.iotsplab.akiba.llm.agent.context.ContextOverflowDetector
 import org.iotsplab.akiba.llm.agent.stream.StreamingChunkPusher
 import org.iotsplab.akiba.llm.client.AkibaLLMClient
@@ -96,7 +95,6 @@ class LlmTransport(
                 try {
                     val result = invokeChat(progress)
                     progress.finish(succeeded = true)
-                    recordObservedPromptTokens(result)
                     if (retriesUsed > 0) {
                         logger.info("LLM call recovered on attempt $attempt/${maxRetries + 1}")
                         writeRetryStatus("retry=$retriesUsed status=recovered")
@@ -146,13 +144,6 @@ class LlmTransport(
                     // ---- Context-overflow emergency compaction ----
                     if (ContextOverflowDetector.isContextOverflow(e)) {
                         consecutiveOverflows++
-                        // Learn the exact window when the provider names it —
-                        // far more precise than any heuristic.
-                        ContextOverflowDetector.extractProviderLimit(e)?.let { limit ->
-                            ContextLengthObserver.recordProviderLimit(
-                                client.config.provider, client.config.modelName, limit
-                            )
-                        }
                         if (consecutiveOverflows >= CONTEXT_OVERFLOW_COMPACT_THRESHOLD) {
                             val tokensBefore =
                                 memory.messages().sumOf { client.estimateTokenCount(it.content) }
@@ -469,21 +460,6 @@ class LlmTransport(
             )
         }
         return null
-    }
-
-    /**
-     * Raise the model's empirically proven context-window lower bound from a
-     * successful call's prompt size (provider usage, else local estimate).
-     */
-    private fun recordObservedPromptTokens(completion: ChatCompletion) {
-        try {
-            val promptTokens = completion.tokenUsage?.inputTokenCount
-                ?: (contextMessagesProvider?.invoke() ?: memory.messages())
-                    .sumOf { client.estimateTokenCount(it.content) }
-            ContextLengthObserver.recordSuccess(
-                client.config.provider, client.config.modelName, promptTokens
-            )
-        } catch (_: Exception) { /* best-effort observation */ }
     }
 
     /**

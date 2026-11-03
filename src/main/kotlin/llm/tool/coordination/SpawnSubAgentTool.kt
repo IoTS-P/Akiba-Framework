@@ -3,7 +3,7 @@ package org.iotsplab.akiba.llm.tool.coordination
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.llm.agent.context.ModelContextLengthService
+import org.iotsplab.akiba.llm.agent.context.ModelContextWindows
 import org.iotsplab.akiba.llm.agent.core.AgentTranscriptWriter
 import org.iotsplab.akiba.llm.agent.core.AkibaAgent
 import org.iotsplab.akiba.llm.agent.core.ReActStrategy
@@ -567,9 +567,7 @@ private fun spawnFreeform(
                     enrichSystemPromptWithMemory = true,
                     auditToolCalls = true,
                     strategy = ReActStrategy(),
-                    contextLength = ModelContextLengthService.getContextLength(
-                        client.config.provider, client.config.modelName,
-                    ),
+                    contextLength = ModelContextWindows.contextLength(client.config.modelName),
                     lifecycle = Lifecycle.ONE_SHOT,
                     runtimeHandle = handle,
                 )

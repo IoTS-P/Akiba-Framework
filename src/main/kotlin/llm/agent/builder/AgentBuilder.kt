@@ -1,7 +1,7 @@
 package org.iotsplab.akiba.llm.agent.builder
 
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.llm.agent.context.ModelContextLengthService
+import org.iotsplab.akiba.llm.agent.context.ModelContextWindows
 import org.iotsplab.akiba.llm.agent.core.AgentHarness
 import org.iotsplab.akiba.llm.agent.core.AgentStrategy
 import org.iotsplab.akiba.llm.agent.core.AgentTranscriptWriter
@@ -334,7 +334,6 @@ class AgentBuilder {
     private var compactOnStandbyValue: Boolean = true
     private var compactThresholdValue: Double = 0.75
     private var compactKeepRoundsValue: Int = 2
-    private var errorRecoverySafetyFactorValue: Double = 0.85
     private var terminationHookOverride: (suspend AkibaAgent.() -> Unit)? = null
 
     /** Set the [Lifecycle] the agent runs with. Default [Lifecycle.ONE_SHOT]. */
@@ -375,11 +374,6 @@ class AgentBuilder {
     /** Number of recent rounds to retain during compaction. */
     fun compactKeepRounds(value: Int) {
         compactKeepRoundsValue = value
-    }
-
-    /** Safety factor applied when adjusting the effective context cap after a recovery. */
-    fun errorRecoverySafetyFactor(value: Double) {
-        errorRecoverySafetyFactorValue = value
     }
 
     // ---- Termination -----------------------------------------------------
@@ -428,10 +422,7 @@ class AgentBuilder {
         val resolvedMemoryManager = memoryManager
             ?: sessionId?.let { agentDbClient?.let { adc -> MemoryManager(adc, it, binaryId) } }
 
-        val contextLength = ModelContextLengthService.getContextLength(
-            resolvedClient.config.provider,
-            resolvedClient.config.modelName
-        )
+        val contextLength = ModelContextWindows.contextLength(resolvedClient.config.modelName)
 
         val agent = AkibaAgent(
             client = resolvedClient,
@@ -453,7 +444,6 @@ class AgentBuilder {
             compactOnStandby = compactOnStandbyValue,
             compactThreshold = compactThresholdValue,
             compactKeepRounds = compactKeepRoundsValue,
-            errorRecoverySafetyFactor = errorRecoverySafetyFactorValue,
             lifecycle = lifecycleValue,
             mailboxService = mailboxServiceValue,
             logger = loggerValue ?: org.apache.logging.log4j.LogManager.getLogger(AkibaAgent::class.java),

@@ -234,8 +234,8 @@ const val CONTEXT_OVERFLOW_COMPACT_THRESHOLD: Int = 2
 /**
  * Failed overflow-compaction attempts after which the current call aborts
  * early instead of spending the rest of its retry budget on a request the
- * provider will never accept — the escape hatch for models unknown to
- * `ModelContextLengthService` whose context simply cannot be shrunk enough.
+ * provider will never accept — the escape hatch for a context that simply
+ * cannot be shrunk enough.
  * Referenced by `AgentStrategy.kt`.
  */
 const val MAX_FAILED_OVERFLOW_COMPACTIONS: Int = 3

@@ -99,9 +99,9 @@ class StrategyContext(
     /**
      * Optional hook invoked when the provider rejects the request with a
      * context-length overflow [CONTEXT_OVERFLOW_COMPACT_THRESHOLD] times in a
-     * row (see [ContextOverflowDetector]) — the escape hatch for models whose
-     * window is unknown to `ModelContextLengthService`, where every retry would
-     * otherwise resend a request the provider can never accept.
+     * row (see [ContextOverflowDetector]) — the escape hatch for a context
+     * that cannot be shrunk enough, where every retry would otherwise resend a
+     * request the provider can never accept.
      *
      * Implementations should compact memory — ideally with a fallback that
      * shrinks the context WITHOUT an LLM call, since the summarising call may

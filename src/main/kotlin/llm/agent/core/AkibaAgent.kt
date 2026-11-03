@@ -6,7 +6,7 @@ import kotlinx.coroutines.withContext
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.llm.agent.context.ContextLengthObserver
+import org.iotsplab.akiba.llm.agent.context.ModelContextWindows
 import org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxService
 import org.iotsplab.akiba.llm.agent.mailbox.ScratchpadRegistry
 import org.iotsplab.akiba.llm.agent.mailbox.withScratchpadRegistry
@@ -138,9 +138,8 @@ class AkibaAgent(
      *  written to a readable file at `<logDir>/agent_transcript.md`. */
     val transcript: AgentTranscriptWriter? = null,
 
-    /** Maximum context length (in tokens) for the current model.
-     *  When null, context compression is disabled. */
-    val contextLength: Int? = null,
+    /** Context window of the current model, in tokens, from [ModelContextWindows]. */
+    val contextLength: Int = ModelContextWindows.DEFAULT_CONTEXT_WINDOW,
 
     /** Whether to automatically compact conversation history before each run. */
     val autoCompact: Boolean = true,
@@ -160,15 +159,6 @@ class AkibaAgent(
 
     /** Number of recent user-assistant rounds to retain during compaction. */
     val compactKeepRounds: Int = 2,
-
-    /**
-     * Safety factor applied to the observed context-window lower bound
-     * ([ContextLengthObserver]) when deriving the compaction cap/target
-     * for models with an unknown context window. The margin
-     * `1 - errorRecoverySafetyFactor` covers output tokens and estimation
-     * error against the largest prompt the provider has actually accepted.
-     */
-    val errorRecoverySafetyFactor: Double = 0.85,
 
     /** Agent database client for audit logging and session management.
      *  Null means audits are silently skipped. */
@@ -678,49 +668,24 @@ class AkibaAgent(
         memory.messages().sumOf { client.estimateTokenCount(it.content) }
 
     /**
-     * The observed-proven safe size for this model, or null when nothing
-     * has been observed yet. Two information sources are combined:
-     *  - [ContextLengthObserver.bound]: largest accepted prompt ×
-     *    [errorRecoverySafetyFactor] (empirical lower bound).
-     *  - [ContextLengthObserver.providerLimit]: the exact window the
-     *    provider named in an overflow error, minus the requested output
-     *    reservation and a margin — providers count prompt +
-     *    max_output_tokens against the window, so a prompt at the raw
-     *    limit is still rejected.
-     *
-     * Used ONLY as the compaction TARGET after a suspected overflow —
-     * never as a pre-emptive cap: capping at the bound would lock
-     * exploration (context never grows past it → no larger prompt is
-     * ever attempted → the bound can never rise), and a 1M-window model
-     * would get stuck at whatever size was observed first.
+     * Token budget the overflow recovery aims for: the compaction threshold
+     * minus the output reservation, since providers count prompt + max output
+     * tokens against one window.
      */
-    private fun observedCap(): Int? {
-        val lower = ContextLengthObserver.bound(client.config.provider, client.config.modelName)
-            ?.let { (it * errorRecoverySafetyFactor).toInt().coerceAtLeast(1) }
-        val exact = ContextLengthObserver.providerLimit(client.config.provider, client.config.modelName)
-            ?.let { limit ->
-                (limit - (client.config.maxTokens ?: 8192) - 2048).coerceAtLeast(1)
-            }
-        return when {
-            lower != null && exact != null -> minOf(lower, exact)
-            else -> lower ?: exact
-        }
+    private fun overflowTarget(): Int {
+        val reserve = (client.config.maxTokens ?: 0).coerceAtLeast(0)
+        return ((contextLength * compactThreshold).toInt() - reserve)
+            .coerceAtLeast(contextLength / 10)
     }
 
     /**
      * Compact the conversation history if the estimated token count exceeds
-     * the effective cap (`contextLength * compactThreshold`).
-     *
-     * Disabled when the model's window is unknown — pre-emptive compaction
-     * at the observed bound would freeze exploration (see [observedCap]).
-     * Unknown models instead rely on the reactive path: grow freely until
-     * the provider rejects, then compact down to the proven-safe size.
+     * `contextLength * compactThreshold`.
      *
      * @return true if compaction was performed.
      */
     fun maybeCompact(): Boolean {
-        val limit = contextLength ?: return false
-        val maxTokens = (limit * compactThreshold).toInt()
+        val maxTokens = (contextLength * compactThreshold).toInt()
         val currentTokens = currentContextTokens()
         if (currentTokens <= maxTokens) return false
         return compact()
@@ -826,16 +791,13 @@ class AkibaAgent(
      * prunes the rounds it summarises, so oversized results in kept rounds survive
      * every compaction), then [compact] (its own summary call may fail on an
      * over-length context, which must not abort the LLM-free stages), then
-     * [dropOldestRound] down to the observed [observedCap].
+     * [dropOldestRound] down to [overflowTarget].
      *
      * The fourth stage is the minimum-shed guarantee: whenever the earlier stages
-     * saved less than [OVERFLOW_DROP_MIN_TOKENS] (unknown bound, or a token estimate
-     * that disagrees with the provider), rounds totalling the shortfall are dropped
-     * via [dropOldestRoundsForTokens], and when none remain
+     * saved less than [OVERFLOW_DROP_MIN_TOKENS] (a token estimate that disagrees
+     * with the provider), rounds totalling the shortfall are dropped via
+     * [dropOldestRoundsForTokens], and when none remain
      * [truncateOversizedMessages] shrinks the survivors.
-     *
-     * The observed bound is never lowered here — failures may be transient, so the
-     * cap stays dynamic.
      *
      * @return true if the context was actually reduced.
      */
@@ -855,16 +817,14 @@ class AkibaAgent(
             reduced
         }
 
-        val target = observedCap()
-        if (target != null) {
-            var guard = 0
-            while (currentContextTokens() > target && guard++ < 50) {
-                if (!dropOldestRound()) break
-                reduced = true
-            }
-            if (currentContextTokens() > target && truncateOversizedMessages(target)) {
-                reduced = true
-            }
+        val target = overflowTarget()
+        var guard = 0
+        while (currentContextTokens() > target && guard++ < 50) {
+            if (!dropOldestRound()) break
+            reduced = true
+        }
+        if (currentContextTokens() > target && truncateOversizedMessages(target)) {
+            reduced = true
         }
 
         // Guaranteed minimum shed: if the stages above saved less than

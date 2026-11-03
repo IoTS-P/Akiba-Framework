@@ -18,8 +18,7 @@ import org.apache.logging.log4j.LogManager
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.data.database.AgentDatabaseClient.SessionInfo
 import org.iotsplab.akiba.data.database.DatabaseClient
-import org.iotsplab.akiba.llm.agent.context.ContextLengthObserver
-import org.iotsplab.akiba.llm.agent.context.ModelContextLengthService
+import org.iotsplab.akiba.llm.agent.context.ModelContextWindows
 import org.iotsplab.akiba.llm.agent.core.AgentPrompts
 import org.iotsplab.akiba.llm.agent.core.LLM_PROGRESS_PREFIX
 import org.iotsplab.akiba.llm.agent.core.LLM_RETRY_STATUS_PREFIX
@@ -30,7 +29,6 @@ import org.iotsplab.akiba.llm.agent.module.tool
 import org.iotsplab.akiba.llm.agent.runtime.AgentRuntime
 import org.iotsplab.akiba.llm.agent.runtime.RuntimeState
 import org.iotsplab.akiba.llm.agent.stream.StreamChunkBus
-import org.iotsplab.akiba.llm.client.LLMProvider
 import org.iotsplab.akiba.llm.config.LLMKeyFileStore
 import org.iotsplab.akiba.llm.tool.core.BuiltInTools
 import org.iotsplab.akiba.llm.tool.core.ConfirmationManager
@@ -955,31 +953,15 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             }
             // Find the last input token count (from the most recent LLM call)
             val lastInputTokens = filtered.lastOrNull { it.role == "assistant" }?.inputTokenCount
-            // Resolve context length for this session's model. Registry
-            // lookup first; for unknown models fall back to the observed
-            // lower bound (ContextLengthObserver) — flagged so the
-            // frontend can render it as an estimate.
-            var contextLengthObserved = false
-            val contextLength = sessionInfo.modelName?.let { modelName ->
-                LLMKeyFileStore.load().firstOrNull { entry ->
-                    entry.modelNames.any { it.equals(modelName, ignoreCase = true) }
-                }?.let { entry ->
-                    val provider = LLMProvider.fromString(entry.provider)
-                    if (provider != null) {
-                        ModelContextLengthService.getContextLength(provider, modelName)
-                            ?: org.iotsplab.akiba.llm.agent.context.ContextLengthObserver
-                                .bound(provider, modelName)
-                                ?.also { contextLengthObserved = true }
-                    } else null
-                }
-            }
+            // Static table lookup; unknown models report the 128K default.
+            val contextLength = sessionInfo.modelName
+                ?.let { ModelContextWindows.contextLength(it) }
             call.respond(mapOf(
                 "messages" to filtered.map { it.toMessageResponse() },
                 "totalInputTokens" to totalInput,
                 "totalOutputTokens" to totalOutput,
                 "lastInputTokens" to lastInputTokens,
-                "contextLength" to contextLength,
-                "contextLengthObserved" to contextLengthObserved
+                "contextLength" to contextLength
             ))
         } catch (e: DatabaseClient.DatabaseDaemonException) {
             if (e.statusCode == HttpStatusCode.NotFound) {
