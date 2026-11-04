@@ -369,10 +369,12 @@ object WorkspaceManager: Closeable {
     }
 
     fun initGhidraProjectDir(): Boolean {
-        // Create directory to save ghidra project
+        // Create directory to save ghidra project. `createDirectories` (not
+        // `createDirectory`): a chat session created without a binary has no
+        // pre-made <projectRoot>/<user> tree, so the parent must be created too.
         if (!Files.exists(Path.of(projectConf.projectRoot))) {
             try {
-                Files.createDirectory(Path.of(projectConf.projectRoot))
+                Files.createDirectories(Path.of(projectConf.projectRoot))
             } catch (_: IOException) {
                 globalLogger.error("Failed to create ghidra project directory")
                 return false

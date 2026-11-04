@@ -369,8 +369,9 @@ object ProgramManager {
                             globalLogger.error("module is null for AkibaUtils!")
                         }
                     } catch (e: Exception) {
-                        globalLogger.error("Failed to create AkibaUtils instance: ${e.message}")
-                        e.printStackTrace()
+                        // Log the full chain: InvocationTargetException carries a
+                        // null message and the real cause only in its stack trace.
+                        globalLogger.error("Failed to create AkibaUtils instance", e)
                     }
                 }
             }

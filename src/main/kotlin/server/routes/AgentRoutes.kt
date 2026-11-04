@@ -2186,6 +2186,7 @@ private fun runManualAgentWorker(
     env.putAll(workerConfig.environment)
     env["AKIBA_MANUAL_AGENT"] = "1"
     env["AKIBA_MANUAL_AGENT_TOKEN"] = token
+    agentRouteLogger.info("Manual worker for {} will call back on port {}", sessionInfo.sessionId, serverPort)
     env["AKIBA_MANUAL_AGENT_SERVER_PORT"] = serverPort.toString()
     env["AKIBA_MANUAL_AGENT_SESSION_ID"] = sessionInfo.sessionId
     sessionInfo.projectName?.let { env["AKIBA_MANUAL_AGENT_PROJECT_NAME"] = it }
