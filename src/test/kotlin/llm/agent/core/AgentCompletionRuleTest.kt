@@ -7,6 +7,7 @@ import kotlin.test.assertTrue
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
+import org.iotsplab.akiba.llm.agent.strategy.ReActStrategy
 import org.iotsplab.akiba.llm.client.AkibaLLMClient
 import org.iotsplab.akiba.llm.client.ChatChunk
 import org.iotsplab.akiba.llm.client.ChatCompletion

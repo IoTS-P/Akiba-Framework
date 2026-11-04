@@ -21,7 +21,6 @@ import org.iotsplab.akiba.llm.agent.core.AgentTranscriptWriter
 import org.iotsplab.akiba.llm.agent.core.AkibaAgent
 import org.iotsplab.akiba.llm.agent.core.DefaultAgentHarness
 import org.iotsplab.akiba.llm.agent.core.ProcessExitReason
-import org.iotsplab.akiba.llm.agent.core.ReActStrategy
 import org.iotsplab.akiba.llm.agent.core.StopReason
 import org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxService
 import org.iotsplab.akiba.llm.agent.runtime.AgentRuntime
@@ -51,6 +50,7 @@ import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import org.iotsplab.akiba.utils.WithAgentMaxIterations
 import org.iotsplab.akiba.utils.WithBundledSkills
 import org.iotsplab.akiba.utils.WithScriptFile
+import org.iotsplab.akiba.llm.agent.strategy.ReActStrategy
 
 // ============================================================
 //  AgentModule — one-click deployable agent module

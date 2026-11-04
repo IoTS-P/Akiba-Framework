@@ -142,7 +142,7 @@ const val RETRY_INSTRUCTION_PREFIX = "__retry_instruction__"
  * can stop mid-tool-call) and then their prose is taken at face value instead
  * of looping until maxIterations.
  *
- * Referenced by `AgentStrategy.kt` (`ReActStrategy.plainTextAnswer`).
+ * Referenced by `strategy/ReActStrategy.kt` (`plainTextAnswer`).
  */
 const val MAX_NO_ACTION_TURNS: Int = 2
 
@@ -209,7 +209,7 @@ const val ESCALATE_AFTER_WAKES: Int = 3
  * WARNING-level duplicates, the ReAct strategy forces a context
  * compaction (up to [MAX_FORCED_COMPACTIONS] times) to break the loop.
  *
- * Referenced by `AgentStrategy.kt` (`ReActStrategy`).
+ * Referenced by `strategy/ReActStrategy.kt`.
  */
 const val DUPLICATE_LOOP_FORCE_COMPACT_THRESHOLD: Int = 5
 
@@ -218,7 +218,7 @@ const val DUPLICATE_LOOP_FORCE_COMPACT_THRESHOLD: Int = 5
  * Prevents infinite compaction loops when the context is already
  * minimal but the LLM keeps repeating.
  *
- * Referenced by `AgentStrategy.kt` (`ReActStrategy`).
+ * Referenced by `strategy/ReActStrategy.kt`.
  */
 const val MAX_FORCED_COMPACTIONS: Int = 2
 
@@ -227,7 +227,7 @@ const val MAX_FORCED_COMPACTIONS: Int = 2
  * retry loop invokes `StrategyContext.onContextOverflowHook` to compact
  * the context. Two (not one) because the one-shot `onLLMErrorHook` may
  * already have compacted for the first; a second rejection proves the
- * context is still too large. Referenced by `AgentStrategy.kt`.
+ * context is still too large. Referenced by `strategy/ReActStrategy.kt`.
  */
 const val CONTEXT_OVERFLOW_COMPACT_THRESHOLD: Int = 2
 
@@ -236,7 +236,7 @@ const val CONTEXT_OVERFLOW_COMPACT_THRESHOLD: Int = 2
  * early instead of spending the rest of its retry budget on a request the
  * provider will never accept — the escape hatch for a context that simply
  * cannot be shrunk enough.
- * Referenced by `AgentStrategy.kt`.
+ * Referenced by `strategy/ReActStrategy.kt`.
  */
 const val MAX_FAILED_OVERFLOW_COMPACTIONS: Int = 3
 
@@ -253,18 +253,14 @@ const val MAX_FAILED_OVERFLOW_COMPACTIONS: Int = 3
 const val PRUNE_PROTECT_TOKENS: Int = 40_000
 
 /**
- * Minimum estimated tokens that one overflow-recovery invocation must shed via
- * oldest-round dropping when the earlier stages (tool-output pruning,
- * summarising compaction, bound-driven dropping) saved less than this.
+ * Window space kept free before compaction fires, so the summarisation prompt
+ * and its reply still fit inside the same window.
  *
- * Dropping a fixed NUMBER of rounds is unreliable — a round can be a few
- * hundred tokens while the provider's rejection margin is typically several
- * thousand — so the floor is sized at the usual max-output-token reservation
- * and one drop covers the common "prompt fits but prompt+output doesn't" case.
- *
- * Referenced by `AkibaAgent.kt` (`forceCompactForOverflow`).
+ * Deliberately not configurable: it describes how compaction works, not how a
+ * deployment happens to be tuned, and windows smaller than it keep the
+ * percentage rule instead of collapsing the trigger to zero.
  */
-const val OVERFLOW_DROP_MIN_TOKENS: Int = 8_192
+const val COMPACT_HEADROOM_TOKENS: Int = 32_000
 
 // ----------------------------------------------------------
 // 7. Tool result truncation

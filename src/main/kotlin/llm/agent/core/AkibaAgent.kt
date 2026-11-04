@@ -19,6 +19,7 @@ import org.iotsplab.akiba.llm.memory.ChatMemory
 import org.iotsplab.akiba.llm.memory.InMemoryChatMemory
 import org.iotsplab.akiba.llm.memory.MemoryManager
 import org.iotsplab.akiba.llm.tool.core.ToolRegistry
+import org.iotsplab.akiba.llm.agent.strategy.ReActStrategy
 
 // ============================================================
 //  Agent result types
@@ -679,15 +680,14 @@ class AkibaAgent(
     }
 
     /**
-     * Compact the conversation history if the estimated token count exceeds
-     * `contextLength * compactThreshold`.
+     * Compact the conversation history once it is past [compactThreshold] of the
+     * window, or once fewer than [COMPACT_HEADROOM_TOKENS] are left — whichever
+     * comes first, since the summarisation prompt and its reply must still fit.
      *
      * @return true if compaction was performed.
      */
     fun maybeCompact(): Boolean {
-        val maxTokens = (contextLength * compactThreshold).toInt()
-        val currentTokens = currentContextTokens()
-        if (currentTokens <= maxTokens) return false
+        if (currentContextTokens() <= compactTriggerTokens(contextLength, compactThreshold)) return false
         return compact()
     }
 
@@ -786,23 +786,21 @@ class AkibaAgent(
 
     /**
      * Emergency context reduction for repeated provider context-length rejections
-     * (`StrategyContext.onContextOverflowHook`), in four progressively more
+     * (`StrategyContext.onContextOverflowHook`), in three progressively more
      * destructive stages: [pruneToolOutputsInMemory] (LLM-free — [compact] only
      * prunes the rounds it summarises, so oversized results in kept rounds survive
      * every compaction), then [compact] (its own summary call may fail on an
      * over-length context, which must not abort the LLM-free stages), then
-     * [dropOldestRound] down to [overflowTarget].
+     * [dropOldestRound] down to [overflowTarget]. Whatever is still over target
+     * once no round can be dropped gets its messages truncated in place.
      *
-     * The fourth stage is the minimum-shed guarantee: whenever the earlier stages
-     * saved less than [OVERFLOW_DROP_MIN_TOKENS] (a token estimate that disagrees
-     * with the provider), rounds totalling the shortfall are dropped via
-     * [dropOldestRoundsForTokens], and when none remain
-     * [truncateOversizedMessages] shrinks the survivors.
+     * The target is exact now that the window is known, so there is no
+     * minimum-shed guesswork: the loop simply continues until the estimate
+     * reaches it.
      *
      * @return true if the context was actually reduced.
      */
     fun forceCompactForOverflow(): Boolean {
-        val tokensAtEntry = currentContextTokens()
         var reduced = false
 
         if (pruneToolOutputsInMemory()) reduced = true
@@ -823,57 +821,13 @@ class AkibaAgent(
             if (!dropOldestRound()) break
             reduced = true
         }
+
+        // No round is left to drop (a single round survives): shrink its
+        // oversized messages in place instead of giving up.
         if (currentContextTokens() > target && truncateOversizedMessages(target)) {
             reduced = true
         }
-
-        // Guaranteed minimum shed: if the stages above saved less than
-        // OVERFLOW_DROP_MIN_TOKENS (bound unknown, or our estimator
-        // disagrees with the provider's count and thinks we are already
-        // under the bound), drop oldest rounds totalling at least the
-        // shortfall.  Dropping a fixed NUMBER of rounds is unreliable —
-        // a round can be a few hundred tokens while the provider's
-        // rejection margin is typically several thousand.
-        val shortfall = OVERFLOW_DROP_MIN_TOKENS - (tokensAtEntry - currentContextTokens())
-        if (shortfall > 0) {
-            if (dropOldestRoundsForTokens(shortfall)) {
-                reduced = true
-            } else if (!reduced) {
-                // Nothing left to drop (a single round remains): shrink
-                // the surviving oversized messages directly.
-                val fallbackTarget = (currentContextTokens() / 2)
-                    .coerceAtLeast(OVERFLOW_DROP_MIN_TOKENS)
-                reduced = truncateOversizedMessages(fallbackTarget)
-            }
-        }
         return reduced
-    }
-
-    /**
-     * Drop oldest conversation rounds until at least [minTokens]
-     * (estimated) have been removed, always keeping the newest round.
-     * Companion of [dropOldestRound] for callers that know how much
-     * they need to save rather than how many rounds to drop.
-     *
-     * @return true if any round was dropped.
-     */
-    private fun dropOldestRoundsForTokens(minTokens: Int): Boolean {
-        var shedTokens = 0
-        var droppedAny = false
-        var guard = 0
-        while (shedTokens < minTokens && guard++ < 50) {
-            val before = currentContextTokens()
-            if (!dropOldestRound()) break
-            droppedAny = true
-            shedTokens += before - currentContextTokens()
-        }
-        if (droppedAny) {
-            logger.warn(
-                "Emergency token-driven drop: discarded oldest rounds totalling " +
-                    "~$shedTokens tokens (requested minimum $minTokens)."
-            )
-        }
-        return droppedAny
     }
 
     /**
@@ -1122,4 +1076,15 @@ class AkibaAgent(
         lines.add("</tool_call_history>")
         return lines.joinToString("\n")
     }
+}
+
+/**
+ * Token count at which [maybeCompact] fires: the stricter of the percentage
+ * rule and the fixed headroom rule. Windows smaller than the headroom keep the
+ * percentage rule, so a tiny window cannot collapse the trigger to zero.
+ */
+internal fun compactTriggerTokens(contextLength: Int, compactThreshold: Double): Int {
+    val threshold = (contextLength * compactThreshold).toInt()
+    val headroom = contextLength - COMPACT_HEADROOM_TOKENS
+    return if (headroom > 0) minOf(threshold, headroom) else threshold
 }

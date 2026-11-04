@@ -5,10 +5,10 @@ import org.apache.logging.log4j.LogManager
 import org.iotsplab.akiba.llm.agent.core.AgentHarness
 import org.iotsplab.akiba.llm.agent.core.AgentStrategy
 import org.iotsplab.akiba.llm.agent.core.DefaultAgentHarness
-import org.iotsplab.akiba.llm.agent.core.ReActStrategy
 import org.iotsplab.akiba.llm.agent.template.HarnessSpec
 import org.iotsplab.akiba.llm.agent.template.StrategySpec
 import org.iotsplab.akiba.llm.agent.template.StrategySpecId
+import org.iotsplab.akiba.llm.agent.strategy.ReActStrategy
 
 // ============================================================
 //  AgentBuilderComponents — single source of truth for the

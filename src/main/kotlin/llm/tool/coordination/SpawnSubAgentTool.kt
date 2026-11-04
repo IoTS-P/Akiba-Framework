@@ -5,7 +5,6 @@ import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.agent.context.ModelContextWindows
 import org.iotsplab.akiba.llm.agent.core.AgentTranscriptWriter
 import org.iotsplab.akiba.llm.agent.core.AkibaAgent
-import org.iotsplab.akiba.llm.agent.core.ReActStrategy
 import org.iotsplab.akiba.llm.agent.core.SYSTEM_SESSION_UUID
 import org.iotsplab.akiba.llm.agent.mailbox.ConversationRegistry
 import org.iotsplab.akiba.llm.agent.module.AgentModule
@@ -29,6 +28,7 @@ import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
 import org.iotsplab.akiba.llm.tool.core.ToolRegistry
 import org.iotsplab.akiba.utils.AkibaJson
+import org.iotsplab.akiba.llm.agent.strategy.ReActStrategy
 
 /**
  * Build the async `spawn_sub_agent` tool.

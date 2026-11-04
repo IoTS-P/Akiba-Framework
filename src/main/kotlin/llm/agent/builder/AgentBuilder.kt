@@ -7,7 +7,6 @@ import org.iotsplab.akiba.llm.agent.core.AgentStrategy
 import org.iotsplab.akiba.llm.agent.core.AgentTranscriptWriter
 import org.iotsplab.akiba.llm.agent.core.AkibaAgent
 import org.iotsplab.akiba.llm.agent.core.DefaultAgentHarness
-import org.iotsplab.akiba.llm.agent.core.ReActStrategy
 import org.iotsplab.akiba.llm.agent.core.ToolResultDuplicateDetector
 import org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxService
 import org.iotsplab.akiba.llm.agent.runtime.JobHandle
@@ -26,6 +25,7 @@ import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
 import org.iotsplab.akiba.llm.tool.core.ToolRegistry
 import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.llm.agent.strategy.ReActStrategy
 
 // ============================================================
 //  AgentBuilder — DSL-style builder for AkibaAgent
