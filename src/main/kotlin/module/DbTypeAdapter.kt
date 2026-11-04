@@ -1,31 +1,16 @@
 package org.iotsplab.akiba.module
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.sql.PreparedStatement
 import java.sql.Timestamp
 import java.sql.Types
 import java.time.Duration
 import java.time.LocalDateTime
 import java.time.ZoneOffset
+import org.iotsplab.akiba.utils.AkibaJson
 
 interface DbTypeAdapter {
     fun set(ps: PreparedStatement, index: Int, value: Any?)
 }
-
-val defaultDbTypeAdapters: Map<String, DbTypeAdapter> = mapOf(
-    "integer" to IntegerAdapter,
-    "bigint" to BigIntAdapter,
-    "text" to TextAdapter,
-    "json" to JsonAdapter,
-    "jsonb" to JsonbAdapter,
-    "float" to FloatAdapter,
-    "double precision" to DoubleAdapter,
-    "bytea" to ByteaAdapter,
-    "boolean" to BooleanAdapter,
-    "timestamp" to TimestampAdapter,
-    "timestamptz" to TimestampTzAdapter,
-    "interval" to IntervalAdapter
-)
 
 object IntegerAdapter : DbTypeAdapter {
     override fun set(ps: PreparedStatement, index: Int, value: Any?) {
@@ -50,7 +35,7 @@ object TextAdapter : DbTypeAdapter {
 
 object JsonAdapter : DbTypeAdapter {
 
-    private val mapper = jacksonObjectMapper()
+    private val mapper = AkibaJson.mapper
 
     override fun set(ps: PreparedStatement, index: Int, value: Any?) {
         set(ps, index, value, "jsonb")

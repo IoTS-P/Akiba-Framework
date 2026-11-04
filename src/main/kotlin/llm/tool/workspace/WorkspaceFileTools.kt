@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.llm.tool.workspace
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.io.IOException
 import java.nio.charset.Charset
 import java.nio.file.FileVisitResult
@@ -18,6 +17,7 @@ import org.iotsplab.akiba.llm.tool.core.ToolParameter
 import org.iotsplab.akiba.llm.tool.core.detectWorkerServerPort
 import org.iotsplab.akiba.llm.tool.core.requestConfirmationViaHttp
 import org.iotsplab.akiba.module.AkibaModule
+import org.iotsplab.akiba.utils.AkibaJson
 
 // ============================================================
 //  WorkspaceFileTools — sandboxed file I/O for LLM agents
@@ -61,7 +61,7 @@ fun WorkspaceFileTools(parent: AkibaModule): List<Tool> = listOf(
 //  Security helpers
 // ============================================================
 
-private val wsMapper = jacksonObjectMapper()
+private val wsMapper = AkibaJson.mapper
 
 /** Maximum characters returned by [ReadWorkspaceFileTool] (≈ 200 KB of text). */
 private const val MAX_READ_CHARS = 200_000

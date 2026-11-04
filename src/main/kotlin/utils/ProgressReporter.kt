@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.utils
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -17,7 +16,7 @@ import java.time.Duration
  */
 object ProgressReporter {
 
-    private val mapper = jacksonObjectMapper()
+    private val mapper = AkibaJson.mapper
     private val client = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(3))
         .build()

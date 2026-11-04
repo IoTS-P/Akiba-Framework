@@ -1,10 +1,10 @@
 package org.iotsplab.akiba.llm.agent.core
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.security.MessageDigest
 import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.tool.core.ToolDedupStrategy
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * Pluggable policy for detecting whether a freshly executed tool result is
@@ -71,7 +71,7 @@ class DefaultToolResultDuplicateDetector(
     private val logger: Logger? = null
 ) : ToolResultDuplicateDetector {
 
-    private val mapper = jacksonObjectMapper()
+    private val mapper = AkibaJson.mapper
     private val inMemoryHistory = mutableListOf<ToolResultDuplicateMatch>()
 
     override fun inspect(request: ToolResultInspectionRequest): ToolResultDuplicateDetection {

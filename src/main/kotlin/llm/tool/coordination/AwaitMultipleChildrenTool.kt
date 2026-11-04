@@ -2,7 +2,6 @@
 
 package org.iotsplab.akiba.llm.tool.coordination
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -16,6 +15,7 @@ import org.iotsplab.akiba.llm.agent.runtime.JobHandle
 import org.iotsplab.akiba.llm.agent.runtime.RuntimeState
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
+import org.iotsplab.akiba.utils.AkibaJson
 
 // ============================================================
 //  AwaitMultipleChildrenTool — batch-wait for N child agents
@@ -150,7 +150,7 @@ private fun handleAwaitMany(
     agentDbClient: AgentDatabaseClient,
     runtimeOverride: AgentRuntime?,
 ): String = runBlocking {
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
     val raw = args["childIds"]
         ?: return@runBlocking "Error: 'childIds' is required"
     val childIds = try {
@@ -461,7 +461,7 @@ internal fun parseChildIds(raw: Any?): List<String> {
     // First try as JSON array
     val trimmed = s.trim()
     if (trimmed.startsWith("[")) {
-        val mapper = jacksonObjectMapper()
+        val mapper = AkibaJson.mapper
         val arr = try { mapper.readValue(trimmed, Array<String>::class.java) } catch (_: Exception) {
             null
         }

@@ -1,12 +1,12 @@
 package org.iotsplab.akiba.llm.agent.stream
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import org.apache.logging.log4j.LogManager
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * Fire-and-forget publisher that forwards live LLM streaming chunks from a
@@ -21,7 +21,7 @@ import org.apache.logging.log4j.LogManager
 object StreamingChunkPusher {
 
     private val logger = LogManager.getLogger(StreamingChunkPusher::class.java)
-    private val mapper = jacksonObjectMapper()
+    private val mapper = AkibaJson.mapper
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(2))
         .build()

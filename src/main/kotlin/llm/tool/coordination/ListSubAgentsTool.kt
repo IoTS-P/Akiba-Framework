@@ -1,10 +1,10 @@
 package org.iotsplab.akiba.llm.tool.coordination
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.agent.module.AgentModule
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
+import org.iotsplab.akiba.utils.AkibaJson
 
 // ============================================================
 //  ListSubAgentsTool — list/search an agent's sub-agents
@@ -194,7 +194,7 @@ fun ListSubAgentsTool(
     try {
         collectChildren(callerSessionId, 0)
 
-        val mapper = jacksonObjectMapper()
+        val mapper = AkibaJson.mapper
         if (results.isEmpty()) {
             mapper.writeValueAsString(
                 mapOf(

@@ -1,7 +1,6 @@
 package org.iotsplab.akiba.llm.tool.coordination
 
 import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.agent.context.ModelContextWindows
 import org.iotsplab.akiba.llm.agent.core.AgentTranscriptWriter
@@ -29,6 +28,7 @@ import org.iotsplab.akiba.llm.skill.SkillManager
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
 import org.iotsplab.akiba.llm.tool.core.ToolRegistry
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * Build the async `spawn_sub_agent` tool.
@@ -166,7 +166,7 @@ private fun handleSpawn(
     callerSessionId: String? = null,
     templateScopeId: String? = null,
 ): String {
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
     val templateId = (args["templateId"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
     val parentAgent = parent.agent ?: return "Error: parent agent not initialised"
     // When [callerSessionId] is provided (sub-agent calling through a
@@ -218,7 +218,7 @@ private fun notifyParentOfPreSpawnFailure(
         appendLine("as the failed child completion notification.")
         appendLine()
         appendLine("Original spawn_sub_agent arguments:")
-        appendLine(jacksonObjectMapper().writeValueAsString(args))
+        appendLine(AkibaJson.mapper.writeValueAsString(args))
         appendLine()
         appendLine("Action: fix the bad parameters (for linear_checker, use groupRef exactly")
         appendLine("as <groupingId>:<globalGroupIndex> from group_functions), then retry")
@@ -607,9 +607,9 @@ private fun parentAgentDepth(parent: AgentModule): Int = parent.agent?.let { 1 }
 
 private fun coerceArgsObject(raw: Any?): JsonNode = when (raw) {
     is JsonNode -> raw
-    is Map<*, *> -> jacksonObjectMapper().valueToTree(raw)
-    null -> jacksonObjectMapper().createObjectNode()
-    else -> jacksonObjectMapper().createObjectNode()
+    is Map<*, *> -> AkibaJson.mapper.valueToTree(raw)
+    null -> AkibaJson.mapper.createObjectNode()
+    else -> AkibaJson.mapper.createObjectNode()
 }
 
 private fun jsonNodeToMap(node: JsonNode): Map<String, Any?> {
@@ -776,7 +776,7 @@ fun spawnChildFromTemplateProgrammatically(
 ): ProgrammaticSpawnResult {
     val parentAgent = parent.agent
         ?: throw IllegalStateException("parent agent is not initialised")
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
 
     val spec = SubAgentSpec(
         templateId = template.id,

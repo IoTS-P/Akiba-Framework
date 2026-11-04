@@ -269,12 +269,3 @@ const val OVERFLOW_DROP_MIN_TOKENS: Int = 8_192
 // ----------------------------------------------------------
 // 7. Tool result truncation
 // ----------------------------------------------------------
-
-/**
- * Maximum length (in characters) of a tool result string stored in
- * chat memory before truncation.  Longer results are truncated to
- * this length with a suffix noting the original size.
- *
- * Referenced by `AkibaAgent.kt`.
- */
-const val MAX_TOOL_RESULT_LENGTH: Int = 40000

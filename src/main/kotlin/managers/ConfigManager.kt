@@ -27,6 +27,7 @@ import org.iotsplab.akiba.utils.ProcedureArgumentsSerializer
 import org.iotsplab.akiba.utils.SqlSource
 import org.iotsplab.akiba.utils.WithConfigClass
 import org.iotsplab.akiba.utils.WithGhidraProject
+import org.iotsplab.akiba.utils.AkibaJson
 
 object ConfigManager {
     lateinit var config: Configs
@@ -92,7 +93,7 @@ object ConfigManager {
     }
 
     @Throws(IllegalArgumentException::class, Exception::class)
-    fun <T> parseModuleConfig(pathAndKey: String, objectMapper: ObjectMapper = jacksonObjectMapper(), clazz: Class<T>): T {
+    fun <T> parseModuleConfig(pathAndKey: String, objectMapper: ObjectMapper = AkibaJson.mapper, clazz: Class<T>): T {
         val (filePath, key) = parseJsonPath(pathAndKey)
 
         require(Path.of(filePath).isRegularFile()) { "$filePath not found or is not a file" }
@@ -111,7 +112,7 @@ object ConfigManager {
 
     @Throws(IllegalArgumentException::class)
     fun mergeConfigs(config: Configs = this.config, outputPath: File) {
-        val builder = jacksonObjectMapper()
+        val builder = AkibaJson.mapper
         val root: ObjectNode = builder.createObjectNode()
 
         val mainConfigNode: JsonNode = jacksonObjectMapper().registerModule(

@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.managers
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import ghidra.program.model.lang.Language
 import ghidra.program.model.lang.LanguageID
 import ghidra.program.model.listing.Program
@@ -20,6 +19,7 @@ import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 import org.iotsplab.akiba.managers.WorkspaceManager.languageProvider
 import org.iotsplab.akiba.managers.WorkspaceManager.project
 import org.iotsplab.akiba.utils.ProgressReporter
+import org.iotsplab.akiba.utils.AkibaJson
 
 object ImportManager {
     private val db: DatabaseClient get() = DatabaseClient.global!!
@@ -255,7 +255,7 @@ object ImportManager {
             processedChecksum = preprocessed?.let { ProgramManager.getFileMD5Checksum(it.first) },
             size = originalPath.fileSize(),
             processedSize = preprocessed?.first?.fileSize() ?: -1,
-            loadProperties = preprocessed?.let { jacksonObjectMapper().writeValueAsString(it.second) },
+            loadProperties = preprocessed?.let { AkibaJson.mapper.writeValueAsString(it.second) },
             arch = resolvedArch,
             format = program?.executableFormat ?: "n/a",
             compilerSpec = program?.compiler ?: "n/a",

@@ -1,9 +1,9 @@
 package org.iotsplab.akiba.llm.tool.coordination
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
+import org.iotsplab.akiba.utils.AkibaJson
 
 // ============================================================
 //  GetAgentStatusTool — peek any visible agent's runtime state
@@ -99,7 +99,7 @@ fun GetAgentStatusTool(
             targetSessionId = target,
             childLimit = childLimit,
         )) {
-            is AgentDatabaseClient.AgentStatusResult.Ok -> jacksonObjectMapper().writeValueAsString(
+            is AgentDatabaseClient.AgentStatusResult.Ok -> AkibaJson.mapper.writeValueAsString(
                 mapOf(
                     "status" to "ok",
                     "relationship" to result.info.relationship.wire(),
@@ -141,7 +141,7 @@ fun GetAgentStatusTool(
                     "directChildrenTruncated" to result.info.directChildrenTruncated,
                 )
             )
-            is AgentDatabaseClient.AgentStatusResult.NotFound -> jacksonObjectMapper().writeValueAsString(
+            is AgentDatabaseClient.AgentStatusResult.NotFound -> AkibaJson.mapper.writeValueAsString(
                 mapOf(
                     "status" to "not_found",
                     "error" to "Target session '$target' does not exist",
@@ -152,7 +152,7 @@ fun GetAgentStatusTool(
                         "for a given binary/module if you are unsure.",
                 )
             )
-            is AgentDatabaseClient.AgentStatusResult.AccessDenied -> jacksonObjectMapper().writeValueAsString(
+            is AgentDatabaseClient.AgentStatusResult.AccessDenied -> AkibaJson.mapper.writeValueAsString(
                 mapOf(
                     "status" to "forbidden",
                     "error" to result.error,
@@ -167,7 +167,7 @@ fun GetAgentStatusTool(
                             "permission model is added.")),
                 )
             )
-            is AgentDatabaseClient.AgentStatusResult.BadRequest -> jacksonObjectMapper().writeValueAsString(
+            is AgentDatabaseClient.AgentStatusResult.BadRequest -> AkibaJson.mapper.writeValueAsString(
                 mapOf(
                     "status" to "bad_request",
                     "error" to result.error,

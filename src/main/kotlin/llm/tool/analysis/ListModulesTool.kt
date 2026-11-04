@@ -1,8 +1,8 @@
 package org.iotsplab.akiba.llm.tool.analysis
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * Create a tool that lists all available AkibaModule classes that
@@ -25,7 +25,7 @@ fun ListModulesTool(): Tool = Tool(
     },
     parameters = emptyList()
 ) {
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
 
     try {
         ProcedureArgumentsDeserializer.peekAllModules()

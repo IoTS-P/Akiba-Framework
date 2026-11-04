@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.llm.tool.analysis
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.util.HashSet
@@ -10,6 +9,7 @@ import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.module.RuntimeReport
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * Create a tool that runs another [AkibaModule] on the current or a different binary.
@@ -78,7 +78,7 @@ fun RunModuleTool(parent: AkibaModule): Tool = Tool(
     val timeout = (args["timeout"] as? Number)?.toInt() ?: AkibaModule.DEFAULT_TIMEOUT
     val skipDbWrite = args["skipDbWrite"] as? Boolean ?: false
 
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
 
     try {
         var resultJson = ""

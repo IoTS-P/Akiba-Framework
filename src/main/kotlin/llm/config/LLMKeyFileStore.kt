@@ -1,11 +1,11 @@
 package org.iotsplab.akiba.llm.config
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermissions
 import org.apache.logging.log4j.LogManager
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * On-disk store for LLM API keys in `~/.akiba/llm_keys.json`.
@@ -20,7 +20,7 @@ import org.apache.logging.log4j.LogManager
 object LLMKeyFileStore {
 
     private val logger = LogManager.getLogger(LLMKeyFileStore::class.java)
-    private val mapper = jacksonObjectMapper()
+    private val mapper = AkibaJson.mapper
 
     private val akibaDir: File by lazy {
         File(System.getProperty("user.home"), ".akiba").also {

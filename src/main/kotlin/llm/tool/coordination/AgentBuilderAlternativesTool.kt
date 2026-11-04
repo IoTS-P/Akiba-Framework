@@ -1,11 +1,11 @@
 package org.iotsplab.akiba.llm.tool.coordination
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.llm.agent.builder.AgentBuilderComponents
 import org.iotsplab.akiba.llm.agent.module.AgentModule
 import org.iotsplab.akiba.llm.agent.template.AgentTemplateRegistry
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
+import org.iotsplab.akiba.utils.AkibaJson
 
 // ============================================================
 //  AgentBuilderAlternativesTool — catalogue of controllable
@@ -54,7 +54,7 @@ fun AgentBuilderAlternativesTool(parent: AgentModule): Tool = Tool(
         )
     )
 ) { args ->
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
     val intent = (args["intent"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
     val includeRaw = (args["include"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
     val detail = (args["detail"] as? String)?.trim()?.lowercase() ?: "summary"

@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.llm.tool.ui
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.agent.module.AgentModule
 import org.iotsplab.akiba.llm.client.LLMClientFactory
@@ -9,6 +8,7 @@ import org.iotsplab.akiba.llm.tool.core.BuiltInTools
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolCallParser
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
+import org.iotsplab.akiba.utils.AkibaJson
 
 // ============================================================
 //  BtwAssistant — constrained side assistant for follow-up questions
@@ -183,7 +183,7 @@ fun PinnedSessionHistoryTool(
         )
     )
 ) { args ->
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
     val limit = ((args["limit"] as? Number)?.toInt() ?: 30).coerceIn(1, 100)
     val fromIndex = (args["fromIndex"] as? Number)?.toInt()
 

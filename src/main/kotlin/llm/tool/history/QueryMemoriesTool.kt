@@ -1,9 +1,9 @@
 package org.iotsplab.akiba.llm.tool.history
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * Create a tool that queries the cognitive memory store.
@@ -54,7 +54,7 @@ fun QueryMemoriesTool(agentDbClient: AgentDatabaseClient): Tool = Tool(
     val minImportance = (args["minImportance"] as? Number)?.toDouble()
     val limit = (args["limit"] as? Number)?.toInt() ?: 20
 
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
 
     try {
         val memories = agentDbClient.queryMemories(

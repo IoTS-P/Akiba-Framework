@@ -1,10 +1,10 @@
 package org.iotsplab.akiba.llm.agent.core
 
 import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * Appends a Markdown transcript of agent interactions (system prompt, user
@@ -197,7 +197,7 @@ class AgentTranscriptWriter(
      */
     private fun writeRunScriptResult(jsonStr: String): String = buildString {
         try {
-            val mapper = jacksonObjectMapper()
+            val mapper = AkibaJson.mapper
             val node: JsonNode = mapper.readTree(jsonStr)
 
             val success = node.path("success").asBoolean(false)

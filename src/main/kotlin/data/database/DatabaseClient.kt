@@ -43,6 +43,7 @@ import org.iotsplab.akiba.managers.BinaryMetadata
 import org.iotsplab.akiba.managers.ProgramManager
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 import org.iotsplab.akiba.module.Log
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * Database daemon client.  Each instance holds its own URL, auth token and
@@ -208,7 +209,7 @@ class DatabaseClient(
             else
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
-        return@runBlocking jacksonObjectMapper().readValue<List<Long>>(response)
+        return@runBlocking AkibaJson.mapper.readValue<List<Long>>(response)
     }
 
     @Throws(DatabaseDaemonException::class)
@@ -222,7 +223,7 @@ class DatabaseClient(
             else
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
-        return@runBlocking jacksonObjectMapper().readValue<List<Long>>(response)
+        return@runBlocking AkibaJson.mapper.readValue<List<Long>>(response)
     }
 
     @Throws(DatabaseDaemonException::class)
@@ -233,7 +234,7 @@ class DatabaseClient(
             else
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
-        return@runBlocking jacksonObjectMapper().readValue<Long>(response)
+        return@runBlocking AkibaJson.mapper.readValue<Long>(response)
     }
 
     @Throws(DatabaseDaemonException::class)
@@ -244,7 +245,7 @@ class DatabaseClient(
             else
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
-        return@runBlocking jacksonObjectMapper().readValue<BinaryMetadata>(response)
+        return@runBlocking AkibaJson.mapper.readValue<BinaryMetadata>(response)
     }
 
     /**
@@ -265,7 +266,7 @@ class DatabaseClient(
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
         @Suppress("UNCHECKED_CAST")
-        return@runBlocking (jacksonObjectMapper().readValue(response) as? List<Map<String, Any?>>) ?: emptyList()
+        return@runBlocking (AkibaJson.mapper.readValue(response) as? List<Map<String, Any?>>) ?: emptyList()
     }
 
     /**
@@ -282,7 +283,7 @@ class DatabaseClient(
             else
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
-        return@runBlocking jacksonObjectMapper().readValue<List<Long>>(response)
+        return@runBlocking AkibaJson.mapper.readValue<List<Long>>(response)
     }
 
     @Throws(DatabaseDaemonException::class)
@@ -318,7 +319,7 @@ class DatabaseClient(
             else
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
-        return@runBlocking jacksonObjectMapper().readValue<Boolean>(response)
+        return@runBlocking AkibaJson.mapper.readValue<Boolean>(response)
     }
 
     @Throws(DatabaseDaemonException::class)
@@ -358,7 +359,7 @@ class DatabaseClient(
             else
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
-        return@runBlocking jacksonObjectMapper().readValue<Long>(response)
+        return@runBlocking AkibaJson.mapper.readValue<Long>(response)
     }
 
     /*   Modules   */
@@ -522,7 +523,7 @@ class DatabaseClient(
             else
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
-        val body = jacksonObjectMapper().readValue<Map<String, Any?>>(response)
+        val body = AkibaJson.mapper.readValue<Map<String, Any?>>(response)
         val token = body["token"] as? String
             ?: throw DatabaseDaemonException(HttpStatusCode.InternalServerError, "Failed to get token")
         this@DatabaseClient.token = token
@@ -659,7 +660,7 @@ class DatabaseClient(
             else
                 throw DatabaseDaemonException(it.first, it.first.description)
         }
-        jacksonObjectMapper().readValue<Map<String, String>>(response)["secret"]
+        AkibaJson.mapper.readValue<Map<String, String>>(response)["secret"]
             ?: throw DatabaseDaemonException(
                 HttpStatusCode.InternalServerError, "Failed to obtain worker credential")
     }
@@ -680,7 +681,7 @@ class DatabaseClient(
             port = port,
             path = "/ws/instance/create"
         ) {
-            send(Frame.Text(jacksonObjectMapper().writeValueAsString(mapOf(
+            send(Frame.Text(AkibaJson.mapper.writeValueAsString(mapOf(
                 "token" to this@DatabaseClient.token,
                 "instanceName" to instanceName
             ))))
@@ -760,7 +761,7 @@ class DatabaseClient(
             port = port,
             path = "/ws/backup/create"
         ) {
-            send(Frame.Text(jacksonObjectMapper().writeValueAsString(mapOf(
+            send(Frame.Text(AkibaJson.mapper.writeValueAsString(mapOf(
                 "isFull" to isFull,
                 "token" to this@DatabaseClient.token,
                 "instance" to instanceName,
@@ -813,7 +814,7 @@ class DatabaseClient(
         post("/backup/status", mapOf("instance" to instanceName)).let {
             if (it.first != HttpStatusCode.OK)
                 throw DatabaseDaemonException(it.first, it.first.description)
-            jacksonObjectMapper().readValue(it.second)
+            AkibaJson.mapper.readValue(it.second)
         }
     }
 
@@ -875,7 +876,7 @@ class DatabaseClient(
             port = port,
             path = "/ws/backup/restore"
         ) {
-            send(Frame.Text(jacksonObjectMapper().writeValueAsString(mapOf(
+            send(Frame.Text(AkibaJson.mapper.writeValueAsString(mapOf(
                 "token" to this@DatabaseClient.token,
                 "instance" to instanceName,
                 "aliasOrLabel" to aliasOrLabel

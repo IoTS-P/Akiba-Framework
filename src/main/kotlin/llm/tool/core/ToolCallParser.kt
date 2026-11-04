@@ -1,17 +1,17 @@
 package org.iotsplab.akiba.llm.tool.core
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import kotlin.collections.get
 import org.iotsplab.akiba.llm.agent.core.ParsedToolCall
 import org.iotsplab.akiba.llm.client.ChatCompletion
+import org.iotsplab.akiba.utils.AkibaJson
 
 // ============================================================
 //  Tool call parsing — shared across strategies
 // ============================================================
 
 object ToolCallParser {
-    private val mapper = jacksonObjectMapper()
+    private val mapper = AkibaJson.mapper
 
     /** Pattern to detect the start of a json code block containing tool_call. */
     private val codeBlockStart = Regex("""```(?:json|tool_call)\s*""")

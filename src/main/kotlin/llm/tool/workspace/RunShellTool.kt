@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.llm.tool.workspace
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.io.InputStream
 import kotlinx.coroutines.*
 import org.iotsplab.akiba.llm.agent.module.AgentModule
@@ -9,6 +8,7 @@ import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
 import org.iotsplab.akiba.llm.tool.core.detectWorkerServerPort
 import org.iotsplab.akiba.llm.tool.core.requestConfirmationViaHttp
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * Create a tool that allows the agent to execute shell commands.
@@ -84,7 +84,7 @@ fun RunShellTool(
         )
     )
 ) { args ->
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
     val command = args["command"] as? String
         ?: return@Tool "Error: 'command' parameter is required"
 

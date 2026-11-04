@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.llm.tool.analysis
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import kotlin.system.measureTimeMillis
 import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
@@ -11,6 +10,7 @@ import org.iotsplab.akiba.llm.tool.core.ToolParameter
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.module.RuntimeReport
 import org.iotsplab.akiba.script.ScriptInstance
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * A library of pre-built, battle-tested Kotlin scripts for common binary
@@ -137,7 +137,7 @@ fun ScriptLibraryTool(
         }
     }
 ) { args ->
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
     val action = args["action"] as? String
         ?: return@Tool "Error: 'action' parameter is required ('search' or 'run')"
 
@@ -223,10 +223,6 @@ private data class ScriptMeta(
     val dbId: Int? = null,  // script row id in the DB, set when loaded from library
     val dedupStrategy: ToolDedupStrategy = ToolDedupStrategy.RESULT_HASH,
 )
-
-/** Cached script library entries. */
-@Volatile
-private var scriptLibrary: List<ScriptMeta>? = null
 
 /**
  * Cached mapping of `scriptName → dedupStrategy`, populated lazily when
@@ -504,7 +500,7 @@ private fun runLibraryScript(
             .encodeToString(paramsJson.toByteArray(Charsets.UTF_8))
         appendLine("// Auto-injected scriptArgs")
         appendLine("private val __akibaScriptArgsJson = String(java.util.Base64.getDecoder().decode(${kotlinLiteral(paramsB64)}), Charsets.UTF_8)")
-        appendLine("val scriptArgs: Map<String, Any?> = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper().readValue(__akibaScriptArgsJson, object : com.fasterxml.jackson.core.type.TypeReference<Map<String, Any?>>() {})")
+        appendLine("val scriptArgs: Map<String, Any?> = com.fasterxml.jackson.module.kotlin.AkibaJson.mapper.readValue(__akibaScriptArgsJson, object : com.fasterxml.jackson.core.type.TypeReference<Map<String, Any?>>() {})")
     }
     // Insert the injection after the imports, before the class definition.
     // Note: `sourceWithArgs` here is the (renamed) result of splicing the

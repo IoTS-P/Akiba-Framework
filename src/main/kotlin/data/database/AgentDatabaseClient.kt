@@ -1,11 +1,11 @@
 package org.iotsplab.akiba.data.database
 
 import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.module.Log
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * Client for Agent-related database operations, sending HTTP POST requests to
@@ -19,7 +19,7 @@ import org.iotsplab.akiba.module.Log
  */
 class AgentDatabaseClient(private val dbClient: DatabaseClient) {
 
-    private val mapper get() = jacksonObjectMapper()
+    private val mapper get() = AkibaJson.mapper
 
     // ============================================================
     //  Session CRUD

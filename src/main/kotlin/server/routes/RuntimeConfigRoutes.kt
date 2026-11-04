@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.server.routes
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
@@ -9,6 +8,7 @@ import io.ktor.server.routing.*
 import java.nio.file.Files
 import java.nio.file.Path
 import org.apache.logging.log4j.LogManager
+import org.iotsplab.akiba.utils.AkibaJson
 
 private val logger = LogManager.getLogger("RuntimeConfigRoutes")
 
@@ -25,7 +25,7 @@ data class RuntimeConfigRequest(
     val json: String
 )
 
-private val mapper = jacksonObjectMapper()
+private val mapper = AkibaJson.mapper
 
 /** Base directory for all user configs. */
 private val configBase: Path get() = Path.of(System.getProperty("user.home"), ".akiba", "user_configs")

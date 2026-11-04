@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.server.routes
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
@@ -39,6 +38,7 @@ import org.iotsplab.akiba.llm.tool.ui.UserChoiceManager
 import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
+import org.iotsplab.akiba.utils.AkibaJson
 
 // ============================================================
 //  Request / Response DTOs
@@ -347,7 +347,7 @@ private const val USER_CANCELLED_STREAM_ERROR = "cancelled by user"
 private class ManualAgentWorkerException(message: String) : Exception(message)
 
 private val agentRouteLogger = LogManager.getLogger("AgentRoutes")
-private val agentRouteMapper = jacksonObjectMapper()
+private val agentRouteMapper = AkibaJson.mapper
 private const val MANUAL_AGENT_TIMEOUT_MINUTES: Long = 10
 private const val AGENT_MESSAGES_PAGE_SIZE = 500
 private const val AGENT_MESSAGES_MAX_RETURN = 20_000
@@ -390,27 +390,6 @@ data class ChatResponse(
     val iterations: Int,
     val tokenUsage: Map<String, Int>?
 )
-
-/**
- * Minimal [AgentModule] used by the interactive chat agent.
- * Provides no real task but gives access to [BuiltInTools] and
- * the session's [Program] (if a binary was selected).
- */
-private class ChatAgentModule(
-    dbClient: DatabaseClient,
-    program: ghidra.program.model.listing.Program? = null,
-    id: Int = -1,
-    private val username: String? = null
-) : AgentModule(
-    id = id,
-    program = program,
-    dbClient = dbClient
-) {
-    override fun taskPrompt(): String = ""
-    override fun defineTools(): List<Tool> = emptyList()
-    override fun includeBuiltInTools(): Boolean = true
-    override fun toolUsername(): String? = username
-}
 
 private val DEFAULT_AGENT_SYSTEM_PROMPT: String = """
     ${AgentPrompts.DEFAULT_SYSTEM_PROMPT}

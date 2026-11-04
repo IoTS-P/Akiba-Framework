@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.llm.tool.core
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import dev.langchain4j.agent.tool.ToolSpecification
 import dev.langchain4j.model.chat.request.json.JsonArraySchema
 import dev.langchain4j.model.chat.request.json.JsonBooleanSchema
@@ -10,6 +9,7 @@ import dev.langchain4j.model.chat.request.json.JsonNumberSchema
 import dev.langchain4j.model.chat.request.json.JsonObjectSchema
 import dev.langchain4j.model.chat.request.json.JsonSchemaElement
 import dev.langchain4j.model.chat.request.json.JsonStringSchema
+import org.iotsplab.akiba.utils.AkibaJson
 
 // ============================================================
 //  Tool — definition
@@ -82,7 +82,7 @@ class Tool(
     val dedupStrategyResolver: ((Map<String, Any?>) -> ToolDedupStrategy)? = null,
     val execute: (Map<String, Any?>) -> String
 ) {
-    private val mapper = jacksonObjectMapper()
+    private val mapper = AkibaJson.mapper
 
     /**
      * Generate a JSON Schema description of this tool for LLM tool-calling.

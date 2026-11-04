@@ -1,10 +1,10 @@
 package org.iotsplab.akiba.llm.agent.template
 
 import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.llm.agent.core.AgentTranscriptWriter
 import org.iotsplab.akiba.llm.agent.core.AkibaAgent
 import org.iotsplab.akiba.llm.client.AkibaLLMClient
+import org.iotsplab.akiba.utils.AkibaJson
 
 // ============================================================
 //  AgentTemplate — pre-built, reusable agent construction block
@@ -423,7 +423,7 @@ data class AgentTemplate(
     }
 
     companion object {
-        private val mapper = jacksonObjectMapper()
+        private val mapper = AkibaJson.mapper
 
         /**
          * Convenience: render a descriptor as pretty JSON.  Useful for tool

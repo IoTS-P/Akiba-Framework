@@ -1,10 +1,10 @@
 package org.iotsplab.akiba.llm.tool.analysis
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
 import org.iotsplab.akiba.module.AkibaModule
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * Create a tool that queries the analysis results stored by
@@ -42,7 +42,7 @@ fun QueryModuleDataTool(parent: AkibaModule, dbClient: DatabaseClient = parent.d
     val columnsStr = args["columns"] as? String
     val columns = columnsStr?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }
 
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
 
     try {
         val data = dbClient.getModuleData(

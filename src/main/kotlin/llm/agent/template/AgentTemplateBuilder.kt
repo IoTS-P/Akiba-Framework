@@ -320,9 +320,3 @@ class InteractionPolicyBuilder(initial: InteractionPolicy) {
  */
 fun agentTemplate(id: String, configure: AgentTemplateBuilder.() -> Unit): AgentTemplate =
     AgentTemplateBuilder(id).apply(configure).build()
-
-/**
- * Mutable variant of [agentTemplate] returning the builder directly.
- * Useful when a module wants to assemble the builder in multiple steps.
- */
-fun agentTemplateBuilder(id: String): AgentTemplateBuilder = AgentTemplateBuilder(id)

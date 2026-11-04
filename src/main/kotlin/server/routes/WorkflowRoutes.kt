@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.server.routes
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
@@ -21,9 +20,10 @@ import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.agent.runtime.RuntimeState
 import org.iotsplab.akiba.llm.config.LLMKeyFileStore
 import org.iotsplab.akiba.managers.WorkspaceManager
+import org.iotsplab.akiba.utils.AkibaJson
 
 private val logger: Logger = LogManager.getLogger("WorkflowRoutes")
-private val mapper = jacksonObjectMapper()
+private val mapper = AkibaJson.mapper
 
 data class StartWorkflowRequest(
     val instanceName: String,

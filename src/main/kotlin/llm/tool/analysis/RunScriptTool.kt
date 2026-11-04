@@ -1,7 +1,6 @@
 package org.iotsplab.akiba.llm.tool.analysis
 
 import com.fasterxml.jackson.databind.node.ObjectNode
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import kotlin.system.measureTimeMillis
 import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
@@ -13,6 +12,7 @@ import org.iotsplab.akiba.module.RuntimeReport
 import org.iotsplab.akiba.script.CompilationException
 import org.iotsplab.akiba.script.ScriptCompiler
 import org.iotsplab.akiba.script.ScriptInstance
+import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * Create a tool that dynamically compiles and runs a Kotlin script.
@@ -183,7 +183,7 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
     val saveToLibrary = args["saveToLibrary"] as? Boolean ?: false
     val scriptDescription = args["description"] as? String ?: ""
 
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
 
     // -----------------------------------------------------------------
     //  Reverse-mistake guard: the LLM sometimes puts a tool_call JSON in

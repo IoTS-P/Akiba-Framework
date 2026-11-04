@@ -272,30 +272,3 @@ fun establishDaemonIdentity(
     reconcileUserInstances(daemonHost, daemonPort, identity, instances, "signin")
     return identity
 }
-
-/**
- * Refresh the instance → owner mapping for [identity], e.g. after the user
- * created or deleted an instance.
- */
-fun refreshOwnedInstances(
-    daemonHost: String,
-    daemonPort: Int,
-    identity: DaemonIdentity,
-): List<String> {
-    val client = DatabaseClient(daemonHost, daemonPort)
-    return try {
-        client.login(identity.username, identity.secret)
-        val names = client.listInstances().map { it.name }
-        DaemonIdentities.registerInstances(identity.username, names)
-        names
-    } catch (e: Exception) {
-        if (e is DatabaseClient.DatabaseDaemonException &&
-            e.statusCode == HttpStatusCode.Unauthorized
-        ) {
-            DaemonIdentities.invalidate(identity.username)
-        }
-        throw e
-    } finally {
-        runCatching { client.logout() }
-    }
-}

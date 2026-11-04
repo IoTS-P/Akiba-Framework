@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.llm.tool.ui
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -21,6 +20,7 @@ import org.iotsplab.akiba.llm.agent.module.AgentModule
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
 import org.iotsplab.akiba.llm.tool.core.detectWorkerServerPort
+import org.iotsplab.akiba.utils.AkibaJson
 
 // ============================================================
 //  UserChoiceManager — in-process "ask the user to pick one" gate
@@ -338,7 +338,7 @@ fun requestChoiceViaHttp(
     btwHandler: ((String) -> String)? = null,
     btwHistoryOut: MutableList<BtwQA>? = null
 ): String? {
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
     var pendingBtwId: String? = null
     var pendingBtwAnswer: String? = null
 
@@ -461,7 +461,7 @@ fun AskUserChoiceTool(
         )
     )
 ) { args ->
-    val mapper = jacksonObjectMapper()
+    val mapper = AkibaJson.mapper
     val question = (args["question"] as? String)?.trim()
         ?: return@Tool "Error: 'question' parameter is required"
     if (question.isEmpty()) {

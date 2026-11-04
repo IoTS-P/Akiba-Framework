@@ -1,6 +1,5 @@
 package org.iotsplab.akiba.llm.tool.coordination
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.llm.agent.core.SYSTEM_SESSION_UUID
 import org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxService
@@ -16,12 +15,13 @@ import org.iotsplab.akiba.llm.agent.mailbox.WakeConditionRegistry
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolDedupStrategy
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
+import org.iotsplab.akiba.utils.AkibaJson
 
 // ============================================================
 //  AgentMailboxTools — inter-agent mailbox / artifact tools
 // ============================================================
 
-private val toolMapper = jacksonObjectMapper()
+private val toolMapper = AkibaJson.mapper
 
 /**
  * Parse a tool argument as [Long], accepting BOTH JSON strings and JSON
@@ -95,20 +95,6 @@ fun AgentMailboxTools(
     AwaitConditionTool(mailboxService, callerSessionId),
     PublishAgentArtifactTool(mailboxService, callerSessionId),
     ReadAgentArtifactTool(mailboxService, callerSessionId),
-)
-
-/** Build only the message tools (no artifact publishing). */
-fun AgentMessageTools(
-    mailboxService: AgentMailboxService,
-    callerSessionId: String?,
-): List<Tool> = listOf(
-    SendAgentMessageTool(mailboxService, callerSessionId),
-    ReadAgentMessagesTool(mailboxService, callerSessionId),
-    AckAgentMessageTool(mailboxService, callerSessionId),
-    CloseConversationTool(mailboxService, callerSessionId),
-    QueryConversationTool(mailboxService, callerSessionId),
-    QueryConversationsTool(mailboxService, callerSessionId),
-    AwaitConditionTool(mailboxService, callerSessionId),
 )
 
 // ============================================================

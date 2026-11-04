@@ -1,7 +1,6 @@
 package org.iotsplab.akiba.llm.skill
 
 import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -9,9 +8,10 @@ import java.util.zip.ZipInputStream
 import kotlin.io.path.exists
 import kotlin.io.path.isDirectory
 import kotlin.io.path.isRegularFile
+import org.iotsplab.akiba.utils.AkibaJson
 
 object SkillManager {
-    private val mapper = jacksonObjectMapper()
+    private val mapper = AkibaJson.mapper
     private val root: Path = Path.of(System.getProperty("user.home"), ".akiba", "skills")
 
     private const val MAX_ZIP_BYTES = 50L * 1024 * 1024
