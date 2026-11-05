@@ -19,7 +19,6 @@ import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 import org.iotsplab.akiba.managers.WorkspaceManager.languageProvider
 import org.iotsplab.akiba.managers.WorkspaceManager.project
 import org.iotsplab.akiba.utils.ProgressReporter
-import org.iotsplab.akiba.utils.AkibaJson
 
 object ImportManager {
     private val db: DatabaseClient get() = DatabaseClient.global!!
@@ -154,8 +153,9 @@ object ImportManager {
      * binaries that are produced/discovered by a module while it is analyzing another binary.
      *
      * @param originalPath Absolute path to the source file. The file MUST already exist.
-     * @param arch         Optional language hint. If null, Ghidra format auto-detection is
-     *                     attempted first, then language guessing if that fails.
+     * @param arch         Optional language hint recorded as-is. When null the binary is
+     *                     registered without a language and the architecture-identification
+     *                     module settles it later.
      * @param sourceId     Provenance: id of the binary being analyzed when this file is being
      *                     imported. `null` for top-level imports done by [import].
      * @param sourceModule Provenance: simple class name of the importing [AkibaModule]. `null`
@@ -192,88 +192,23 @@ object ImportManager {
             return importArchiveAsRawBinary(originalPath, originalChecksum, sourceId, sourceModule)
         }
 
-        // If Ghidra can automatically detect the file format, import directly and insert it to database
-        ProgramManager.tryCreateProgramWithAutoDetect(project, originalPath)?.let {
-            // Ghidra successfully identified the binary format, import directly.
-            // Auto-analyze BEFORE saving: without analysis the program's
-            // function manager is empty and every downstream function
-            // lookup (JNI exports, decompile, xrefs, script_library runs)
-            // comes up empty.  Symmetric with the arch-specified path below.
-            autoAnalyzeInTimeout(it, mainConf.autoAnalysisTimeout)
-            val id = db.insertBinary(
-                DatabaseClient.InsertData(
-                    originalPath = originalPath.absolutePathString(),
-                    processedPath = null,
-                    checksum = originalChecksum,
-                    processedChecksum = null,
-                    size = originalPath.fileSize(),
-                    processedSize = -1,
-                    loadProperties = null,
-                    arch = it.languageID.idAsString,
-                    format = it.executableFormat,
-                    compilerSpec = it.compiler,
-                    sourceId = sourceId,
-                    sourceModule = sourceModule,
-                )
+        // Registration only: checksum, size, a copy under the workspace, and a
+        // row with no language.  Loading the file into Ghidra and settling its
+        // architecture is the expensive half of the old import, and it now
+        // belongs to the architecture-identification module, so a bulk import
+        // costs one MD5 and one file copy per file.
+        val id = db.insertBinary(
+            DatabaseClient.InsertData(
+                originalPath = originalPath.absolutePathString(),
+                checksum = originalChecksum,
+                size = originalPath.fileSize(),
+                arch = arch?.languageID?.toString(),
+                sourceId = sourceId,
+                sourceModule = sourceModule,
             )
-            originalPath.copyTo(WorkspaceManager.binaryPath.resolve("$id.bin"), overwrite = true)
-
-            val txId = it.startTransaction("rename")
-            it.name = "$id-${originalPath.fileName}"
-            it.endTransaction(txId, true)
-            project.saveAs(it, "/", it.name, false)
-            project.close(it)
-            return id
-        }
-
-        // Preprocess binaries, now only contains removing unnecessary continuous \x00 segments
-        val preprocessed: Pair<Path, List<FileSegment>>? = preprocessFile(originalPath)
-        val program: Program? = arch?.let {
-            val prog = ProgramManager.loadProgram(
-                originalPath,
-                project,
-                languageProvider.getLanguage(it.languageID)
-            )
-            prog?.let { p -> autoAnalyzeInTimeout(p, mainConf.autoAnalysisTimeout) }
-            prog
-        } ?: ProgramManager.tryCreateProgramWithoutLang(
-            project = project,
-            path = preprocessed?.first ?: originalPath,
-            loadProperties = preprocessed?.second ?: listOf()
-        ) ?: run {
-            globalLogger.warn("Failed to guess language: $originalPath")
-            null
-        }
-
-        // If no arch is specified, try to guess its arch, if no arch matched, use 'n/a'
-        val resolvedArch = arch?.languageID?.toString() ?: program?.languageID?.toString() ?: "n/a"
-
-        val id = db.insertBinary(DatabaseClient.InsertData(
-            originalPath = originalPath.absolutePathString(),
-            processedPath = preprocessed?.first?.absolutePathString(),
-            checksum = originalChecksum,
-            processedChecksum = preprocessed?.let { ProgramManager.getFileMD5Checksum(it.first) },
-            size = originalPath.fileSize(),
-            processedSize = preprocessed?.first?.fileSize() ?: -1,
-            loadProperties = preprocessed?.let { AkibaJson.mapper.writeValueAsString(it.second) },
-            arch = resolvedArch,
-            format = program?.executableFormat ?: "n/a",
-            compilerSpec = program?.compiler ?: "n/a",
-            sourceId = sourceId,
-            sourceModule = sourceModule,
-        ))
+        )
         originalPath.copyTo(
             WorkspaceManager.binaryPath.resolve("$id.bin"), overwrite = true)
-        preprocessed?.first?.moveTo(
-            WorkspaceManager.processedBinaryPath.resolve("$id.bin"), overwrite = true)
-
-        program?.let {
-            val txId = it.startTransaction("rename")
-            it.name = "$id-${originalPath.fileName}"
-            it.endTransaction(txId, true)
-            project.saveAs(it, "/", it.name, false)
-            project.close(program)
-        }
 
         return id
     }
