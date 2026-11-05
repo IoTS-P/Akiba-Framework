@@ -109,14 +109,6 @@ fun ApplicationCall.currentUsernameOrDefault(): String =
         "Authentication required: this endpoint needs a signed-in user"
     )
 
-/** Whether the authenticated caller is an administrator. */
-fun ApplicationCall.currentUserIsAdmin(): Boolean {
-    val authHeader = request.header("Authorization") ?: return false
-    if (!authHeader.startsWith("Bearer ")) return false
-    val session = JwtService.validateToken(authHeader.substring(7)) ?: return false
-    return UserDao.getUserById(session.userId)?.isAdmin == true
-}
-
 /** Safely-mapped current username that is always safe to embed into a path segment. */
 fun ApplicationCall.currentSafeUsername(): String = safePathSegment(currentUsernameOrDefault())
 

@@ -94,10 +94,20 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
             val importJson = mapper.writeValueAsString(mapOf("entries" to entries))
             Files.writeString(uploadDir.resolve("import.json"), importJson)
 
-            // 3. Create config.json (the -c file)
+            // 3. Create config.json (the -c file). The worker authenticates as
+            // the operator's cached daemon identity: there is exactly one, and
+            // it carries a derived secret rather than the account password, so
+            // no credential has to be written into this file.
+            val identity = DaemonIdentities.current()
+            if (identity == null) {
+                Files.deleteIfExists(uploadDir)
+                call.respond(HttpStatusCode.Unauthorized,
+                    mapOf("error" to "Sign in before importing files"))
+                return@post
+            }
             val config = mapOf(
-                "username" to (call.parameters["username"] ?: "akiba"),
-                "password" to "akiba",
+                "username" to identity.username,
+                "password" to identity.secret,
                 "usingInstance" to instance,
                 "general" to mapOf(
                     "importRoot" to "/tmp/akiba_upload_$taskId/"

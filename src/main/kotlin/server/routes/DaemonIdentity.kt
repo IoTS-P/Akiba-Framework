@@ -70,69 +70,14 @@ object DaemonIdentities {
         logger.info("Invalidated cached daemon identity for '$username'")
     }
 
-    fun registeredUsers(): Set<String> = byUser.keys.toSet()
-
-    /** Names of the instances known to belong to [username]. */
-    fun instancesOf(username: String): List<String> =
-        ownerByInstance.entries.filter { it.value == username }.map { it.key }
-}
-
-/**
- * Apply a new password to an existing daemon credential, on behalf of an
- * administrator.
- *
- * Signing in as the administrator yields a token, and the daemon only accepts
- * this operation from an administrator token — which is why the admin's own
- * [DaemonIdentity] (established at their sign-in) is required here.
- *
- * @throws DatabaseClient.DatabaseDaemonException when the daemon refuses (for
- *         instance, when the administrator's own credential is not flagged as an
- *         administrator in the daemon's store).
- */
-fun applyDaemonPassword(
-    daemonHost: String,
-    daemonPort: Int,
-    admin: DaemonIdentity,
-    username: String,
-    newPassword: String,
-) {
-    val client = DatabaseClient(daemonHost, daemonPort)
-    try {
-        client.login(admin.username, admin.secret)
-        val updated = client.setUserPassword(username, newPassword)
-        if (!updated) {
-            // The daemon has no record of the account yet (for example an account
-            // that never signed in). Creating it is the correct repair.
-            client.registerUser(username, newPassword, isAdmin = false)
-        }
-    } finally {
-        runCatching { client.logout() }
-    }
-}
-
-/**
- * Lift an account's brute-force lock on the daemon side.
- *
- * The daemon keeps its own credentials and its own failure counters (see
- * `UserStore.login`), so the framework's administrator action has to be mirrored
- * here — otherwise an account unlocked on the web would still be refused by the
- * daemon for the rest of the lock window.
- *
- * @throws DatabaseClient.DatabaseDaemonException when the daemon refuses.
- */
-fun applyDaemonUnlock(
-    daemonHost: String,
-    daemonPort: Int,
-    admin: DaemonIdentity,
-    username: String,
-) {
-    val client = DatabaseClient(daemonHost, daemonPort)
-    try {
-        client.login(admin.username, admin.secret)
-        client.unlockUser(username)
-    } finally {
-        runCatching { client.logout() }
-    }
+    /**
+     * The operator's identity.
+     *
+     * Akiba serves exactly one operator, so "whose credential is this?" has a
+     * single answer; callers that used to resolve it from a username read it
+     * here instead.
+     */
+    fun current(): DaemonIdentity? = byUser.values.firstOrNull()
 }
 
 private val reconcileScope = CoroutineScope(Dispatchers.IO)
