@@ -6,6 +6,7 @@ import org.iotsplab.akiba.llm.tool.analysis.ListModulesTool
 import org.iotsplab.akiba.llm.tool.analysis.QueryGhidraAPITool
 import org.iotsplab.akiba.llm.tool.analysis.QueryModuleDataTool
 import org.iotsplab.akiba.llm.tool.analysis.ReadSkillTool
+import org.iotsplab.akiba.llm.tool.analysis.IdentifyArchitectureTool
 import org.iotsplab.akiba.llm.tool.analysis.RunModuleTool
 import org.iotsplab.akiba.llm.tool.analysis.RunScriptTool
 import org.iotsplab.akiba.llm.tool.analysis.ScriptLibraryTool
@@ -48,6 +49,7 @@ object BuiltInTools {
      */
     fun all(parent: AgentModule, agentDbClient: AgentDatabaseClient, username: String? = null): List<Tool> = listOf(
         RunModuleTool(parent),
+        IdentifyArchitectureTool(parent),
         SpawnSubAgentTool(parent, agentDbClient),
         ListSubAgentsTool(parent, agentDbClient),
         AwaitMultipleChildrenTool(parent, agentDbClient),

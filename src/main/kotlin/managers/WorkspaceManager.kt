@@ -489,7 +489,15 @@ object WorkspaceManager: Closeable {
 
     fun ensureProgramForBinary(dbClient: DatabaseClient, binaryId: Int): ghidra.program.model.listing.Program? {
         if (!::binaryPath.isInitialized || !::processedBinaryPath.isInitialized) initBinDirectories()
-        dbClient.getMetadata(binaryId.toLong())
+        val metadata = dbClient.getMetadata(binaryId.toLong())
+        // Import no longer identifies architecture, so a fresh binary has none.
+        // Saying so beats opening a program in a guessed language.
+        if (metadata.arch.isNullOrBlank()) {
+            throw IllegalStateException(
+                "Binary #$binaryId has no architecture yet. Run the `identify_architecture` " +
+                    "tool (module org.iotsplab.akiba.process.AkibaArch) before analysing it."
+            )
+        }
         val path = processedBinaryPath.resolve("$binaryId.bin").let {
             if (it.exists()) it else binaryPath.resolve("$binaryId.bin")
         }
