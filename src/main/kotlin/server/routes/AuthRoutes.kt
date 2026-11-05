@@ -34,7 +34,7 @@ data class SetupStatusResponse(val needsSetup: Boolean, val userCount: Int)
  * container start any more, because credentials that ship in an image are
  * credentials everybody knows. The first visit shows a setup form
  * ([POST /auth/setup]) that creates the first administrator; once an account
- * exists setup is closed and further accounts come from [adminRoutes].
+ * exists setup is closed.
  *
  * Sign-in also establishes the daemon identity: password verification stays
  * here (bcrypt in the `users` table), but the user is additionally verified

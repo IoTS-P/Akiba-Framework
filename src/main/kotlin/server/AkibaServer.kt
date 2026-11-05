@@ -29,7 +29,6 @@ import org.iotsplab.akiba.llm.agent.stream.StreamingChunkPusher
 import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.server.db.ServerDatabase
 import org.iotsplab.akiba.server.db.ServerDbConfig
-import org.iotsplab.akiba.server.routes.adminRoutes
 import org.iotsplab.akiba.server.routes.agentRoutes
 import org.iotsplab.akiba.server.routes.authRoutes
 import org.iotsplab.akiba.server.routes.fileRoutes
@@ -167,7 +166,6 @@ object AkibaServer {
                     }
 
                     authRoutes(config.daemonHost, config.daemonPort)
-                    adminRoutes(config.daemonHost, config.daemonPort)
                     instanceRoutes(config.daemonHost, config.daemonPort)
                     fileRoutes(config.daemonHost, config.daemonPort)
                     workflowRoutes(config.daemonHost, config.daemonPort)
