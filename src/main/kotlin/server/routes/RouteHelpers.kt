@@ -113,34 +113,24 @@ fun ApplicationCall.currentUsernameOrDefault(): String =
 fun ApplicationCall.currentSafeUsername(): String = safePathSegment(currentUsernameOrDefault())
 
 /**
- * Absolute directory under `ghidra_projects/<username>/` that is the per-user
- * Ghidra project root. This is independent of the global `projectConf.projectRoot`
- * because each user gets an isolated directory tree for their projects.
+ * `ghidra_projects/` — the Ghidra project root.
+ *
+ * Akiba serves one operator, so the tree has no per-user level: a project name
+ * is unique on its own.
  */
-fun ApplicationCall.currentUserGhidraProjectsRoot(): Path {
-    val username = currentSafeUsername()
-    return Path.of("ghidra_projects", username).toAbsolutePath().normalize()
-}
+fun ApplicationCall.currentUserGhidraProjectsRoot(): Path =
+    Path.of("ghidra_projects").toAbsolutePath().normalize()
 
-/** `~/.akiba/logs/<username>/` — fixed per-user logs directory. */
-fun ApplicationCall.currentUserLogsRoot(): Path {
-    val username = currentSafeUsername()
-    return Path.of(System.getProperty("user.home"), ".akiba", "logs", username)
-        .toAbsolutePath()
-        .normalize()
-}
+/** `~/.akiba/logs/` — where task logs live. */
+fun ApplicationCall.currentUserLogsRoot(): Path =
+    Path.of(System.getProperty("user.home"), ".akiba", "logs").toAbsolutePath().normalize()
 
-/** `~/.akiba/workspace/<username>/` — fixed per-user workspace directory. */
-fun ApplicationCall.currentUserWorkspaceRoot(): Path {
-    val username = currentSafeUsername()
-    return Path.of(System.getProperty("user.home"), ".akiba", "workspace", username)
-        .toAbsolutePath()
-        .normalize()
-}
+/** `~/.akiba/workspace/` — scratch space of the running tasks. */
+fun ApplicationCall.currentUserWorkspaceRoot(): Path =
+    Path.of(System.getProperty("user.home"), ".akiba", "workspace").toAbsolutePath().normalize()
 
-/** Directory name under the configured Ghidra project root for this request's user. */
-fun ApplicationCall.currentUserProjectDirectory(): Path =
-    Path.of(currentSafeUsername())
+/** Directory inside the Ghidra project root; the root itself with one operator. */
+fun ApplicationCall.currentUserProjectDirectory(): Path = Path.of("")
 
 private fun safePathSegment(value: String): String =
     value.replace(Regex("[^A-Za-z0-9._-]+"), "_")

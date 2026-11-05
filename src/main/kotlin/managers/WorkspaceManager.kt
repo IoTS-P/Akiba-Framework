@@ -318,9 +318,8 @@ object WorkspaceManager: Closeable {
         val resolvedRoot = if (mainConf.binariesRoot.isNotBlank()) {
             mainConf.binariesRoot
         } else {
-            val user = config.username ?: "default"
             val instance = config.usingInstance ?: "default"
-            "${System.getProperty("user.home")}/.akiba/binaries/$user/$instance"
+            "${System.getProperty("user.home")}/.akiba/binaries/$instance"
         }
         // Store the resolved root back so other code can use it consistently
         mainConf.binariesRoot = resolvedRoot

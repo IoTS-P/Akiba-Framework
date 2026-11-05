@@ -1014,9 +1014,8 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             // binaryRoot mirrors WorkspaceManager.initBinaryPaths' auto-compute
             // default so newly-imported binaries land next to those imported
             // via the regular /files/import subprocess.
-            val username = call.currentSafeUsername()
             val binaryRoot = Path.of(
-                System.getProperty("user.home"), ".akiba", "binaries", username, instance, "original"
+                System.getProperty("user.home"), ".akiba", "binaries", instance, "original"
             )
 
             val result = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
