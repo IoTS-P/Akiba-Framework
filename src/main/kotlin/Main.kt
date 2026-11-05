@@ -25,6 +25,7 @@ import sun.misc.Signal
         StartInstance::class,
         ShutdownInstance::class,
         ListInstances::class,
+        IdentifyArchCommand::class,
         ServerCommand::class,
         MeltdownCommand::class
     ]
