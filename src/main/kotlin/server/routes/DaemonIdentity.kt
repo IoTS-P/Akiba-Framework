@@ -80,8 +80,35 @@ object DaemonIdentities {
     fun current(): DaemonIdentity? = byUser.values.firstOrNull()
 }
 
-private val reconcileScope = CoroutineScope(Dispatchers.IO)
+/**
+ * Write the operator's new password into the daemon's credential store.
+ *
+ * The two stores answer different questions — the framework decides who may
+ * open the UI, the daemon decides who may touch an instance — but with a single
+ * operator they must agree: otherwise the next sign-in verifies locally and
+ * then fails on the first instance operation.
+ *
+ * @throws DatabaseClient.DatabaseDaemonException when the daemon refuses.
+ */
+fun syncDaemonPassword(daemonHost: String, daemonPort: Int, newPassword: String) {
+    val identity = DaemonIdentities.current()
+        ?: throw IllegalStateException(
+            "No daemon identity cached: sign in again before changing the password"
+        )
+    val client = DatabaseClient(daemonHost, daemonPort)
+    try {
+        client.login(identity.username, identity.secret)
+        if (!client.setUserPassword(identity.username, newPassword)) {
+            throw IllegalStateException(
+                "The daemon has no credential for '${identity.username}'"
+            )
+        }
+    } finally {
+        runCatching { client.logout() }
+    }
+}
 
+private val reconcileScope = CoroutineScope(Dispatchers.IO)
 /**
  * Best-effort agent-session reconciliation for [instances], run in the
  * background right after a successful sign-in.

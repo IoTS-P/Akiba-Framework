@@ -153,6 +153,10 @@ fun Route.authRoutes(daemonHost: String, daemonPort: Int) {
                 return@post
             }
             UserDao.setPassword(user.id, req.newPassword)
+            // The daemon keeps its own credential store, so the operator's new
+            // password has to be written there too — otherwise the next sign-in
+            // verifies locally but the daemon still holds the old secret.
+            syncDaemonPassword(daemonHost, daemonPort, req.newPassword)
             // The daemon authenticates with the password it was given at
             // sign-in, so a changed password needs a fresh identity here too.
             establishDaemonIdentity(
