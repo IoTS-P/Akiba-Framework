@@ -3,6 +3,7 @@ package org.iotsplab.akiba.subcommands
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
+import org.iotsplab.akiba.utils.ADMIN_USERNAME
 import org.iotsplab.akiba.utils.Configs
 import org.iotsplab.akiba.utils.SqlSource
 import picocli.CommandLine
@@ -22,10 +23,9 @@ object RestoreInstance: Runnable {
 
     @CommandLine.Option(
         names = ["-u", "--user"],
-        description = ["User name of akiba"],
-        required = true
+        description = ["Operator account name (defaults to admin)"]
     )
-    lateinit var user: String
+    var user: String = ADMIN_USERNAME
 
     @CommandLine.Option(
         names = ["-P", "--password"],

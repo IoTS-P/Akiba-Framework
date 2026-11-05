@@ -10,6 +10,7 @@ import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.server.db.UserDao
 import org.iotsplab.akiba.server.security.JwtService
 import org.iotsplab.akiba.server.security.LoginProtection
+import org.iotsplab.akiba.utils.ADMIN_USERNAME
 
 private val logger: Logger = LogManager.getLogger("AuthRoutes")
 
@@ -20,15 +21,6 @@ data class ChangePasswordRequest(val currentPassword: String, val newPassword: S
 data class AuthResponse(val token: String, val username: String)
 data class MessageResponse(val message: String)
 data class SetupStatusResponse(val needsSetup: Boolean)
-
-/**
- * The single operator account.
- *
- * Akiba has no user management: one password guards the deployment, and the
- * row behind it is always this name. Setup sets the password the first time,
- * `POST /auth/password` changes it later.
- */
-const val ADMIN_USERNAME = "admin"
 
 /**
  * Authentication routes.

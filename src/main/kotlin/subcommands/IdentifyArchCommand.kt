@@ -7,6 +7,7 @@ import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.managers.WorkspaceManager.globalLogger
 import org.iotsplab.akiba.module.AkibaModule
+import org.iotsplab.akiba.utils.ADMIN_USERNAME
 import org.iotsplab.akiba.utils.Configs
 import org.iotsplab.akiba.utils.SqlSource
 import picocli.CommandLine
@@ -34,8 +35,11 @@ object IdentifyArchCommand : Runnable {
     @CommandLine.Option(names = ["-p", "--port"], description = ["Port of the database daemon"])
     var port: Int = 31777
 
-    @CommandLine.Option(names = ["-u", "--user"], description = ["User name of akiba"], required = true)
-    lateinit var user: String
+    @CommandLine.Option(
+        names = ["-u", "--user"],
+        description = ["Operator account name (defaults to admin)"]
+    )
+    var user: String = ADMIN_USERNAME
 
     @CommandLine.Option(names = ["-P", "--password"], description = ["Password of the user"])
     var password: String? = null
