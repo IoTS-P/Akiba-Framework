@@ -1173,7 +1173,8 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                         workerConfig = workerConfig,
                         serverPort = serverPort,
                         token = token,
-                        sessionInfo = sessionInfo
+                        sessionInfo = sessionInfo,
+                        instance = instance
                     )
                 } else {
                     ProjectLock.asOwner(lockedProject, projectDirectory, sessionInfo.sessionId, instance) {
@@ -1181,7 +1182,8 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                             workerConfig = workerConfig,
                             serverPort = serverPort,
                             token = token,
-                            sessionInfo = sessionInfo
+                            sessionInfo = sessionInfo,
+                            instance = instance
                         )
                     }
                 }
@@ -2173,7 +2175,8 @@ private fun runManualAgentWorker(
     workerConfig: ManualAgentWorkerConfig,
     serverPort: Int,
     token: String,
-    sessionInfo: SessionInfo
+    sessionInfo: SessionInfo,
+    instance: String
 ) {
     val scriptPath = findAkibaScriptForAgent()
     val pb = ProcessBuilder(scriptPath, "-c", "${workerConfig.file}@/main")
@@ -2185,6 +2188,7 @@ private fun runManualAgentWorker(
     agentRouteLogger.info("Manual worker for {} will call back on port {}", sessionInfo.sessionId, serverPort)
     env["AKIBA_MANUAL_AGENT_SERVER_PORT"] = serverPort.toString()
     env["AKIBA_MANUAL_AGENT_SESSION_ID"] = sessionInfo.sessionId
+    env["AKIBA_MANUAL_AGENT_INSTANCE"] = instance
     sessionInfo.projectName?.let { env["AKIBA_MANUAL_AGENT_PROJECT_NAME"] = it }
     pb.redirectErrorStream(true)
     val logFile = Files.createTempFile("akiba-manual-agent-${sessionInfo.sessionId.take(8)}-", ".log")

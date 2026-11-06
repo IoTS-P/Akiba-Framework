@@ -54,9 +54,17 @@ object StreamingChunkPusher {
                     }
                     inFlightSends.incrementAndGet()
                     try {
-                        httpClient.send(request, HttpResponse.BodyHandlers.discarding())
+                        val response = httpClient.send(request, HttpResponse.BodyHandlers.discarding())
+                        if (response.statusCode() !in 200..299) {
+                            // A rejected push used to be invisible: the UI simply
+                            // stopped streaming, with no error anywhere.
+                            logger.warn(
+                                "stream-chunk POST rejected: HTTP {} ({})",
+                                response.statusCode(), response.uri().path
+                            )
+                        }
                     } catch (e: Exception) {
-                        logger.debug("stream-chunk POST failed: ${e.message}")
+                        logger.warn("stream-chunk POST failed: ${e.message}")
                     } finally {
                         inFlightSends.decrementAndGet()
                     }
@@ -193,11 +201,20 @@ object StreamingChunkPusher {
                     "error" to error,
                 )
             )
-            val request = HttpRequest.newBuilder()
+            // The receiving route authenticates like any other: the manual
+            // worker must present its own token and instance name, otherwise
+            // every chunk was answered 401 and the chat never streamed.
+            val resolvedInstance = instanceName
+                ?: System.getenv("AKIBA_MANUAL_AGENT_INSTANCE")?.takeIf { it.isNotBlank() }
+                ?: "akiba-instance"
+            val token = System.getenv("AKIBA_MANUAL_AGENT_TOKEN")?.takeIf { it.isNotBlank() }
+            val builder = HttpRequest.newBuilder()
                 .uri(URI.create("http://127.0.0.1:$port/api/agent/internal/stream-chunk"))
                 .header("Content-Type", "application/json")
-                .header("X-Akiba-Instance", instanceName ?: "akiba-instance")
+                .header("X-Akiba-Instance", resolvedInstance)
                 .timeout(Duration.ofSeconds(2))
+            if (token != null) builder.header("Authorization", "Bearer $token")
+            val request = builder
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build()
             ensureSenderThread()
