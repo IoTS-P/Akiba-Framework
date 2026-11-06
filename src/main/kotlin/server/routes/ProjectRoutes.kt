@@ -19,6 +19,7 @@ import io.ktor.http.content.PartData
 import io.ktor.http.content.forEachPart
 import io.ktor.http.content.streamProvider
 import io.ktor.server.application.*
+import io.ktor.server.request.receive
 import io.ktor.server.request.receiveMultipart
 import io.ktor.server.request.receiveText
 import io.ktor.server.response.*
@@ -41,6 +42,7 @@ import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.managers.GarImporter
+import org.iotsplab.akiba.managers.ProjectPrograms
 import org.iotsplab.akiba.managers.WorkspaceManager
 
 data class GhidraProjectInfo(
@@ -121,6 +123,13 @@ private data class ProjectTextExportOptions(
  * operations under `ghidra_projects/<username>/` and do **not** require a
  * running akiba_db_daemon instance.
  */
+/** Body of `POST /projects/{name}/programs/copy`. */
+data class CopyProgramRequest(
+    val fromProject: String,
+    val programName: String,
+    val asName: String? = null,
+)
+
 fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
 
     val logger: Logger = LogManager.getLogger("ProjectRoutes")
@@ -509,6 +518,51 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
      * session that fails mid-export yields a small `.error.txt` entry instead
      * of aborting the whole archive.
      */
+    /**
+     * Copy a program from another project into this one.
+     *
+     * Copying duplicates the Ghidra domain file: the two projects diverge from
+     * that moment on, which is why this is an explicit operator action rather
+     * than something a background task does.
+     */
+    post("/projects/{name}/programs/copy") {
+        val targetProject = call.parameters["name"]
+            ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
+        if (!isValidProjectName(targetProject)) {
+            return@post call.respond(
+                HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name: $targetProject"))
+        }
+        val req = call.receive<CopyProgramRequest>()
+        if (!isValidProjectName(req.fromProject)) {
+            return@post call.respond(
+                HttpStatusCode.BadRequest, mapOf("error" to "Invalid source project: ${req.fromProject}"))
+        }
+        if (req.programName.isBlank()) {
+            return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing program name"))
+        }
+
+        try {
+            val outcome = ProjectPrograms.copy(
+                sourceProject = req.fromProject,
+                programName = req.programName,
+                targetProject = targetProject,
+                projectDirectory = call.currentUserGhidraProjectsRoot(),
+                asName = req.asName,
+            )
+            call.respond(mapOf(
+                "source" to outcome.source,
+                "target" to outcome.target,
+                "program" to outcome.program,
+                "targetFile" to outcome.targetFile,
+            ))
+        } catch (e: IllegalArgumentException) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Copy failed")))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
     post("/projects/{name}/export_sessions") {
         val projectName = call.parameters["name"]
             ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
