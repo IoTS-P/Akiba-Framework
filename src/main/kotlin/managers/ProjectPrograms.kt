@@ -23,6 +23,67 @@ object ProjectPrograms {
 
     data class CopyOutcome(val source: String, val program: String, val target: String, val targetFile: String)
 
+    data class ImportOutcome(val program: String, val folder: String)
+
+    /**
+     * Import a binary file into a folder of a project.
+     *
+     * Missing parent folders are created on the way. The program is saved
+     * under [asName], or under the source file name when no name is given.
+     *
+     * @param source absolute path of the binary to import
+     * @param folder `/`-separated target folder, relative to the project root
+     * @throws ProjectBusyException when the project is open elsewhere
+     * @throws IllegalArgumentException when the file is missing or the name is taken
+     */
+    fun importProgram(
+        projectName: String,
+        projectDirectory: Path,
+        source: Path,
+        folder: String = "",
+        asName: String? = null,
+    ): ImportOutcome {
+        require(Files.isRegularFile(source)) { "Binary file '${source.fileName}' is missing" }
+        requireExists(projectDirectory, projectName)
+
+        var project: GhidraProject? = null
+        val outcome = try {
+            project = open(projectName, projectDirectory)
+            val target = ensureFolder(project.projectData.rootFolder, folder)
+            val name = asName?.takeIf { it.isNotBlank() } ?: source.fileName.toString()
+            require(target.getFile(name) == null && target.getFolder(name) == null) {
+                "'$name' already exists in ${target.pathname}"
+            }
+
+            val program = ProgramManager.loadProgram(source, project)
+                ?: throw IllegalArgumentException("Ghidra could not import '${source.fileName}'")
+            try {
+                // The loader leaves the program unsaved; naming it first keeps
+                // the program and its domain file in step.
+                val txId = program.startTransaction("import")
+                try {
+                    program.name = name
+                } finally {
+                    program.endTransaction(txId, true)
+                }
+                project.saveAs(program, target.pathname, name, false)
+            } finally {
+                runCatching { project.close(program) }
+            }
+            logger.info(
+                "Imported binary '{}' into project '{}' as '{}'",
+                source.fileName, projectName, name
+            )
+            ImportOutcome(program = name, folder = target.pathname)
+        } finally {
+            runCatching { project?.close() }
+        }
+
+        // The handle is released, so the index can reopen the project itself.
+        ProjectIndex.refresh(projectName, projectDirectory)
+        return outcome
+    }
+
     /**
      * @param asName optional target name; Ghidra appends a suffix when the name is
      *        taken instead of overwriting, and the outcome reports what was written
@@ -173,6 +234,15 @@ object ProjectPrograms {
             acc.getFolder(segment) ?: throw IllegalArgumentException("Folder '$path' does not exist")
         }
     }
+
+    /** Like [resolveFolder], but creates missing segments instead of failing. */
+    private fun ensureFolder(root: DomainFolder, path: String): DomainFolder =
+        path.trim('/').split('/').filter { it.isNotBlank() }.fold(root) { acc, segment ->
+            acc.getFolder(segment) ?: run {
+                require(acc.getFile(segment) == null) { "'$segment' is a program, not a folder" }
+                acc.createFolder(segment)
+            }
+        }
 
     private fun resolveParent(root: DomainFolder, path: String): Pair<DomainFolder, String> {
         val segments = path.trim('/').split('/').filter { it.isNotBlank() }

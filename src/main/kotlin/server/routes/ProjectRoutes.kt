@@ -1,5 +1,6 @@
 package org.iotsplab.akiba.server.routes
 
+import com.fasterxml.jackson.core.JacksonException
 import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import generic.io.JarWriter
@@ -40,6 +41,7 @@ import kotlin.io.path.name
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
+import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.managers.GarImporter
 import org.iotsplab.akiba.managers.ProjectIndex
@@ -128,6 +130,13 @@ private data class ProjectTextExportOptions(
 data class CopyProgramRequest(
     val fromProject: String,
     val programName: String,
+    val asName: String? = null,
+)
+
+/** Body of `POST /projects/{name}/programs/import`. */
+data class ImportProgramRequest(
+    val binaryId: String,
+    val folder: String = "",
     val asName: String? = null,
 )
 
@@ -655,6 +664,71 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             ))
         } catch (e: IllegalArgumentException) {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Copy failed")))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    /**
+     * Import a binary registered in the selected instance into this project.
+     *
+     * The binary's stored copy (`<binariesRoot>/original/<id>.bin`) is loaded
+     * through Ghidra, saved into the requested folder and recorded in the
+     * project index. The instance is required: only its database knows which
+     * binary ids exist.
+     */
+    post("/projects/{name}/programs/import") {
+        val targetProject = call.parameters["name"]
+            ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
+        if (!isValidProjectName(targetProject)) {
+            return@post call.respond(
+                HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name: $targetProject"))
+        }
+        val instance = call.requireInstanceHeader() ?: return@post
+        val req = call.receive<ImportProgramRequest>()
+
+        try {
+            val binaryId = req.binaryId.trim().toLongOrNull()
+            require(binaryId != null && binaryId > 0) { "Invalid binary id: '${req.binaryId}'" }
+
+            // An unknown id comes back from the daemon as an empty object, which
+            // fails to deserialize — that is the "not in this instance" case.
+            val binary = try {
+                withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                    dbClient.getMetadata(binaryId)
+                }
+            } catch (e: DatabaseClient.DatabaseDaemonException) {
+                throw e
+            } catch (_: JacksonException) {
+                null
+            }
+            require(binary != null) { "Binary '$binaryId' is not in instance '$instance'" }
+
+            // Mirrors WorkspaceManager.initBinDirectories' auto-computed root.
+            val binaryFile = Path.of(
+                System.getProperty("user.home"), ".akiba", "binaries", instance, "original", "$binaryId.bin"
+            )
+            require(Files.isRegularFile(binaryFile)) {
+                "Binary '$binaryId' has no stored file in instance '$instance'"
+            }
+
+            val originalName = binary.originalPath.substringAfterLast('/')
+                .ifBlank { binaryFile.fileName.toString() }
+            val outcome = ProjectPrograms.importProgram(
+                projectName = targetProject,
+                projectDirectory = call.currentUserGhidraProjectsRoot(),
+                source = binaryFile,
+                folder = req.folder,
+                asName = req.asName?.takeIf { it.isNotBlank() } ?: originalName,
+            )
+            call.respond(mapOf(
+                "target" to targetProject,
+                "program" to outcome.program,
+                "folder" to outcome.folder,
+            ))
+        } catch (e: IllegalArgumentException) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Import failed")))
         } catch (e: Exception) {
             val (status, body) = errorPayload(e)
             call.respond(status, body)
