@@ -36,6 +36,7 @@ import org.iotsplab.akiba.llm.tool.ui.PendingChoiceSnapshot
 import org.iotsplab.akiba.llm.tool.ui.UserChoiceEvent
 import org.iotsplab.akiba.llm.tool.ui.UserChoiceManager
 import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.managers.ProjectLock
 import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import org.iotsplab.akiba.utils.AkibaJson
@@ -831,6 +832,9 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     resolvedProjectName = name
                     createNewProject = req.projectMode != "existing"
                     WorkspaceManager.openOrCreateInteractiveProject(name, createNewProject, projectDirectory)
+                    // Only create/validate here. Holding the project would lock the
+                    // worker out of the very project this session is about to use.
+                    WorkspaceManager.releaseActiveProject()
                 } else if (req.projectName != null && req.projectName.isNotBlank()) {
                     resolvedProjectName = req.projectName
                     createNewProject = req.projectMode == "new"
@@ -839,6 +843,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     WorkspaceManager.openOrCreateInteractiveProject(
                         req.projectName, createNewProject, projectDirectory
                     )
+                    WorkspaceManager.releaseActiveProject()
                 } else {
                     resolvedProjectName = null
                     createNewProject = false
@@ -1162,12 +1167,24 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             )
 
             try {
-                runManualAgentWorker(
-                    workerConfig = workerConfig,
-                    serverPort = serverPort,
-                    token = token,
-                    sessionInfo = sessionInfo
-                )
+                val lockedProject = sessionInfo.projectName?.takeIf { it.isNotBlank() }
+                if (lockedProject == null) {
+                    runManualAgentWorker(
+                        workerConfig = workerConfig,
+                        serverPort = serverPort,
+                        token = token,
+                        sessionInfo = sessionInfo
+                    )
+                } else {
+                    ProjectLock.asOwner(lockedProject, projectDirectory, sessionInfo.sessionId, instance) {
+                        runManualAgentWorker(
+                            workerConfig = workerConfig,
+                            serverPort = serverPort,
+                            token = token,
+                            sessionInfo = sessionInfo
+                        )
+                    }
+                }
             } finally {
                 ManualAgentTurnRegistry.remove(token)
                 runCatching { Files.deleteIfExists(workerConfig.file) }

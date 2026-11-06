@@ -27,6 +27,7 @@ import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.llm.agent.runtime.AgentSessionReconciler
 import org.iotsplab.akiba.llm.agent.stream.StreamingChunkPusher
 import org.iotsplab.akiba.managers.WorkspaceManager
+import org.iotsplab.akiba.managers.ProjectLock
 import org.iotsplab.akiba.server.db.ServerDatabase
 import org.iotsplab.akiba.server.db.ServerDbConfig
 import org.iotsplab.akiba.server.routes.agentRoutes
@@ -105,6 +106,12 @@ object AkibaServer {
         // Best-effort only — failures are logged and the server still
         // starts; [AgentWatchdog] + [OrphanReaper] catch what this misses.
         runStartupReconciliation(config)
+
+        // Drop project-owner notes left by a process that no longer exists. The
+        // Ghidra channel lock dies with that process; the note does not.
+        runCatching {
+            ProjectLock.sweepStaleOwners(java.nio.file.Path.of("ghidra_projects"))
+        }.onFailure { logger.warn("Project owner sweep failed: ${it.message}") }
 
         // ── JVM shutdown hook ─────────────────────────────────────────
         // Catches the SIGTERM case (entrypoint.sh's `cleanup` sends

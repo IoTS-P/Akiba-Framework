@@ -10,6 +10,7 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.Logger
+import org.iotsplab.akiba.managers.ProjectBusyException
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.server.db.UserDao
 import org.iotsplab.akiba.server.security.JwtService
@@ -307,11 +308,15 @@ fun instanceAccessProblem(call: ApplicationCall, instance: String): Pair<HttpSta
 fun errorPayload(e: Throwable): Pair<HttpStatusCode, Map<String, String?>> {
     val msg = e.message ?: e.javaClass.simpleName
     val dbEx = e as? DatabaseClient.DatabaseDaemonException
-    val status = dbEx?.statusCode ?: HttpStatusCode.InternalServerError
-    if (dbEx != null) {
-        logger.warn("Route error (HTTP ${status.value}): ${dbEx.message}", dbEx)
-    } else {
+    // A project held by another session is a conflict, not a server fault: the
+    // caller can retry later or pick another project.
+    val busy = e as? ProjectBusyException
+    val status = dbEx?.statusCode
+        ?: if (busy != null) HttpStatusCode.Conflict else HttpStatusCode.InternalServerError
+    if (status == HttpStatusCode.InternalServerError) {
         logger.error("Unexpected route error (HTTP 500): ${e.message}", e)
+    } else if (dbEx != null) {
+        logger.warn("Route error (HTTP ${status.value}): ${dbEx.message}", dbEx)
     }
     return status to mapOf("error" to msg)
 }
