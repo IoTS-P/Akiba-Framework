@@ -16,8 +16,10 @@ import org.iotsplab.akiba.utils.InternalToken
  * In-process workers publish straight to the bus; cross-process workers POST
  * to `http://127.0.0.1:$PORT/api/agent/internal/stream-chunk`, discovering the
  * port from env or the port file and authenticating with the shared secret in
- * [InternalToken.file].  Failures are dropped so a dead server never stalls
- * the consumer.
+ * [InternalToken.file].  Queued chunks are coalesced into ONE batched POST per
+ * drain (and that batch is retried once), because a per-token round-trip makes
+ * the tail of a fast response — including its `done` marker — lose the race
+ * with the worker's exit.
  */
 object StreamingChunkPusher {
 
@@ -27,15 +29,28 @@ object StreamingChunkPusher {
         .connectTimeout(Duration.ofSeconds(2))
         .build()
 
+    /** Chunks carried by one POST; keeps a burst to a single round-trip. */
+    private const val MAX_BATCH = 256
+
+    /** One queued chunk, in producer order. */
+    private data class Queued(
+        val sessionId: String,
+        val delta: String,
+        val chunkCount: Int,
+        val byteCount: Int,
+        val done: Boolean,
+        val error: String?,
+        val instanceName: String?,
+        val newGeneration: Boolean,
+    )
+
     /**
      * Serial sender queue for cross-process POSTs: chunks MUST reach
-     * the server in publish order (the poll endpoint only moves its
-     * `since` cursor forward, and a late generation-start chunk would
-     * wipe newer history).  Every request is funneled through a single
-     * daemon thread that sends them one at a time; `offer` never
-     * blocks the worker.
+     * the server in publish order (the bus appends in arrival order and
+     * the poller only moves its cursor forward).  Every batch is sent by
+     * a single daemon thread; `offer` never blocks the worker.
      */
-    private val sendQueue = java.util.concurrent.LinkedBlockingQueue<HttpRequest>()
+    private val sendQueue = java.util.concurrent.LinkedBlockingQueue<Queued>()
     private val inFlightSends = java.util.concurrent.atomic.AtomicInteger(0)
 
     @Volatile private var senderStarted = false
@@ -48,29 +63,105 @@ object StreamingChunkPusher {
             senderStarted = true
             Thread({
                 while (true) {
-                    val request = try {
+                    val first = try {
                         sendQueue.take()
                     } catch (_: InterruptedException) {
                         continue
                     }
+                    // Counted before the batch is assembled so `awaitQuiescence`
+                    // can never observe "queue empty, nothing in flight" while a
+                    // chunk sits in a local list.
                     inFlightSends.incrementAndGet()
                     try {
-                        val response = httpClient.send(request, HttpResponse.BodyHandlers.discarding())
-                        if (response.statusCode() !in 200..299) {
-                            // A rejected push used to be invisible: the UI simply
-                            // stopped streaming, with no error anywhere.
-                            logger.warn(
-                                "stream-chunk POST rejected: HTTP {} ({})",
-                                response.statusCode(), response.uri().path
-                            )
+                        val batch = ArrayList<Queued>(MAX_BATCH)
+                        batch.add(first)
+                        sendQueue.drainTo(batch, MAX_BATCH - 1)
+                        if (!sendBatch(batch)) {
+                            // One retry, then give up loudly: a rejected push
+                            // used to be invisible, and the UI simply stopped
+                            // streaming with no error anywhere.
+                            Thread.sleep(50)
+                            if (!sendBatch(batch)) {
+                                logger.warn(
+                                    "stream-chunk batch dropped after retry: {} chunk(s), session {}",
+                                    batch.size, batch.first().sessionId
+                                )
+                            }
                         }
-                    } catch (e: Exception) {
-                        logger.warn("stream-chunk POST failed: ${e.message}")
+                    } catch (e: InterruptedException) {
+                        logger.warn("stream-chunk sender interrupted: ${e.message}")
                     } finally {
                         inFlightSends.decrementAndGet()
                     }
                 }
             }, "stream-chunk-sender").apply { isDaemon = true; start() }
+        }
+    }
+
+    /** POST one batch; false on any transport failure or non-2xx answer. */
+    private fun sendBatch(batch: List<Queued>): Boolean {
+        val port = serverPort() ?: run {
+            // The server port vanished (in-process publish is handled by
+            // [publish]); keep the batch rather than dropping it silently.
+            logger.debug("stream-chunk batch held: server port unavailable")
+            return true
+        }
+        val body = try {
+            mapper.writeValueAsString(
+                mapOf(
+                    "sessionId" to batch.first().sessionId,
+                    "chunks" to batch.map { c ->
+                        mapOf(
+                            "sessionId" to c.sessionId,
+                            "delta" to c.delta,
+                            "chunkCount" to c.chunkCount,
+                            "byteCount" to c.byteCount,
+                            "done" to c.done,
+                            "error" to c.error,
+                            "newGeneration" to c.newGeneration,
+                        )
+                    },
+                )
+            )
+        } catch (e: Exception) {
+            logger.warn("stream-chunk batch could not be serialised: ${e.message}")
+            return true
+        }
+        // The receiving route accepts the shared secret from
+        // ~/.akiba/akiba_internal.token instead of a user JWT: a worker
+        // JVM has no session of its own, and environment variables only
+        // reach workers the server spawned directly.
+        val resolvedInstance = batch.firstOrNull { it.instanceName != null }?.instanceName
+            ?: System.getenv("AKIBA_MANUAL_AGENT_INSTANCE")?.takeIf { it.isNotBlank() }
+            ?: "akiba-instance"
+        val builder = HttpRequest.newBuilder()
+            .uri(URI.create("http://127.0.0.1:$port/api/agent/internal/stream-chunk"))
+            .header("Content-Type", "application/json")
+            .header("X-Akiba-Instance", resolvedInstance)
+            .timeout(Duration.ofSeconds(5))
+        val token = internalToken()
+        if (token != null) {
+            builder.header(InternalToken.HEADER, token)
+        } else {
+            warnMissingTokenOnce()
+        }
+        return try {
+            val request = builder
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build()
+            val response = httpClient.send(request, HttpResponse.BodyHandlers.discarding())
+            if (response.statusCode() !in 200..299) {
+                logger.warn(
+                    "stream-chunk POST rejected: HTTP {} ({})",
+                    response.statusCode(), response.uri().path
+                )
+                false
+            } else {
+                true
+            }
+        } catch (e: Exception) {
+            logger.warn("stream-chunk POST failed: ${e.message}")
+            false
         }
     }
 
@@ -88,7 +179,7 @@ object StreamingChunkPusher {
         val deadline = System.currentTimeMillis() + maxMs
         while (System.currentTimeMillis() < deadline) {
             if (sendQueue.isEmpty() && inFlightSends.get() == 0) return
-            Thread.sleep(25)
+            Thread.sleep(10)
         }
     }
 
@@ -184,13 +275,13 @@ object StreamingChunkPusher {
      * @param delta     incremental text delta for this chunk.
      * @param chunkCount cumulative chunk count (1-based).
      * @param byteCount  cumulative byte count of the full response.
-     * @param done       true on the terminal chunk; the SSE endpoint
-     *                   closes the stream after emitting it.
+     * @param done       true on the terminal chunk.
      * @param error      optional error message (terminal chunks only).
-     * @param instanceName optional X-Akiba-Instance header value —
-     *                   required by the internal route.  When null we
-     *                   fall back to "akiba-instance" (the default
-     *                   docker container's instance name).
+     * @param instanceName optional X-Akiba-Instance header value — required
+     *                   by the internal route.  When null we fall back to
+     *                   "akiba-instance" (the default container's instance).
+     * @param newGeneration true on the first chunk of an LLM call, so the bus
+     *                   opens a generation before any text arrives.
      */
     fun publish(
         sessionId: String,
@@ -200,60 +291,39 @@ object StreamingChunkPusher {
         done: Boolean = false,
         error: String? = null,
         instanceName: String? = null,
+        newGeneration: Boolean = false,
     ) {
         if (sessionId.isBlank()) return
-        val chunk = StreamChunkBus.Chunk(
-            sessionId = sessionId,
-            delta = delta,
-            chunkCount = chunkCount,
-            byteCount = byteCount,
-            done = done,
-            error = error,
-        )
         val port = serverPort()
         if (port == null) {
             // In-process: just publish to the bus directly.
-            StreamChunkBus.publish(chunk)
-            return
-        }
-        // Cross-process: enqueue for the serial sender (ordering
-        // guarantee, see sendQueue).  Never blocks the caller.
-        try {
-            val body = mapper.writeValueAsString(
-                mapOf(
-                    "sessionId" to sessionId,
-                    "delta" to delta,
-                    "chunkCount" to chunkCount,
-                    "byteCount" to byteCount,
-                    "done" to done,
-                    "error" to error,
+            StreamChunkBus.publish(
+                StreamChunkBus.Chunk(
+                    sessionId = sessionId,
+                    delta = delta,
+                    chunkCount = chunkCount,
+                    byteCount = byteCount,
+                    done = done,
+                    error = error,
+                    newGeneration = newGeneration,
                 )
             )
-            // The receiving route accepts the shared secret from
-            // ~/.akiba/akiba_internal.token instead of a user JWT: a worker
-            // JVM has no session of its own, and environment variables only
-            // reach workers the server spawned directly.
-            val resolvedInstance = instanceName
-                ?: System.getenv("AKIBA_MANUAL_AGENT_INSTANCE")?.takeIf { it.isNotBlank() }
-                ?: "akiba-instance"
-            val builder = HttpRequest.newBuilder()
-                .uri(URI.create("http://127.0.0.1:$port/api/agent/internal/stream-chunk"))
-                .header("Content-Type", "application/json")
-                .header("X-Akiba-Instance", resolvedInstance)
-                .timeout(Duration.ofSeconds(2))
-            val token = internalToken()
-            if (token != null) {
-                builder.header(InternalToken.HEADER, token)
-            } else {
-                warnMissingTokenOnce()
-            }
-            val request = builder
-                .POST(HttpRequest.BodyPublishers.ofString(body))
-                .build()
-            ensureSenderThread()
-            sendQueue.offer(request)
-        } catch (e: Exception) {
-            logger.debug("stream-chunk publish failed for session $sessionId: ${e.message}")
+            return
         }
+        // Cross-process: enqueue for the serial sender, which coalesces the
+        // queue into one POST (see [sendQueue]).  Never blocks the caller.
+        ensureSenderThread()
+        sendQueue.offer(
+            Queued(
+                sessionId = sessionId,
+                delta = delta,
+                chunkCount = chunkCount,
+                byteCount = byteCount,
+                done = done,
+                error = error,
+                instanceName = instanceName,
+                newGeneration = newGeneration,
+            )
+        )
     }
 }

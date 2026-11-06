@@ -261,17 +261,33 @@ data class ManualAgentStartResponse(
 
 /**
  * Payload sent by a worker (or the in-process runtime) to
- * `POST /agent/internal/stream-chunk` for every live LLM streaming
- * chunk.  The server fans it out to every SSE subscriber via
- * [org.iotsplab.akiba.llm.agent.stream.StreamChunkBus].
+ * `POST /agent/internal/stream-chunk`.
+ *
+ * A single chunk may still be posted flat (the fields below); the pusher sends
+ * a whole burst as `chunks`, which keeps a fast response to one round-trip so
+ * its tail — the `done` marker included — cannot be lost at worker exit.
  */
 data class StreamChunkRequest(
-    val sessionId: String,
-    val delta: String,
-    val chunkCount: Int,
-    val byteCount: Int,
+    val sessionId: String = "",
+    val delta: String = "",
+    val chunkCount: Int = 0,
+    val byteCount: Int = 0,
     val done: Boolean = false,
     val error: String? = null,
+    val newGeneration: Boolean = false,
+    val chunks: List<StreamChunkPayload> = emptyList(),
+)
+
+/** One chunk inside a batched [StreamChunkRequest]. */
+data class StreamChunkPayload(
+    /** Overrides the request's sessionId when set (batches may mix sessions). */
+    val sessionId: String = "",
+    val delta: String = "",
+    val chunkCount: Int = 0,
+    val byteCount: Int = 0,
+    val done: Boolean = false,
+    val error: String? = null,
+    val newGeneration: Boolean = false,
 )
 
 private data class ManualAgentTurnJob(
@@ -479,21 +495,40 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid chunk payload: ${e.message}"))
             return@post
         }
-        if (req.sessionId.isBlank()) {
+        if (req.sessionId.isBlank() && req.chunks.isEmpty()) {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to "sessionId is required"))
             return@post
         }
-        org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.publish(
-            org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.Chunk(
-                sessionId = req.sessionId,
-                delta = req.delta,
-                chunkCount = req.chunkCount,
-                byteCount = req.byteCount,
-                done = req.done,
-                error = req.error,
+        // A batch keeps a whole burst to one round-trip; the flat fields stay
+        // supported for single-chunk callers (curl probes, older workers).
+        val batch = if (req.chunks.isEmpty()) {
+            listOf(
+                StreamChunkPayload(
+                    delta = req.delta,
+                    chunkCount = req.chunkCount,
+                    byteCount = req.byteCount,
+                    done = req.done,
+                    error = req.error,
+                    newGeneration = req.newGeneration,
+                )
             )
-        )
-        call.respond(mapOf("status" to "ok"))
+        } else {
+            req.chunks
+        }
+        for (payload in batch) {
+            org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.publish(
+                org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.Chunk(
+                    sessionId = payload.sessionId.takeIf { it.isNotBlank() } ?: req.sessionId,
+                    delta = payload.delta,
+                    chunkCount = payload.chunkCount,
+                    byteCount = payload.byteCount,
+                    done = payload.done,
+                    error = payload.error,
+                    newGeneration = payload.newGeneration,
+                )
+            )
+        }
+        call.respond(mapOf("status" to "ok", "accepted" to batch.size))
     }
 
     // ------ Incremental poll: live LLM streaming chunks for a session ------
@@ -505,14 +540,15 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
     // SSE transport died at the outer reverse proxy, which kills
     // `text/event-stream` connections after the first flush).
     //
-    // Request:  GET /agent/sessions/{id}/stream-chunks?since=N
-    // Response: { active, generation, latestCount, done, error,
-    //             chunks: [{ delta, chunkCount, byteCount, done, error }] }
+    // Request:  GET /agent/sessions/{id}/stream-chunks?since=SEQ
+    // Response: { active, generation, latestSeq, latestCount, done, error,
+    //             chunks: [{ seq, delta, chunkCount, byteCount, done, error }] }
     //
-    // `since` is the highest chunkCount the client has consumed; only
-    // newer chunks are returned.  `generation` bumps whenever a new
-    // LLM generation starts — the client must discard accumulated
-    // text and re-pull from zero when it changes.
+    // `since` is the last `seq` the client applied.  The bus assigns `seq`
+    // itself and never restarts it at a generation boundary, so resuming from
+    // the client's own cursor can never filter out a new generation's first
+    // chunks.  `generation` still bumps when a new LLM generation starts — the
+    // client discards accumulated text then, but keeps its cursor.
     get("/agent/sessions/{id}/stream-chunks") {
         val instance = call.request.header("X-Akiba-Instance")
             ?.takeIf { it.isNotBlank() }
@@ -526,12 +562,13 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
             return@get
         }
-        val since = call.request.queryParameters["since"]?.toIntOrNull()?.coerceAtLeast(0) ?: 0
+        val since = call.request.queryParameters["since"]?.toLongOrNull()?.coerceAtLeast(0L) ?: 0L
         val snap = org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.historySince(sessionId, since)
         if (snap == null) {
             call.respond(mapOf(
                 "active" to false,
                 "generation" to 0,
+                "latestSeq" to 0L,
                 "latestCount" to 0,
                 "done" to false,
                 "chunks" to emptyList<Any>(),
@@ -541,11 +578,13 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         call.respond(mapOf(
             "active" to true,
             "generation" to snap.generation,
+            "latestSeq" to snap.latestSeq,
             "latestCount" to snap.latestCount,
             "done" to snap.done,
             "error" to snap.error,
             "chunks" to snap.chunks.map { c ->
                 mapOf(
+                    "seq" to c.seq,
                     "delta" to c.delta,
                     "chunkCount" to c.chunkCount,
                     "byteCount" to c.byteCount,
@@ -944,9 +983,13 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             }
             // Find the last input token count (from the most recent LLM call)
             val lastInputTokens = filtered.lastOrNull { it.role == "assistant" }?.inputTokenCount
-            // Static table lookup; unknown models report the 128K default.
-            val contextLength = sessionInfo.modelName
-                ?.let { ModelContextWindows.contextLength(it) }
+            // Configured per-model window wins over the static table.
+            val contextLength = sessionInfo.modelName?.let { name ->
+                ModelContextWindows.resolve(
+                    name,
+                    LLMKeyFileStore.configuredContextLength(name)
+                ).contextLength
+            }
             call.respond(mapOf(
                 "messages" to filtered.map { it.toMessageResponse() },
                 "totalInputTokens" to totalInput,
@@ -1173,6 +1216,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 projectDirectory = projectDirectory
             )
 
+            var workerError: String? = null
             try {
                 val lockedProject = sessionInfo.projectName?.takeIf { it.isNotBlank() }
                 if (lockedProject == null) {
@@ -1194,9 +1238,17 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                         )
                     }
                 }
+            } catch (e: Exception) {
+                workerError = e.message ?: e.javaClass.simpleName
+                throw e
             } finally {
                 ManualAgentTurnRegistry.remove(token)
                 runCatching { Files.deleteIfExists(workerConfig.file) }
+                // The worker JVM exits with its terminal chunk possibly still
+                // in flight (a hung POST, a kill).  The turn is over either
+                // way, so resolve the stream here: a poller left on `done`
+                // false spun on "waiting for model…" forever.
+                org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.finish(id, workerError)
             }
 
             withDaemonSession(daemonHost, daemonPort, instance, serialize = false) { dbClient ->

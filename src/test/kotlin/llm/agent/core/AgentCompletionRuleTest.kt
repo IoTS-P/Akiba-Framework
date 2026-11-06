@@ -144,6 +144,34 @@ class AgentCompletionRuleTest {
     }
 
     @Test
+    fun `a tool call streamed as text in a native-protocol reply is executed`() = runBlocking {
+        // The reproduced turn: the provider HAS a native tool channel, the model
+        // still answers with a ```json tool_call block, and the turn ended there
+        // with the raw JSON as its answer and no tool ever running.
+        val streamed = """
+            Let me take a look at the currently loaded binary.
+
+            ```json
+            {"tool_call":{"name":"echo","arguments":{"text":"binary_info"}}}
+            ```
+        """.trimIndent()
+        val client = ScriptedClient(
+            listOf(
+                ChatCompletion(content = streamed, finishReason = "stop"),
+                ChatCompletion(content = "The binary is a hello-world ELF.", finishReason = "stop"),
+            )
+        )
+        val ctx = context(client)
+
+        val result = ReActStrategy().execute(ctx)
+
+        assertEquals(1, ctx.stats.toolCallsMade, "the streamed call must run, not end the turn")
+        assertEquals(StopReason.COMPLETED, result.stopReason)
+        assertEquals("The binary is a hello-world ELF.", result.output)
+        assertEquals(2, client.calls, "the tool result must be fed back to the model")
+    }
+
+    @Test
     fun `text protocol gets one reminder, then the prose is accepted`() = runBlocking {
         val client = ScriptedClient(
             listOf(ChatCompletion(content = "I think it is a hello-world binary.", finishReason = "stop")),

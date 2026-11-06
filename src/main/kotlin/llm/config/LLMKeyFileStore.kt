@@ -5,17 +5,18 @@ import java.io.File
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermissions
 import org.apache.logging.log4j.LogManager
+import org.iotsplab.akiba.llm.agent.context.ModelContextWindows
 import org.iotsplab.akiba.utils.AkibaJson
 
 /**
  * On-disk store for LLM API keys in `~/.akiba/llm_keys.json`.
  *
  * Each entry holds a provider / modelNames / baseUrl / apiKey tuple, so several
- * vendors can coexist; one key may cover many models, so `modelNames` is a list.
+ * vendors can coexist; one key may cover many models, so `modelNames` is a list,
+ * and per-model windows ride along in [KeyEntry.contextLengths].
  *
- * Written with POSIX 600 permissions (best-effort ACL elsewhere).  This is
- * **not** encryption at rest — any process running as the same Unix user can
- * read it.
+ * Written with POSIX 600 permissions (best-effort ACL elsewhere); it is **not**
+ * encryption at rest — any process running as the same Unix user can read it.
  */
 object LLMKeyFileStore {
 
@@ -39,7 +40,15 @@ object LLMKeyFileStore {
         val provider: String,
         val modelNames: List<String>,
         val baseUrl: String?,
-        val apiKey: String
+        val apiKey: String,
+
+        /**
+         * Explicit context window per model name, in tokens.
+         *
+         * Absent (or unknown model) keeps the built-in table in charge; see
+         * [ModelContextWindows.resolve] for the order.
+         */
+        val contextLengths: Map<String, Int> = emptyMap()
     )
 
     /** Load all entries from disk. Returns an empty list if the file does not exist yet. */
@@ -70,23 +79,76 @@ object LLMKeyFileStore {
     /**
      * Add or update a single entry.
      *
-     * Matching is done by `(provider, baseUrl)`. If an entry with the same
-     * provider and baseUrl already exists, the modelNames are merged
-     * (deduplicated) and the apiKey is updated; otherwise the entry is appended.
+     * Matching is done by `(provider, baseUrl)`. An existing entry keeps its
+     * stored apiKey when the incoming one is blank.
+     *
+     * Context lengths are authoritative for the models in `entry.modelNames`:
+     * an absent key means "use the built-in table", so clearing a field resets
+     * it. Overrides of models this call does not mention are left alone.
+     *
+     * @throws IllegalArgumentException on a missing apiKey for a new entry, or a
+     *   context length outside `1..MAX_CONTEXT_WINDOW`.
      */
     fun addOrUpdate(entry: KeyEntry) {
+        val incoming = entry.copy(
+            contextLengths = entry.contextLengths
+                .filterKeys { it in entry.modelNames }
+                .mapValues { (model, tokens) -> validateContextLength(model, tokens) }
+        )
         val entries = load().toMutableList()
         val idx = entries.indexOfFirst {
             it.provider == entry.provider && it.baseUrl == entry.baseUrl
         }
         if (idx >= 0) {
             val existing = entries[idx]
-            val mergedNames = (existing.modelNames + entry.modelNames).distinct()
-            entries[idx] = existing.copy(modelNames = mergedNames, apiKey = entry.apiKey)
+            val mergedNames = (existing.modelNames + incoming.modelNames).distinct()
+            val mergedKey = incoming.apiKey.ifBlank { existing.apiKey }
+            require(mergedKey.isNotBlank()) { "apiKey is required to update '${entry.provider}'" }
+            val untouched = existing.contextLengths.filterKeys { it !in incoming.modelNames }
+            entries[idx] = existing.copy(
+                modelNames = mergedNames,
+                apiKey = mergedKey,
+                contextLengths = untouched + incoming.contextLengths
+            )
         } else {
-            entries.add(entry)
+            require(incoming.apiKey.isNotBlank()) {
+                "apiKey is required for a new '${entry.provider}' configuration"
+            }
+            entries.add(incoming)
         }
         save(entries)
+    }
+
+    /**
+     * Explicit context window saved for [modelName], or null when unset.
+     *
+     * [provider] disambiguates when two vendors expose the same model name; with
+     * no match there, any entry that lists the model answers.
+     */
+    fun configuredContextLength(modelName: String, provider: String? = null): Int? {
+        val entries = load()
+        val exact = provider?.let { p ->
+            entries.find { it.provider == p && it.modelNames.contains(modelName) }
+        }
+        val owner = exact ?: entries.find { it.modelNames.contains(modelName) }
+        return owner?.contextLengths?.get(modelName)?.takeIf { it > 0 }
+    }
+
+    /**
+     * Reject a context length outside `1..MAX_CONTEXT_WINDOW`.
+     *
+     * The message names the model and the bound so the settings UI can surface it
+     * verbatim.
+     */
+    fun validateContextLength(modelName: String, tokens: Int): Int {
+        require(tokens > 0) {
+            "Context length for '$modelName' must be positive, got $tokens tokens"
+        }
+        require(tokens <= ModelContextWindows.MAX_CONTEXT_WINDOW) {
+            "Context length for '$modelName' must be at most " +
+                "${ModelContextWindows.MAX_CONTEXT_WINDOW} tokens, got $tokens"
+        }
+        return tokens
     }
 
     /**
@@ -110,7 +172,10 @@ object LLMKeyFileStore {
         if (newNames.isEmpty()) {
             entries.removeAt(entryIdx)
         } else {
-            entries[entryIdx] = entry.copy(modelNames = newNames)
+            entries[entryIdx] = entry.copy(
+                modelNames = newNames,
+                contextLengths = entry.contextLengths.filterKeys { it != modelName }
+            )
         }
         save(entries)
         return true

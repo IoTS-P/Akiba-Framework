@@ -274,6 +274,20 @@ class LlmTransport(
         val textBuffer = StringBuilder()
         var finalChunk: org.iotsplab.akiba.llm.client.ChatChunk? = null
 
+        // Open the generation before any text arrives: the bus clears the
+        // previous answer there, and a call that produces no delta at all
+        // (a native tool call, an immediate error) still starts and ends a
+        // generation of its own instead of landing on the previous one.
+        if (sessionId != null) {
+            StreamingChunkPusher.publish(
+                sessionId = sessionId,
+                delta = "",
+                chunkCount = 0,
+                byteCount = 0,
+                newGeneration = true,
+            )
+        }
+
         // Progress rows are written by the shared reporter (one writer per
         // attempt).  The consumer coroutine only touches its atomics, so the
         // streaming producer is never back-pressured by a slow daemon write.

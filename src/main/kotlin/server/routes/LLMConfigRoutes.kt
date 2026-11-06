@@ -5,6 +5,7 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import org.apache.logging.log4j.LogManager
+import org.iotsplab.akiba.llm.agent.context.ModelContextWindows
 import org.iotsplab.akiba.llm.client.LLMProvider
 import org.iotsplab.akiba.llm.config.LLMKeyFileStore
 import org.iotsplab.akiba.llm.config.LLMModelFetcher
@@ -26,7 +27,10 @@ data class AddKeyEntryRequest(
     val provider: String,
     val modelNames: List<String>,
     val baseUrl: String? = null,
-    val apiKey: String
+    /** Blank updates an existing `(provider, baseUrl)` entry without touching its key. */
+    val apiKey: String = "",
+    /** Explicit context window per model, in tokens; absent = built-in table. */
+    val contextLengths: Map<String, Int>? = null
 )
 
 /** Non-sensitive view of a key entry stored on disk. */
@@ -34,7 +38,15 @@ data class StoredKeyEntryResponse(
     val id: String,
     val provider: String,
     val modelNames: List<String>,
-    val baseUrl: String?
+    val baseUrl: String?,
+    val contextLengths: Map<String, Int>
+)
+
+/** Effective window for one model: what applies now, why, and the built-in value. */
+data class ContextLengthResponse(
+    val contextLength: Int,
+    val source: String,
+    val tableLength: Int
 )
 
 // ============================================================
@@ -67,10 +79,36 @@ fun Route.llmConfigRoutes() {
                     id = it.id,
                     provider = it.provider,
                     modelNames = it.modelNames,
-                    baseUrl = it.baseUrl
+                    baseUrl = it.baseUrl,
+                    contextLengths = it.contextLengths
                 )
             }
         ))
+    }
+
+    /**
+     * Resolve the effective context window for the named models.
+     *
+     * `modelNames` is a comma-separated query parameter. The settings UI calls
+     * this so a blank field can show what it would fall back to, in tokens.
+     */
+    get("/llm/context-lengths") {
+        val names = call.request.queryParameters["modelNames"].orEmpty()
+            .split(',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        val resolved = names.distinct().associateWith { name ->
+            val hit = ModelContextWindows.resolve(
+                name,
+                LLMKeyFileStore.configuredContextLength(name)
+            )
+            ContextLengthResponse(
+                contextLength = hit.contextLength,
+                source = hit.source.name.lowercase(),
+                tableLength = ModelContextWindows.contextLength(name)
+            )
+        }
+        call.respond(mapOf("contextLengths" to resolved))
     }
 
     /**
@@ -137,22 +175,29 @@ fun Route.llmConfigRoutes() {
             return@post
         }
 
-        if (req.provider.isBlank() || req.modelNames.isEmpty() || req.modelNames.all { it.isBlank() } || req.apiKey.isBlank()) {
+        if (req.provider.isBlank() || req.modelNames.isEmpty() || req.modelNames.all { it.isBlank() }) {
             call.respond(
                 HttpStatusCode.BadRequest,
-                mapOf("error" to "provider, modelNames and apiKey are required")
+                mapOf("error" to "provider and modelNames are required")
             )
             return@post
         }
 
-        LLMKeyFileStore.addOrUpdate(
-            LLMKeyFileStore.KeyEntry(
-                provider = req.provider,
-                modelNames = req.modelNames.filter { it.isNotBlank() },
-                baseUrl = req.baseUrl?.takeIf { it.isNotBlank() },
-                apiKey = req.apiKey
+        try {
+            LLMKeyFileStore.addOrUpdate(
+                LLMKeyFileStore.KeyEntry(
+                    provider = req.provider,
+                    modelNames = req.modelNames.filter { it.isNotBlank() },
+                    baseUrl = req.baseUrl?.takeIf { it.isNotBlank() },
+                    apiKey = req.apiKey,
+                    contextLengths = req.contextLengths.orEmpty()
+                )
             )
-        )
+        } catch (e: IllegalArgumentException) {
+            // Validation messages are written for the user, so pass them through.
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to e.message))
+            return@post
+        }
         call.respond(mapOf("message" to "Key saved"))
     }
 

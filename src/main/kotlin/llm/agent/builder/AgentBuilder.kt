@@ -17,6 +17,7 @@ import org.iotsplab.akiba.llm.client.AkibaLLMClient
 import org.iotsplab.akiba.llm.client.LLMClientFactory
 import org.iotsplab.akiba.llm.client.LLMConfig
 import org.iotsplab.akiba.llm.client.LLMProvider
+import org.iotsplab.akiba.llm.config.LLMKeyFileStore
 import org.iotsplab.akiba.llm.memory.ChatMemory
 import org.iotsplab.akiba.llm.memory.InMemoryChatMemory
 import org.iotsplab.akiba.llm.memory.MemoryManager
@@ -422,7 +423,16 @@ class AgentBuilder {
         val resolvedMemoryManager = memoryManager
             ?: sessionId?.let { agentDbClient?.let { adc -> MemoryManager(adc, it, binaryId) } }
 
-        val contextLength = ModelContextWindows.contextLength(resolvedClient.config.modelName)
+        val modelName = resolvedClient.config.modelName
+        // The override is read from ~/.akiba/llm_keys.json at build time, so a new
+        // session needs no restart; an already-running agent keeps its window.
+        val contextLength = ModelContextWindows.resolve(
+            modelName,
+            LLMKeyFileStore.configuredContextLength(
+                modelName,
+                resolvedClient.config.provider.name
+            )
+        ).contextLength
 
         val agent = AkibaAgent(
             client = resolvedClient,

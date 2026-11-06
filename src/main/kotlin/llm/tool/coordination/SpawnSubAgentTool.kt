@@ -21,6 +21,7 @@ import org.iotsplab.akiba.llm.agent.template.TemplateFactoryResolver
 import org.iotsplab.akiba.llm.agent.template.TemplateInputSpec
 import org.iotsplab.akiba.llm.agent.template.spawnChildFromAgentProgrammatically
 import org.iotsplab.akiba.llm.client.LLMClientFactory
+import org.iotsplab.akiba.llm.config.LLMKeyFileStore
 import org.iotsplab.akiba.llm.memory.MemoryManager
 import org.iotsplab.akiba.llm.memory.persistentChatMemory
 import org.iotsplab.akiba.llm.skill.SkillManager
@@ -567,7 +568,13 @@ private fun spawnFreeform(
                     enrichSystemPromptWithMemory = true,
                     auditToolCalls = true,
                     strategy = ReActStrategy(),
-                    contextLength = ModelContextWindows.contextLength(client.config.modelName),
+                    contextLength = ModelContextWindows.resolve(
+                        client.config.modelName,
+                        LLMKeyFileStore.configuredContextLength(
+                            client.config.modelName,
+                            client.config.provider.name
+                        )
+                    ).contextLength,
                     lifecycle = Lifecycle.ONE_SHOT,
                     runtimeHandle = handle,
                 )

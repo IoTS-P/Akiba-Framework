@@ -480,6 +480,94 @@ object ToolCallParser {
         return if (content.isNotBlank()) parseAll(content) else emptyList()
     }
 
+    /**
+     * Parse tool calls the model wrote as TEXT even though the provider has a
+     * native tool channel: an explicit `tool_call` / `tool_calls` /
+     * `function_call` wrapper, or a flat `name` plus arguments that sits inside
+     * a ```json / ```tool_call fence.
+     *
+     * Only calls whose name is in [allowed] are returned, and prose that merely
+     * mentions a JSON object with a `name` field is never executed — an answer
+     * carrying `{"suspiciousFunctions":[{"name":…}]}` must stay an answer.
+     */
+    fun parseExplicitTextCalls(text: String, allowed: Set<String>): List<ParsedToolCall> {
+        if (text.isBlank() || allowed.isEmpty()) return emptyList()
+        val fences = fencedRanges(text)
+        val calls = mutableListOf<ParsedToolCall>()
+        var from = 0
+        while (from < text.length) {
+            val brace = text.indexOf('{', from)
+            if (brace < 0) break
+            val (jsonStr, endIdx) = extractBalancedJsonWithEnd(text, brace)
+            if (jsonStr == null) {
+                from = brace + 1
+                continue
+            }
+            if (isExplicitCallObject(jsonStr, fences.any { brace in it })) {
+                calls += tryParseToolCallJson(jsonStr).filter { it.name in allowed }
+                from = endIdx + 1
+            } else {
+                from = brace + 1
+            }
+        }
+        return calls.distinctBy { it.name + "\u0000" + it.argumentsJson }
+    }
+
+    /** True when [text] holds at least one explicit tool_call object. */
+    fun hasExplicitTextCall(text: String): Boolean {
+        if (text.isBlank()) return false
+        val fences = fencedRanges(text)
+        var from = 0
+        while (from < text.length) {
+            val brace = text.indexOf('{', from)
+            if (brace < 0) return false
+            val (jsonStr, _) = extractBalancedJsonWithEnd(text, brace)
+            if (jsonStr == null) {
+                from = brace + 1
+                continue
+            }
+            if (isExplicitCallObject(jsonStr, fences.any { brace in it })) return true
+            from = brace + 1
+        }
+        return false
+    }
+
+    /** Bodies of ```json / ```tool_call fences, as absolute char ranges. */
+    private fun fencedRanges(text: String): List<IntRange> {
+        val ranges = mutableListOf<IntRange>()
+        var match = codeBlockStart.find(text)
+        while (match != null) {
+            val bodyStart = match.range.last + 1
+            val close = text.indexOf("```", bodyStart)
+            val bodyEnd = if (close < 0) text.length - 1 else close + 2
+            if (bodyStart <= bodyEnd) ranges.add(bodyStart..bodyEnd)
+            match = codeBlockStart.find(text, if (close < 0) text.length else close + 3)
+        }
+        return ranges
+    }
+
+    /**
+     * Structural test: a `tool_call`-style wrapper always counts; a flat
+     * `name` next to an arguments field only counts inside a code fence.
+     */
+    private fun isExplicitCallObject(jsonStr: String, inFence: Boolean): Boolean {
+        val parsed = try {
+            mapper.readValue<Map<String, Any?>>(jsonStr)
+        } catch (_: Exception) {
+            return false
+        }
+        if (parsed["tool_call"] is Map<*, *>) return true
+        if (parsed["function_call"] is Map<*, *>) return true
+        if (parsed["tool_calls"] is List<*>) return true
+        if (!inFence) return false
+        val named = firstString(parsed, listOf("name", "tool", "tool_name", "toolName")) != null
+        if (!named) return false
+        return listOf("arguments", "args", "parameters", "input", "params").any { key ->
+            val value = parsed[key]
+            value is Map<*, *> || value is String
+        }
+    }
+
     // ============================================================
     //  Reverse-mistake detection helpers
     // ============================================================

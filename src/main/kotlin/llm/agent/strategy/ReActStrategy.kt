@@ -206,11 +206,14 @@ class ReActStrategy : AgentStrategy {
             val allToolCalls = when {
                 completion.toolCalls.isNotEmpty() ->
                     ToolCallParser.parseAllFromCompletion(completion)
-                // Native tool protocol: the structured channel is the only
-                // source of truth.  A reply without a tool call is an answer,
-                // and scanning its text would misread JSON payloads (e.g. a
-                // `{"suspiciousFunctions":[{"name":"..."}]}` answer) as calls.
-                usesNativeToolProtocol(ctx) -> emptyList()
+                // Native tool protocol: the structured channel is authoritative
+                // for a reply that HAS calls, but some models (DeepSeek) answer
+                // with an explicit ```json tool_call block instead.  Dropping
+                // that ended the turn with the raw JSON as the visible answer
+                // and no tool ever ran, so an explicit block naming a
+                // registered tool is executed exactly as in the text protocol.
+                usesNativeToolProtocol(ctx) ->
+                    ToolCallParser.parseExplicitTextCalls(assistantText, ctx.toolRegistry.names())
                 // Text protocol: the call lives in the prose.
                 else -> ToolCallParser.parseAll(assistantText)
             }
@@ -488,8 +491,16 @@ class ReActStrategy : AgentStrategy {
         if (!stopsNormally(completion)) return null
 
         return when {
-            // Native protocol: no tool call + normal stop = finished.
-            usesNativeToolProtocol(ctx) -> text
+            // Native protocol: no tool call + normal stop = finished.  A reply
+            // that carries an explicit tool_call block (e.g. naming an unknown
+            // tool) is not an answer — hand it back for a correction instead of
+            // showing the raw JSON as the final message.  Bounded like the text
+            // protocol so a model that keeps emitting an unknown call still
+            // ends the run instead of looping to max iterations.
+            usesNativeToolProtocol(ctx) ->
+                if (ToolCallParser.hasExplicitTextCall(text) &&
+                    ctx.stats.consecutiveNoActionTurns <= MAX_NO_ACTION_TURNS
+                ) null else text
             // No tools registered at all: any normal stop is the answer.
             ctx.toolRegistry.isEmpty() -> text
             // Text protocol: only after the reminder failed to produce a call.

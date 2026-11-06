@@ -3,9 +3,9 @@ package org.iotsplab.akiba.llm.agent.context
 /**
  * Hardcoded context windows, in tokens, matched by model-name prefix.
  *
- * Add a prefix here when a provider ships a model; nothing is fetched or
- * probed at runtime. Unknown models (including every user-defined one) get
- * [DEFAULT_CONTEXT_WINDOW].
+ * This table is the *default*, not the last word: a per-model value saved in
+ * the model configuration wins over it through [resolve], so a renamed model
+ * does not silently fall back to [DEFAULT_CONTEXT_WINDOW].
  *
  * Values came from models.dev — re-check them when a family changes version
  * (`claude-sonnet-4-5` is 200K, `claude-sonnet-4-6` is 1M).
@@ -14,6 +14,41 @@ object ModelContextWindows {
 
     /** Fallback for any model missing from the table: 128K tokens. */
     const val DEFAULT_CONTEXT_WINDOW: Int = 128_000
+
+    /** Upper bound accepted for a configured window; nothing real is larger. */
+    const val MAX_CONTEXT_WINDOW: Int = 2_000_000
+
+    /** Where a resolved window came from, for diagnostics and the settings hint. */
+    enum class Source {
+        /** Explicit per-model value saved in the model configuration. */
+        CONFIGURED,
+        /** Matched a prefix in the built-in table. */
+        TABLE,
+        /** Nothing matched; [DEFAULT_CONTEXT_WINDOW] applies. */
+        DEFAULT
+    }
+
+    /** A window plus its provenance. */
+    data class Resolution(val contextLength: Int, val source: Source)
+
+    /**
+     * Resolution order: [configured] → built-in table → [DEFAULT_CONTEXT_WINDOW].
+     *
+     * A configured value is capped defensively rather than rejected; the write
+     * path already refuses out-of-range values, so a cap here only guards a
+     * hand-edited key file.
+     */
+    fun resolve(modelName: String, configured: Int? = null): Resolution {
+        if (configured != null) {
+            if (configured <= 0) {
+                return Resolution(contextLength(modelName), Source.TABLE)
+            }
+            return Resolution(configured.coerceAtMost(MAX_CONTEXT_WINDOW), Source.CONFIGURED)
+        }
+        val table = tableLength(modelName)
+        return if (table != null) Resolution(table, Source.TABLE)
+        else Resolution(DEFAULT_CONTEXT_WINDOW, Source.DEFAULT)
+    }
 
     private data class Entry(val prefix: String, val tokens: Int)
 
@@ -114,14 +149,18 @@ object ModelContextWindows {
     ).sortedByDescending { it.prefix.length }
 
     /**
-     * Window for [modelName], matched by the longest prefix in the table.
-     * Accepts gateway-style names (`openai/gpt-4o`) and `:variant` suffixes.
+     * Window for [modelName] from the built-in table only, matched by the
+     * longest prefix. Accepts gateway names (`openai/gpt-4o`) and `:variant`
+     * suffixes. Unknown models get [DEFAULT_CONTEXT_WINDOW].
      */
-    fun contextLength(modelName: String): Int {
+    fun contextLength(modelName: String): Int =
+        tableLength(modelName) ?: DEFAULT_CONTEXT_WINDOW
+
+    /** Table lookup without the fallback; null means "not in the table". */
+    private fun tableLength(modelName: String): Int? {
         val normalized = normalize(modelName)
-        if (normalized.isEmpty()) return DEFAULT_CONTEXT_WINDOW
+        if (normalized.isEmpty()) return null
         return entries.firstOrNull { normalized.startsWith(it.prefix) }?.tokens
-            ?: DEFAULT_CONTEXT_WINDOW
     }
 
     private fun normalize(raw: String): String =

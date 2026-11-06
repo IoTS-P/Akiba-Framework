@@ -7,10 +7,13 @@ import java.util.concurrent.ConcurrentHashMap
  * or in-process runtime) to consumer (frontend incremental polls): plain
  * JSON-over-GET polling, no DB writes on the hot path.
  *
- * Each session keeps a rolling history of one generation: a chunk with
- * `chunkCount <= 1` resets it and bumps [SessionHistory.generation] so clients
- * discard older text. [publish] only appends to a deque, so a slow browser
- * never back-pressures the worker, and history is capped at [MAX_CHUNKS].
+ * The bus owns the authoritative delivery counter ([SessionHistory.nextSeq]),
+ * so `seq` never restarts when a new generation begins: a client resumes from
+ * the last `seq` it applied and cannot filter out the first chunks of the next
+ * generation.  A generation starts on the producer's explicit `newGeneration`
+ * chunk (or on a content delta that restarts its numbering at 1).
+ * [publish] only appends to a deque, so a slow browser never back-pressures the
+ * worker, and history is capped at [MAX_CHUNKS].
  */
 object StreamChunkBus {
 
@@ -25,7 +28,7 @@ object StreamChunkBus {
         val sessionId: String,
         /** Incremental text delta for this chunk. */
         val delta: String,
-        /** Cumulative chunk count (1-based). */
+        /** Cumulative chunk count of the producing generation (1-based). */
         val chunkCount: Int,
         /** Cumulative byte count of the full response so far. */
         val byteCount: Int,
@@ -34,6 +37,10 @@ object StreamChunkBus {
         /** Optional error message (only set on terminal chunks that
          *  carry an error). */
         val error: String? = null,
+        /** Delivery index assigned by the bus; 0 on producer payloads. */
+        val seq: Long = 0L,
+        /** True on the producer's first chunk of a new LLM call. */
+        val newGeneration: Boolean = false,
     )
 
     /** Rolling per-session history of one LLM generation. */
@@ -41,6 +48,15 @@ object StreamChunkBus {
         @Volatile var generation = 0
         @Volatile var done = false
         @Volatile var error: String? = null
+
+        /** Highest producer [Chunk.chunkCount] of a content delta. */
+        var maxDeltaCount = 0
+
+        /** True once a producer declared boundaries explicitly. */
+        var generationExplicit = false
+
+        /** Never reset by a generation boundary (see the class doc). */
+        var nextSeq = 1L
         val lock = Any()
         val chunks = ArrayDeque<Chunk>()
     }
@@ -54,41 +70,43 @@ object StreamChunkBus {
         val done: Boolean,
         val error: String?,
         val latestCount: Int,
+        val latestSeq: Long,
     )
 
     /**
-     * Record a chunk in the per-session history.  Never blocks the
-     * caller.  Cross-process POSTs may arrive slightly out of order,
-     * so chunks are inserted ordered by [Chunk.chunkCount].
+     * Record a chunk in the per-session history.  Never blocks the caller.
+     *
+     * A generation starts on the producer's explicit `newGeneration` chunk, or
+     * — for producers that only restart their numbering — on a content delta
+     * whose `chunkCount` is 1 again.  A terminal chunk NEVER starts a
+     * generation, so a one-token answer is not wiped by its own `done`.
+     *
+     * Chunks are appended in arrival order (the producer's sender is serial),
+     * and each one gets the next `seq`.  A content delta whose `chunkCount` is
+     * not strictly greater than the highest already stored is a duplicate from
+     * a retried push and is dropped, so a retry can never double a token.
      */
     fun publish(chunk: Chunk) {
         if (chunk.sessionId.isBlank()) return
         val hist = histories.getOrPut(chunk.sessionId) { SessionHistory() }
         synchronized(hist.lock) {
-            if (chunk.chunkCount <= 1) {
+            val implicitStart = chunk.delta.isNotEmpty() && chunk.chunkCount <= 1
+            if (chunk.newGeneration || (!hist.generationExplicit && implicitStart)) {
                 // New LLM generation — drop anything from the previous one.
                 hist.generation++
+                hist.generationExplicit = chunk.newGeneration
                 hist.chunks.clear()
                 hist.done = false
                 hist.error = null
+                hist.maxDeltaCount = 0
             }
-            if (hist.chunks.isEmpty() || chunk.chunkCount > hist.chunks.last().chunkCount) {
-                hist.chunks.addLast(chunk)
-            } else {
-                // Out-of-order or duplicate delivery (async worker
-                // POSTs): insert at the right position, replacing an
-                // existing entry with the same chunkCount.
-                val list = hist.chunks.toMutableList()
-                var idx = list.size
-                while (idx > 0 && list[idx - 1].chunkCount > chunk.chunkCount) idx--
-                if (idx < list.size && list[idx].chunkCount == chunk.chunkCount) {
-                    list[idx] = chunk
-                } else {
-                    list.add(idx, chunk)
-                }
-                hist.chunks.clear()
-                hist.chunks.addAll(list)
+            if (chunk.delta.isNotEmpty()) {
+                if (chunk.chunkCount <= hist.maxDeltaCount) return
+                hist.maxDeltaCount = chunk.chunkCount
             }
+            // A terminal chunk shares the last delta's chunkCount; it gets its
+            // own entry instead of replacing (and so erasing) that delta.
+            hist.chunks.addLast(chunk.copy(seq = hist.nextSeq++))
             while (hist.chunks.size > MAX_CHUNKS) hist.chunks.removeFirst()
             if (chunk.done) {
                 hist.done = true
@@ -120,18 +138,20 @@ object StreamChunkBus {
     }
 
     /**
-     * Return every chunk with `chunkCount > since` for [sessionId],
-     * or null when the session has no streaming history at all.
+     * Return every chunk with `seq > since` for [sessionId], or null when the
+     * session has no streaming history at all.  [since] is the client's own
+     * last-applied [Chunk.seq], so a generation change can never hide chunks.
      */
-    fun historySince(sessionId: String, since: Int): HistorySnapshot? {
+    fun historySince(sessionId: String, since: Long): HistorySnapshot? {
         val hist = histories[sessionId] ?: return null
         return synchronized(hist.lock) {
             HistorySnapshot(
                 generation = hist.generation,
-                chunks = hist.chunks.filter { it.chunkCount > since },
+                chunks = hist.chunks.filter { it.seq > since },
                 done = hist.done,
                 error = hist.error,
                 latestCount = hist.chunks.lastOrNull()?.chunkCount ?: 0,
+                latestSeq = hist.chunks.lastOrNull()?.seq ?: 0L,
             )
         }
     }
