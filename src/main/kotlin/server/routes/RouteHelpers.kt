@@ -3,6 +3,7 @@ package org.iotsplab.akiba.server.routes
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.header
+import io.ktor.server.request.path
 import io.ktor.server.response.respond
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
@@ -14,6 +15,7 @@ import org.iotsplab.akiba.managers.ProjectBusyException
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.server.db.UserDao
 import org.iotsplab.akiba.server.security.JwtService
+import org.iotsplab.akiba.utils.InternalToken
 
 private val logger: Logger = LogManager.getLogger("RouteHelpers")
 
@@ -269,6 +271,19 @@ private fun <T> runDaemonSession(
     return if (lock != null) lock.withLock { doSession() } else doSession()
 }
 
+/** Absolute path of the live-chunk push endpoint, as the server sees it. */
+private const val STREAM_CHUNK_PATH = "/api/agent/internal/stream-chunk"
+
+/**
+ * True when [this] request is a worker JVM pushing a live LLM chunk with the
+ * shared secret from [InternalToken].  Only that one endpoint accepts the
+ * secret: every other /api route still requires a signed-in user.
+ */
+private fun ApplicationCall.isInternalChunkPush(): Boolean {
+    if (request.path() != STREAM_CHUNK_PATH) return false
+    return InternalToken.matches(request.header(InternalToken.HEADER))
+}
+
 /**
  * Whether [call] may act on [instance], expressed as the HTTP answer to send
  * when it may not.
@@ -283,6 +298,11 @@ private fun <T> runDaemonSession(
  *         to answer with.
  */
 fun instanceAccessProblem(call: ApplicationCall, instance: String): Pair<HttpStatusCode, String>? {
+    // A worker JVM has no user session; it authenticates with the shared
+    // secret from ~/.akiba/akiba_internal.token, and only for the endpoint
+    // that accepts live chunk pushes. Checked before the JWT so a worker can
+    // stream, while every other route keeps its normal identity check.
+    if (call.isInternalChunkPush()) return null
     val username = call.currentUsernameOrNull()
         ?: return HttpStatusCode.Unauthorized to "Authentication required"
     val owner = DaemonIdentities.ownerOf(instance)

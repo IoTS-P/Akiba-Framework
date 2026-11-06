@@ -7,16 +7,17 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import org.apache.logging.log4j.LogManager
 import org.iotsplab.akiba.utils.AkibaJson
+import org.iotsplab.akiba.utils.InternalToken
 
 /**
  * Fire-and-forget publisher that forwards live LLM streaming chunks from a
- * worker to the server's [StreamChunkBus], whose per-session history the
- * browser drains via incremental polls.
+ * worker to the server's [StreamChunkBus], which the browser drains via polls.
  *
  * In-process workers publish straight to the bus; cross-process workers POST
  * to `http://127.0.0.1:$PORT/api/agent/internal/stream-chunk`, discovering the
- * port from `AKIBA_MANUAL_AGENT_SERVER_PORT` or the port file. All methods are
- * non-blocking and drop failures — a dead server must not stall the consumer.
+ * port from env or the port file and authenticating with the shared secret in
+ * [InternalToken.file].  Failures are dropped so a dead server never stalls
+ * the consumer.
  */
 object StreamingChunkPusher {
 
@@ -106,6 +107,33 @@ object StreamingChunkPusher {
 
     /** True when this JVM IS the server (it called [publishServerPortFile]). */
     @Volatile private var inProcessServer = false
+
+    /** Shared secret read from disk; resolved once per worker JVM. */
+    @Volatile private var cachedInternalToken: String? = null
+    @Volatile private var internalTokenResolved = false
+    @Volatile private var missingTokenLogged = false
+
+    /**
+     * Shared secret that authenticates this worker to the server's internal
+     * chunk endpoint.  Read from `~/.akiba/akiba_internal.token`, which the
+     * server rewrites on every start — the same file every launch path can
+     * see, unlike an inherited environment variable.
+     */
+    private fun internalToken(): String? {
+        if (internalTokenResolved) return cachedInternalToken
+        cachedInternalToken = InternalToken.readOrNull()
+        internalTokenResolved = true
+        return cachedInternalToken
+    }
+
+    private fun warnMissingTokenOnce() {
+        if (missingTokenLogged) return
+        missingTokenLogged = true
+        logger.warn(
+            "no internal token at {} — cross-process stream chunks will be rejected",
+            InternalToken.file
+        )
+    }
 
     private var cachedFilePort: Int? = null
     private var portFileChecked = false
@@ -201,19 +229,24 @@ object StreamingChunkPusher {
                     "error" to error,
                 )
             )
-            // The receiving route authenticates like any other: the manual
-            // worker must present its own token and instance name, otherwise
-            // every chunk was answered 401 and the chat never streamed.
+            // The receiving route accepts the shared secret from
+            // ~/.akiba/akiba_internal.token instead of a user JWT: a worker
+            // JVM has no session of its own, and environment variables only
+            // reach workers the server spawned directly.
             val resolvedInstance = instanceName
                 ?: System.getenv("AKIBA_MANUAL_AGENT_INSTANCE")?.takeIf { it.isNotBlank() }
                 ?: "akiba-instance"
-            val token = System.getenv("AKIBA_MANUAL_AGENT_TOKEN")?.takeIf { it.isNotBlank() }
             val builder = HttpRequest.newBuilder()
                 .uri(URI.create("http://127.0.0.1:$port/api/agent/internal/stream-chunk"))
                 .header("Content-Type", "application/json")
                 .header("X-Akiba-Instance", resolvedInstance)
                 .timeout(Duration.ofSeconds(2))
-            if (token != null) builder.header("Authorization", "Bearer $token")
+            val token = internalToken()
+            if (token != null) {
+                builder.header(InternalToken.HEADER, token)
+            } else {
+                warnMissingTokenOnce()
+            }
             val request = builder
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build()

@@ -144,6 +144,10 @@ object AkibaServer {
         // process spawns directly, the file reaches every launch
         // path.  Also marks this JVM as the in-process server so
         // its own chunk publishes stay in memory.
+        //
+        // The credential for those pushes is a fresh random token in
+        // ~/.akiba/akiba_internal.token (owner-only, rotated per start).
+        org.iotsplab.akiba.utils.InternalToken.rotate()
         org.iotsplab.akiba.llm.agent.stream.StreamingChunkPusher.publishServerPortFile(config.port)
 
         embeddedServer(Netty, config.port, config.host) {

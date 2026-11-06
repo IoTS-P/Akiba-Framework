@@ -1,7 +1,14 @@
 package org.iotsplab.akiba.utils
 
+import java.nio.ByteBuffer
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.PosixFilePermissions
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.util.Base64
+import org.apache.logging.log4j.LogManager
 
 /**
  * Deployment-wide settings that do not belong to a single instance.
@@ -58,5 +65,94 @@ object GlobalConfig {
         return runCatching {
             AkibaJson.mapper.readValue(configPath.toFile(), AkibaGlobalConfig::class.java)
         }.getOrElse { AkibaGlobalConfig() }
+    }
+}
+
+/**
+ * Shared secret that authenticates co-located JVMs to the server's internal
+ * endpoints.  A worker has no user session, so the server mints a random token
+ * at startup and publishes it in `~/.akiba/akiba_internal.token`; every worker
+ * reads that file.  A file reaches launch paths that inherit no environment,
+ * such as workflow module processes.  Rotating per start invalidates old workers.
+ */
+object InternalToken {
+
+    /** Request header that carries the secret. */
+    const val HEADER = "X-Akiba-Internal"
+
+    private val logger = LogManager.getLogger(InternalToken::class.java)
+    private val random = SecureRandom()
+
+    /** `~/.akiba/akiba_internal.token` — shared by every co-located JVM. */
+    val file: Path by lazy {
+        Path.of(System.getProperty("user.home"), ".akiba", "akiba_internal.token")
+    }
+
+    /** Token minted by [rotate] in this JVM; null in worker JVMs. */
+    @Volatile private var minted: String? = null
+
+    /** Worker-side cache so a chunk stream does not re-read the file per chunk. */
+    @Volatile private var cachedFileToken: String? = null
+
+    /**
+     * Mint a fresh token and write it to [file], readable by the owner only.
+     *
+     * Called once at server startup, before the HTTP listener opens.  A write
+     * failure is logged rather than thrown: the server keeps running and only
+     * cross-process chunk pushes are lost.
+     *
+     * @return the token, also kept in memory for this JVM.
+     */
+    fun rotate(): String {
+        val token = ByteArray(32)
+            .also { random.nextBytes(it) }
+            .let { Base64.getUrlEncoder().withoutPadding().encodeToString(it) }
+        minted = token
+        runCatching {
+            Files.createDirectories(file.parent)
+            // Create with the final mode: a world-readable window, however
+            // short, would let any local user push chunks as the server.
+            val ownerOnly = PosixFilePermissions.asFileAttribute(
+                PosixFilePermissions.fromString("rw-------")
+            )
+            val channel = Files.newByteChannel(
+                file,
+                setOf(
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                ),
+                ownerOnly,
+            )
+            try {
+                channel.write(ByteBuffer.wrap(token.toByteArray()))
+            } finally {
+                channel.close()
+            }
+            // Creation attributes apply only to a new file; an existing one
+            // keeps whatever mode it had.
+            Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"))
+        }.onFailure {
+            logger.warn("Could not write internal token file ${file}: ${it.message}")
+        }
+        return token
+    }
+
+    /** Token of this JVM if it is the server, otherwise the one in [file]. */
+    fun readOrNull(): String? = minted ?: cachedFileToken ?: readFileToken()
+
+    /** True when [candidate] equals the current internal token. */
+    fun matches(candidate: String?): Boolean {
+        if (candidate.isNullOrBlank()) return false
+        val expected = readOrNull() ?: return false
+        return MessageDigest.isEqual(expected.toByteArray(), candidate.toByteArray())
+    }
+
+    private fun readFileToken(): String? {
+        val token = runCatching {
+            Files.readString(file).trim().takeIf { it.isNotEmpty() }
+        }.getOrNull()
+        if (token != null) cachedFileToken = token
+        return token
     }
 }
