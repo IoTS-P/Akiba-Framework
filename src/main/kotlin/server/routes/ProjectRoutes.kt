@@ -148,7 +148,11 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
 
     val logger: Logger = LogManager.getLogger("ProjectRoutes")
 
+    // Projects are operator data, and every one of these handlers used to answer
+    // anonymous callers because the root path needs no username. The browser
+    // always sends a JWT, so anything below must be signed in.
     get("/projects") {
+        if (!call.requireAuthenticated()) return@get
         try {
             val projectDirectory = call.currentUserGhidraProjectsRoot()
             Files.createDirectories(projectDirectory)
@@ -224,6 +228,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
      *  - `deleteWorkspace`      delete `<workspaceRoot>/<projectName>/`
      */
     delete("/projects/{name}") {
+        if (!call.requireAuthenticated()) return@delete
         val projectName = call.parameters["name"]
             ?: return@delete call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
         if (!isValidProjectName(projectName)) {
@@ -404,6 +409,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
      * different analysis states.
      */
     get("/projects/{name}/programs") {
+        if (!call.requireAuthenticated()) return@get
         val projectName = call.parameters["name"]
             ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
         if (!isValidProjectName(projectName)) {
@@ -453,6 +459,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
      * This endpoint zips only the subdirectory matching the requested project name.
      */
     get("/projects/{name}/export_workspace") {
+        if (!call.requireAuthenticated()) return@get
         val projectName = call.parameters["name"]
             ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
         if (!isValidProjectName(projectName)) {
@@ -498,6 +505,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
      * daemon DB, not on disk).
      */
     get("/projects/{name}/sessions") {
+        if (!call.requireAuthenticated()) return@get
         val projectName = call.parameters["name"]
             ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
         if (!isValidProjectName(projectName)) {
@@ -534,6 +542,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
      * and if even that fails the answer is an empty tree flagged `stale`.
      */
     get("/projects/{name}/tree") {
+        if (!call.requireAuthenticated()) return@get
         val name = call.parameters["name"].orEmpty()
         if (!isValidProjectName(name)) {
             return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name"))
@@ -572,6 +581,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
     }
 
     post("/projects/{name}/folders") {
+        if (!call.requireAuthenticated()) return@post
         val name = call.parameters["name"].orEmpty()
         if (!isValidProjectName(name)) {
             return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name"))
@@ -589,6 +599,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
     }
 
     patch("/projects/{name}/entries") {
+        if (!call.requireAuthenticated()) return@patch
         val name = call.parameters["name"].orEmpty()
         if (!isValidProjectName(name)) {
             return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name"))
@@ -606,6 +617,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
     }
 
     delete("/projects/{name}/entries") {
+        if (!call.requireAuthenticated()) return@delete
         val name = call.parameters["name"].orEmpty()
         if (!isValidProjectName(name)) {
             return@delete call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name"))
@@ -633,6 +645,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
      * than something a background task does.
      */
     post("/projects/{name}/programs/copy") {
+        if (!call.requireAuthenticated()) return@post
         val targetProject = call.parameters["name"]
             ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
         if (!isValidProjectName(targetProject)) {
@@ -679,6 +692,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
      * binary ids exist.
      */
     post("/projects/{name}/programs/import") {
+        if (!call.requireAuthenticated()) return@post
         val targetProject = call.parameters["name"]
             ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
         if (!isValidProjectName(targetProject)) {
@@ -736,6 +750,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
     }
 
     get("/projects/{name}/export") {
+        if (!call.requireAuthenticated()) return@get
         val projectName = call.parameters["name"]
             ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
 
@@ -828,6 +843,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
     }
 
     post("/projects/import-gar") {
+        if (!call.requireAuthenticated()) return@post
         val instance = call.instanceHeader()
             ?: return@post call.respond(
                 HttpStatusCode.BadRequest,
