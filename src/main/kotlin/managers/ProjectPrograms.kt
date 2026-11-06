@@ -130,6 +130,9 @@ object ProjectPrograms {
         require(newName.isNotBlank()) { "New name is required" }
         mutate(projectName, projectDirectory) { root ->
             val (parent, name) = resolveParent(root, path)
+            require(parent.getFolder(newName) == null && parent.getFile(newName) == null) {
+                "'$newName' already exists in this folder"
+            }
             val folder = parent.getFolder(name)
             if (folder != null) folder.setName(newName) else
                 (parent.getFile(name) ?: throw IllegalArgumentException("'$path' does not exist"))
@@ -191,13 +194,17 @@ object ProjectPrograms {
         return entries
     }
 
-    private fun open(projectName: String, projectDirectory: Path): GhidraProject =
-        try {
+    private fun open(projectName: String, projectDirectory: Path): GhidraProject {
+        // The first project access in a fresh JVM has to initialise Ghidra,
+        // otherwise ToolUtils fails its static initialiser for the whole process.
+        check(WorkspaceManager.initializeGhidra()) { "Ghidra application is not available" }
+        return try {
             GhidraProject.openProject(projectDirectory.toAbsolutePath().toString(), projectName)
         } catch (e: Exception) {
             // LockException / FileInUseException both mean "somebody else has it".
             throw ProjectBusyException(projectName, ProjectLock.owner(projectDirectory, projectName), e)
         }
+    }
 
     private fun requireExists(projectDirectory: Path, projectName: String) {
         val grp = projectDirectory.resolve("$projectName.gpr")

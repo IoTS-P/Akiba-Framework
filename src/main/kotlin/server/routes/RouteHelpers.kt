@@ -311,8 +311,15 @@ fun errorPayload(e: Throwable): Pair<HttpStatusCode, Map<String, String?>> {
     // A project held by another session is a conflict, not a server fault: the
     // caller can retry later or pick another project.
     val busy = e as? ProjectBusyException
+    // `require`-style validation of a request (bad name, duplicate entry) is the
+    // caller's mistake, so it must read as 400 rather than a server fault.
+    val invalid = e as? IllegalArgumentException
     val status = dbEx?.statusCode
-        ?: if (busy != null) HttpStatusCode.Conflict else HttpStatusCode.InternalServerError
+        ?: when {
+            busy != null -> HttpStatusCode.Conflict
+            invalid != null -> HttpStatusCode.BadRequest
+            else -> HttpStatusCode.InternalServerError
+        }
     if (status == HttpStatusCode.InternalServerError) {
         logger.error("Unexpected route error (HTTP 500): ${e.message}", e)
     } else if (dbEx != null) {
