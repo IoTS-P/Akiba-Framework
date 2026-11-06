@@ -500,7 +500,7 @@ private fun runLibraryScript(
             .encodeToString(paramsJson.toByteArray(Charsets.UTF_8))
         appendLine("// Auto-injected scriptArgs")
         appendLine("private val __akibaScriptArgsJson = String(java.util.Base64.getDecoder().decode(${kotlinLiteral(paramsB64)}), Charsets.UTF_8)")
-        appendLine("val scriptArgs: Map<String, Any?> = com.fasterxml.jackson.module.kotlin.AkibaJson.mapper.readValue(__akibaScriptArgsJson, object : com.fasterxml.jackson.core.type.TypeReference<Map<String, Any?>>() {})")
+        appendLine("val scriptArgs: Map<String, Any?> = org.iotsplab.akiba.utils.AkibaJson.mapper.readValue(__akibaScriptArgsJson, object : com.fasterxml.jackson.core.type.TypeReference<Map<String, Any?>>() {})")
     }
     // Insert the injection after the imports, before the class definition.
     // Note: `sourceWithArgs` here is the (renamed) result of splicing the
