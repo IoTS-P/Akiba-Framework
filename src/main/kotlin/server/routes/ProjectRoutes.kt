@@ -130,6 +130,10 @@ data class CopyProgramRequest(
     val asName: String? = null,
 )
 
+/** Body of `POST /projects/{name}/folders` and `PATCH /projects/{name}/entries`. */
+data class FolderRequest(val path: String = "", val name: String)
+data class RenameRequest(val path: String, val newName: String)
+
 fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
 
     val logger: Logger = LogManager.getLogger("ProjectRoutes")
@@ -518,6 +522,77 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
      * session that fails mid-export yields a small `.error.txt` entry instead
      * of aborting the whole archive.
      */
+    /** The project's file tree: Ghidra projects are folder trees, not a flat list. */
+    get("/projects/{name}/tree") {
+        val name = call.parameters["name"].orEmpty()
+        if (!isValidProjectName(name)) {
+            return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name"))
+        }
+        try {
+            val entries = ProjectPrograms.tree(name, call.currentUserGhidraProjectsRoot())
+            call.respond(mapOf("entries" to entries.map {
+                mapOf("path" to it.path, "name" to it.name, "folder" to it.folder, "size" to it.size)
+            }))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    post("/projects/{name}/folders") {
+        val name = call.parameters["name"].orEmpty()
+        if (!isValidProjectName(name)) {
+            return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name"))
+        }
+        val req = call.receive<FolderRequest>()
+        try {
+            ProjectPrograms.createFolder(name, call.currentUserGhidraProjectsRoot(), req.path, req.name)
+            call.respond(mapOf("status" to "ok"))
+        } catch (e: IllegalArgumentException) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Cannot create folder")))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    patch("/projects/{name}/entries") {
+        val name = call.parameters["name"].orEmpty()
+        if (!isValidProjectName(name)) {
+            return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name"))
+        }
+        val req = call.receive<RenameRequest>()
+        try {
+            ProjectPrograms.renameEntry(name, call.currentUserGhidraProjectsRoot(), req.path, req.newName)
+            call.respond(mapOf("status" to "ok"))
+        } catch (e: IllegalArgumentException) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Cannot rename")))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    delete("/projects/{name}/entries") {
+        val name = call.parameters["name"].orEmpty()
+        if (!isValidProjectName(name)) {
+            return@delete call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name"))
+        }
+        val path = call.request.queryParameters["path"].orEmpty()
+        if (path.isBlank()) {
+            return@delete call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing path"))
+        }
+        try {
+            ProjectPrograms.deleteEntry(name, call.currentUserGhidraProjectsRoot(), path)
+            call.respond(mapOf("status" to "ok"))
+        } catch (e: IllegalArgumentException) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Cannot delete")))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
     /**
      * Copy a program from another project into this one.
      *
