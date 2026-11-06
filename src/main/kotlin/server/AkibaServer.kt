@@ -26,6 +26,7 @@ import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.llm.agent.runtime.AgentSessionReconciler
 import org.iotsplab.akiba.llm.agent.stream.StreamingChunkPusher
+import org.iotsplab.akiba.managers.ProjectIndex
 import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.managers.ProjectLock
 import org.iotsplab.akiba.server.db.ServerDatabase
@@ -112,6 +113,12 @@ object AkibaServer {
         runCatching {
             ProjectLock.sweepStaleOwners(java.nio.file.Path.of("ghidra_projects"))
         }.onFailure { logger.warn("Project owner sweep failed: ${it.message}") }
+
+        // Drop index rows of projects deleted while the server was down: the
+        // Details browser would otherwise keep showing their trees.
+        runCatching {
+            ProjectIndex.reconcile(java.nio.file.Path.of("ghidra_projects"))
+        }.onFailure { logger.warn("Project index reconcile failed: ${it.message}") }
 
         // ── JVM shutdown hook ─────────────────────────────────────────
         // Catches the SIGTERM case (entrypoint.sh's `cleanup` sends

@@ -42,6 +42,7 @@ import org.apache.logging.log4j.Logger
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
 import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.managers.GarImporter
+import org.iotsplab.akiba.managers.ProjectIndex
 import org.iotsplab.akiba.managers.ProjectPrograms
 import org.iotsplab.akiba.managers.WorkspaceManager
 
@@ -369,6 +370,9 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             }
         }
 
+        // The tree rows are keyed by the project's directory and would outlive the files.
+        ProjectIndex.forget(projectName, projectDirectory)
+
         call.respond(mapOf(
             "message" to "Project '$projectName' deleted",
             "deletedFiles" to deletedFiles,
@@ -514,29 +518,48 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
     }
 
     /**
-     * Batch-export agent sessions of a project as a ZIP of Markdown documents,
-     * one full agent-TREE export (root session + sub-agents) per selected id in
-     * `{ "sessionIds": [...] }`.
+     * The project's file tree, served from the database index.
      *
-     * Sessions from another project are skipped (ownership check), and a
-     * session that fails mid-export yields a small `.error.txt` entry instead
-     * of aborting the whole archive.
+     * Never opens the project: an agent session holding it would turn this page
+     * into a 409. A project that has no rows yet is indexed once (best effort),
+     * and if even that fails the answer is an empty tree flagged `stale`.
      */
-    /** The project's file tree: Ghidra projects are folder trees, not a flat list. */
     get("/projects/{name}/tree") {
         val name = call.parameters["name"].orEmpty()
         if (!isValidProjectName(name)) {
             return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name"))
         }
-        try {
-            val entries = ProjectPrograms.tree(name, call.currentUserGhidraProjectsRoot())
-            call.respond(mapOf("entries" to entries.map {
-                mapOf("path" to it.path, "name" to it.name, "folder" to it.folder, "size" to it.size)
-            }))
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
+        val projectDirectory = call.currentUserGhidraProjectsRoot()
+        if (!projectDirectory.resolve("$name.gpr").isRegularFile() ||
+            !projectDirectory.resolve("$name.rep").isDirectory()
+        ) {
+            return@get call.respond(
+                HttpStatusCode.NotFound,
+                mapOf("error" to "Project '$name' does not exist on disk")
+            )
         }
+
+        val indexed = runCatching { ProjectIndex.entries(name, projectDirectory) }
+            .getOrElse {
+                logger.warn("[tree] index unavailable for '$name': ${it.message}")
+                null
+            }
+        if (indexed == null) {
+            return@get call.respond(mapOf("entries" to emptyList<Any>(), "stale" to true))
+        }
+        if (indexed.isNotEmpty()) {
+            return@get call.respond(mapOf("entries" to indexed.toWireEntries(), "stale" to false))
+        }
+
+        // Nothing indexed yet: this is the one moment the project is opened,
+        // and a busy project simply leaves the browser with an empty, stale tree.
+        val refreshed = ProjectIndex.refresh(name, projectDirectory)
+        val rows = if (refreshed) {
+            runCatching { ProjectIndex.entries(name, projectDirectory) }.getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
+        call.respond(mapOf("entries" to rows.toWireEntries(), "stale" to !refreshed))
     }
 
     post("/projects/{name}/folders") {
@@ -942,6 +965,10 @@ private val FINISHED_SESSION_STATES = setOf("closed", "completed", "cancelled", 
 
 private fun isValidProjectName(name: String): Boolean =
     Regex("^[A-Za-z0-9._-]{1,64}$").matches(name) && !name.contains("..")
+
+/** Rows of the tree route, in the shape the Projects browser consumes. */
+private fun List<ProjectIndex.Entry>.toWireEntries(): List<Map<String, Any>> =
+    map { mapOf("path" to it.path, "name" to it.name, "folder" to it.folder, "size" to it.size) }
 
 /** Find the `bin/akiba` launch script (same logic as FileRoutes / WorkflowRoutes). */
 /** Recursively collect all files under [root] into [zip], preserving relative paths. */

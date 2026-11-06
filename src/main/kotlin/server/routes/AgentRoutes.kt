@@ -36,6 +36,7 @@ import org.iotsplab.akiba.llm.tool.ui.PendingChoiceSnapshot
 import org.iotsplab.akiba.llm.tool.ui.UserChoiceEvent
 import org.iotsplab.akiba.llm.tool.ui.UserChoiceManager
 import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.managers.ProjectIndex
 import org.iotsplab.akiba.managers.ProjectLock
 import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
@@ -813,6 +814,9 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         val req = runCatching { call.receive<CreateAgentSessionRequest>() }
             .getOrDefault(CreateAgentSessionRequest())
         val projectDirectory = call.currentUserProjectDirectory()
+        // The index is keyed by absolute path and the Projects routes resolve the
+        // same root, so both sides must name the project the same way.
+        val indexRoot = call.currentUserGhidraProjectsRoot()
         try {
             val info = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 val agentDbClient = AgentDatabaseClient(dbClient)
@@ -835,6 +839,8 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     // Only create/validate here. Holding the project would lock the
                     // worker out of the very project this session is about to use.
                     WorkspaceManager.releaseActiveProject()
+                    // Closed again, so its tree can be read and indexed for the browser.
+                    ProjectIndex.refresh(name, indexRoot)
                 } else if (req.projectName != null && req.projectName.isNotBlank()) {
                     resolvedProjectName = req.projectName
                     createNewProject = req.projectMode == "new"
@@ -844,6 +850,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                         req.projectName, createNewProject, projectDirectory
                     )
                     WorkspaceManager.releaseActiveProject()
+                    ProjectIndex.refresh(req.projectName, indexRoot)
                 } else {
                     resolvedProjectName = null
                     createNewProject = false

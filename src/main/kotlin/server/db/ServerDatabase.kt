@@ -21,6 +21,14 @@ object ServerDatabase {
     private lateinit var dataSource: PGSimpleDataSource
     private lateinit var connection: Connection
 
+    /**
+     * Whether [init] completed. Callers that can work without the database —
+     * the project index, for one — check this instead of catching the
+     * `lateinit` failure.
+     */
+    var isInitialized: Boolean = false
+        private set
+
     fun init(config: ServerDbConfig) {
         this.config = config
         dataSource = PGSimpleDataSource().apply {
@@ -32,6 +40,7 @@ object ServerDatabase {
         }
         connection = dataSource.connection
         initSchema()
+        isInitialized = true
     }
 
     /**
@@ -64,6 +73,23 @@ object ServerDatabase {
                     token VARCHAR(512) UNIQUE NOT NULL,
                     created_at TIMESTAMPTZ DEFAULT now(),
                     expires_at TIMESTAMPTZ NOT NULL
+                )
+            """.trimIndent())
+
+            // Project file tree cache. The Projects browser reads these rows
+            // instead of opening the project, which would collide with the
+            // channel lock of a running agent session. `project_dir` is the
+            // project's absolute path, so equally named projects in different
+            // instances stay apart; `path` is project-relative and `/`-separated.
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS project_entries (
+                    project_dir TEXT NOT NULL,
+                    path        TEXT NOT NULL,
+                    name        TEXT NOT NULL,
+                    folder      BOOLEAN NOT NULL,
+                    size        BIGINT NOT NULL DEFAULT 0,
+                    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (project_dir, path)
                 )
             """.trimIndent())
         }
@@ -125,6 +151,15 @@ object ServerDatabase {
     }
 
     fun getConnection(): Connection = connection
+
+    /**
+     * A fresh connection for callers that run their own transaction.
+     *
+     * [getConnection] hands out the one connection the server keeps open, so
+     * `autoCommit = false` there would swallow every other caller's statements
+     * into that transaction. Callers own the result and must close it.
+     */
+    fun newConnection(): Connection = dataSource.connection
 
     fun close() {
         connection.close()

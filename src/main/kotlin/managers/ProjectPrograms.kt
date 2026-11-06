@@ -12,16 +12,12 @@ import org.apache.logging.log4j.Logger
 private val logger: Logger = LogManager.getLogger("ProjectPrograms")
 
 /**
- * Copy a program from one Ghidra project into another.
+ * Read and edit the contents of a Ghidra project.
  *
- * Ghidra projects are self-contained: a program belongs to exactly one `.rep`,
- * so sharing analysis between conversations means copying the domain file. Both
- * projects are opened by this process for the duration of the copy, which is the
- * only way `DomainFile.copyTo` can see a destination folder.
- *
- * The source project is taken with its own channel lock, so a program cannot be
- * copied out of a project another process is using — the caller gets the same
- * "busy" answer as opening it would give.
+ * Every call opens the project, does its work and closes it again: Ghidra
+ * grants one process at a time, so a project held by an agent session answers
+ * "busy" instead. The Projects browser therefore reads [ProjectIndex], and
+ * this object refreshes that index whenever it had a project open anyway.
  */
 object ProjectPrograms {
 
@@ -48,7 +44,7 @@ object ProjectPrograms {
 
         var source: GhidraProject? = null
         var target: GhidraProject? = null
-        try {
+        val outcome = try {
             source = open(sourceProject, projectDirectory)
             target = open(targetProject, projectDirectory)
 
@@ -66,7 +62,7 @@ object ProjectPrograms {
                 "Copied program '{}' from project '{}' to '{}' as '{}'",
                 programName, sourceProject, targetProject, copied.name
             )
-            return CopyOutcome(
+            CopyOutcome(
                 source = sourceProject,
                 program = programName,
                 target = targetProject,
@@ -76,6 +72,10 @@ object ProjectPrograms {
             runCatching { target?.close() }
             runCatching { source?.close() }
         }
+
+        // Both handles are released, so the index can reopen the target itself.
+        ProjectIndex.refresh(targetProject, projectDirectory)
+        return outcome
     }
 
     /** Programs of a project, for the UI to offer as copy sources. */
@@ -152,12 +152,16 @@ object ProjectPrograms {
     private fun <T> mutate(projectName: String, projectDirectory: Path, block: (DomainFolder) -> T): T {
         requireExists(projectDirectory, projectName)
         var project: GhidraProject? = null
-        return try {
+        val result = try {
             project = open(projectName, projectDirectory)
             block(project.projectData.rootFolder)
         } finally {
             runCatching { project?.close() }
         }
+        // The project is closed again, so `tree` can reopen it without hitting
+        // this process's own channel lock.
+        ProjectIndex.refresh(projectName, projectDirectory)
+        return result
     }
 
     private fun resolveFolder(root: DomainFolder, path: String): DomainFolder {
