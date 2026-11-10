@@ -16,7 +16,7 @@ import org.iotsplab.akiba.llm.tool.core.ToolParameter
 /**
  * Manages the Ghidra API documentation on the local filesystem.
  *
- * The docs directory (`ghidra_api_12.1/`) holds the standard Javadoc output:
+ * The docs directory (`ghidra_api_12.1.4/`) holds the standard Javadoc output:
  * per-class `.html` and `.json` files side by side, plus the
  * `type-search-index.js` / `member-search-index.js` indexes that back the
  * search action.  Each `.json` mirrors its class with `comment`, `javadoc`,
@@ -25,12 +25,12 @@ import org.iotsplab.akiba.llm.tool.core.ToolParameter
  */
 object GhidraDocsManager {
 
-    private const val GHIDRA_VERSION = "12.1"
+    private const val GHIDRA_VERSION = "12.1.4"
 
     /** URL of the official Ghidra release zip (pinned, since version cadence is low). */
     private const val GHIDRA_RELEASE_URL =
         "https://github.com/NationalSecurityAgency/ghidra/releases/download/" +
-        "Ghidra_12.1_build/ghidra_12.1_PUBLIC_20260513.zip"
+        "Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip"
 
     /** Base directory under user home for Akiba data. */
     private val AKIBA_HOME: Path = Path.of(System.getProperty("user.home"), ".akiba")
@@ -42,7 +42,7 @@ object GhidraDocsManager {
     private val DOCS_DIR: Path = AKIBA_HOME.resolve("docs")
 
     /** Top-level directory name inside the release zip. */
-    private const val RELEASE_TOP_DIR = "ghidra_12.1_PUBLIC"
+    private const val RELEASE_TOP_DIR = "ghidra_12.1.4_PUBLIC"
 
     /**
      * Name of the directory under [DOCS_DIR] that holds the Ghidra API
@@ -283,11 +283,11 @@ object GhidraDocsManager {
      * Replace the first path segment of a forward-slash zip entry with
      * [newFirstSegment].
      *
-     * Examples (with `newFirstSegment = "ghidra_api_12.1"`):
-     *   `api/`                 → `ghidra_api_12.1/`
-     *   `api/index.html`       → `ghidra_api_12.1/index.html`
-     *   `api/foo/bar.html`     → `ghidra_api_12.1/foo/bar.html`
-     *   `top_level_file_only`  → `ghidra_api_12.1/top_level_file_only`
+     * Examples (with `newFirstSegment = "ghidra_api_12.1.4"`):
+     *   `api/`                 → `ghidra_api_12.1.4/`
+     *   `api/index.html`       → `ghidra_api_12.1.4/index.html`
+     *   `api/foo/bar.html`     → `ghidra_api_12.1.4/foo/bar.html`
+     *   `top_level_file_only`  → `ghidra_api_12.1.4/top_level_file_only`
      */
     private fun replaceFirstSegment(path: String, newFirstSegment: String): String? {
         val normalized = path.trimStart('/')
