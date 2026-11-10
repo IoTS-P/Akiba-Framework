@@ -124,10 +124,27 @@ object GhidraDocsManager {
             val releaseRoot = GHIDRA_DIR.resolve(RELEASE_TOP_DIR)
             if (!releaseRoot.exists()) {
                 val zipPath = GHIDRA_DIR.resolve("ghidra_release.zip")
-                if (!zipPath.exists()) {
+                // A download that died half-way leaves a truncated archive whose
+                // header still looks fine, so the next start reused it and died
+                // in ZipInputStream with "Unexpected end of ZLIB input stream".
+                if (Files.exists(zipPath) && !isReadableZip(zipPath)) {
+                    Files.deleteIfExists(zipPath)
+                }
+                if (!Files.exists(zipPath)) {
                     downloadFile(GHIDRA_RELEASE_URL, zipPath)
                 }
-                extractZip(zipPath, GHIDRA_DIR)
+                if (!isReadableZip(zipPath)) {
+                    Files.deleteIfExists(zipPath)
+                    throw IOException("downloaded Ghidra release is not a readable zip: $zipPath")
+                }
+                try {
+                    extractZip(zipPath, GHIDRA_DIR)
+                } catch (e: Throwable) {
+                    // A half-extracted tree would make the next start skip the
+                    // download and fail again on a missing docs directory.
+                    runCatching { deleteRecursively(releaseRoot) }
+                    throw e
+                }
                 // Best-effort cleanup of the (large) release zip after extraction.
                 try { Files.deleteIfExists(zipPath) } catch (_: Exception) {}
             }
@@ -185,12 +202,33 @@ object GhidraDocsManager {
                 conn.disconnect()
                 throw IOException("HTTP $code while downloading $current")
             }
+            // Download beside the target and move it into place only once the
+            // whole body arrived, so an interrupted transfer can never be
+            // mistaken for a complete archive.
+            Files.createDirectories(target.parent)
+            val partial = target.resolveSibling("${target.fileName}.part")
             BufferedInputStream(conn.inputStream).use { input ->
-                Files.createDirectories(target.parent)
-                Files.copy(input, target, StandardCopyOption.REPLACE_EXISTING)
+                Files.copy(input, partial, StandardCopyOption.REPLACE_EXISTING)
             }
+            Files.move(partial, target, StandardCopyOption.REPLACE_EXISTING)
             conn.disconnect()
             return
+        }
+    }
+
+    /** True when [zipFile] is a complete archive with at least one entry. */
+    private fun isReadableZip(zipFile: Path): Boolean =
+        try {
+            java.util.zip.ZipFile(zipFile.toFile()).use { it.size() > 0 }
+        } catch (_: Exception) {
+            false
+        }
+
+    /** Delete a directory tree without letting a stubborn entry abort setup. */
+    private fun deleteRecursively(dir: Path) {
+        if (!Files.exists(dir)) return
+        Files.walk(dir).sorted(Comparator.reverseOrder()).use { paths ->
+            paths.forEach { runCatching { Files.deleteIfExists(it) } }
         }
     }
 
