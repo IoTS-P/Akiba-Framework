@@ -14,7 +14,7 @@ The Akiba Runtime Framework is the runtime entry point for the Akiba tool.
 
 ### Ghidra Preprocessing
 
-1. Download Ghidra 12.1.4 from here: [Link](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip)
+1. Download Ghidra 12.2 from here: [Link](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.2_build/ghidra_12.2_PUBLIC_20261016.zip)
 2. Extract Ghidra.zip
 3. (Optional but may be required by some modules) Extract some Ghidra official extensions (zip files) to `/Ghidra/Features`, so that Ghidra can package these extensions into `ghidra.jar` when building the JAR (by default, the `MachineLearning` extension is packaged)
 4. Go to the `/support` directory and run the `buildGhidraJar` script file (run `buildGhidraJar.bat` on Windows)

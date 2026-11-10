@@ -14,7 +14,7 @@ Akiba 运行框架是 Akiba 工具的运行入口。
 
 ### Ghidra 预处理
 
-1. 在这里下载 Ghidra 12.1.4：[链接](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip)
+1. 在这里下载 Ghidra 12.2：[链接](https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.2_build/ghidra_12.2_PUBLIC_20261016.zip)
 2. 解压 Ghidra.zip
 3. (可选但一些模块可能需要) 解压一些 Ghidra 官方扩展 (zip 文件) 到 `/Ghidra/Features`，这样 Ghidra 在 Jar 打包时可以将这些扩展打包进 `ghidra.jar` （默认打包 `MachineLearning` 扩展）
 4. 到 `/support` 目录运行 `buildGhidraJar` 脚本文件（在 Windows 上运行`buildGhidraJar.bat`）

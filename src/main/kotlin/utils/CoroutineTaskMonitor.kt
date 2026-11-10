@@ -29,7 +29,7 @@ class CoroutineTaskMonitor (
     override fun isCancelled(): Boolean = !job.isActive || delegate.isCancelled
 
     @Deprecated("Deprecated in Ghidra")
-    override fun checkCanceled() {
+    override fun checkCancelled() {
         if (!job.isActive)
             throw CancelledException("Cancelled by coroutine")
         delegate.checkCancelled()
@@ -75,7 +75,7 @@ class CoroutineTaskMonitor (
         delegate.isCancelEnabled
 
     @Deprecated("Deprecated in Ghidra")
-    override fun clearCanceled() =
+    override fun clearCancelled() =
         delegate.clearCancelled()
 
     override fun setShowProgressValue(var1: Boolean) =
