@@ -1332,6 +1332,10 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 // A busy project is not a configuration error: answer 409 with
                 // the holder so the UI can say who is using it.
                 e is org.iotsplab.akiba.managers.ProjectBusyException -> {
+                    // The session was flipped to running before the lock was
+                    // attempted; leaving it there made the turn look live
+                    // forever (spinner, out-of-date status).
+                    markManualChatFailed(daemonHost, daemonPort, instance, id, e.message)
                     val (status, body) = errorPayload(e)
                     call.respond(status, body)
                 }
