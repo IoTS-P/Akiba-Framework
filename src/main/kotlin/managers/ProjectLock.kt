@@ -106,7 +106,12 @@ object ProjectLock {
                     WorkspaceManager.releaseActiveProject()
                     null
                 } catch (e: Exception) {
-                    ProjectBusyException(projectName, owner(projectDirectory, projectName), e)
+                    // A failure is only "busy" when somebody actually holds the
+                    // project.  Reporting every open failure as "in use" sent
+                    // callers chasing a phantom session while the real problem
+                    // (uninitialised Ghidra, bad path, corrupt project) was hidden.
+                    val holder = owner(projectDirectory, projectName)
+                    if (holder != null) ProjectBusyException(projectName, holder, e) else throw e
                 }
             }
         }
