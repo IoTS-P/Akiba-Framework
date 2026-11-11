@@ -1329,6 +1329,12 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 // Respond 200 so the frontend ends the turn calmly.
                 ManualAgentProcessRegistry.consumeCancelled(id) ->
                     call.respond(mapOf("status" to "cancelled", "sessionId" to id))
+                // A busy project is not a configuration error: answer 409 with
+                // the holder so the UI can say who is using it.
+                e is org.iotsplab.akiba.managers.ProjectBusyException -> {
+                    val (status, body) = errorPayload(e)
+                    call.respond(status, body)
+                }
                 e is IllegalStateException -> {
                     markManualChatFailed(daemonHost, daemonPort, instance, id, e.message)
                     call.respond(HttpStatusCode.ServiceUnavailable,

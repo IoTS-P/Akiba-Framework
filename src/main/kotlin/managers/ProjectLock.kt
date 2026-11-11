@@ -31,12 +31,18 @@ data class ProjectLockOwner(
     }
 }
 
-/** Thrown when a project is held by somebody else and the caller chose not to wait. */
+/**
+ * Thrown when a project is held by somebody else and the caller chose not to wait.
+ *
+ * Deliberately NOT an [IllegalStateException]: handlers that translate a state
+ * error into "not configured" were swallowing it and reporting the lock as a
+ * configuration fault.
+ */
 class ProjectBusyException(
     val projectName: String,
     val owner: ProjectLockOwner?,
     cause: Throwable? = null,
-) : IllegalStateException(
+) : Exception(
     buildString {
         append("Project '").append(projectName).append("' is in use")
         owner?.let {
