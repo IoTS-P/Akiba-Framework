@@ -45,13 +45,17 @@ import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.managers.GarImporter
 import org.iotsplab.akiba.managers.ProjectIndex
+import org.iotsplab.akiba.managers.ProjectLock
+import org.iotsplab.akiba.managers.ProjectLockOwner
 import org.iotsplab.akiba.managers.ProjectPrograms
 import org.iotsplab.akiba.managers.WorkspaceManager
 
 data class GhidraProjectInfo(
     val name: String,
     val sessionCount: Int,
-    val fileCount: Int
+    val fileCount: Int,
+    /** Who holds the project right now, or null when it is free. */
+    val locked: ProjectLockOwner? = null,
 )
 
 private val projectTextExportLock = ReentrantLock()
@@ -205,7 +209,8 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                 GhidraProjectInfo(
                     name = name,
                     sessionCount = sessionCounts[name] ?: 0,
-                    fileCount = fileCount
+                    fileCount = fileCount,
+                    locked = ProjectLock.owner(projectDirectory, name)
                 )
             }.sortedWith(compareByDescending<GhidraProjectInfo> { it.sessionCount }.thenBy { it.name })
 
@@ -247,6 +252,19 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
 
         if (!grpFile.isRegularFile() && !repDir.isDirectory()) {
             return@delete call.respond(HttpStatusCode.NotFound, mapOf("error" to "Project '$projectName' not found"))
+        }
+
+        // Deleting under a live session would pull the .rep out from under it;
+        // the operator stops the conversation first.
+        ProjectLock.owner(projectDirectory, projectName)?.let { holder ->
+            return@delete call.respond(
+                HttpStatusCode.Conflict,
+                mapOf(
+                    "error" to "Project '$projectName' is in use by session " +
+                        "${holder.sessionId ?: "?"} (pid ${holder.pid})",
+                    "locked" to holder
+                )
+            )
         }
 
         // Release the active project if it's the one being deleted.
