@@ -56,6 +56,28 @@ object ProjectIndex {
         }
     }
 
+    /** Last successful rebuild per project, so browsing does not reopen it every time. */
+    private val lastRefresh = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val MIN_REFRESH_INTERVAL_MS = 30_000L
+
+    /**
+     * Rebuild the index when the project is free and the copy is older than
+     * [MIN_REFRESH_INTERVAL_MS].
+     *
+     * Projects change outside Akiba too — a Ghidra tool can save a new program —
+     * and without this the browser kept showing whatever the last mutation left
+     * behind. A held project is skipped: opening it would fight the session.
+     */
+    fun refreshIfStale(projectName: String, projectDirectory: Path): Boolean {
+        if (ProjectLock.owner(projectDirectory, projectName) != null) return false
+        val key = projectKey(projectName, projectDirectory)
+        val now = System.currentTimeMillis()
+        val last = lastRefresh[key] ?: 0L
+        if (now - last < MIN_REFRESH_INTERVAL_MS) return false
+        lastRefresh[key] = now
+        return refresh(projectName, projectDirectory)
+    }
+
     /**
      * The indexed tree of [projectName], folders first and then by path.
      *

@@ -584,7 +584,12 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             return@get call.respond(mapOf("entries" to emptyList<Any>(), "stale" to true))
         }
         if (indexed.isNotEmpty()) {
-            return@get call.respond(mapOf("entries" to indexed.toWireEntries(), "stale" to false))
+            // Refresh in the background when the copy is old and the project is
+            // free, then answer with what is on disk now rather than last week.
+            ProjectIndex.refreshIfStale(name, projectDirectory)
+            val fresh = runCatching { ProjectIndex.entries(name, projectDirectory) }
+                .getOrDefault(indexed)
+            return@get call.respond(mapOf("entries" to fresh.toWireEntries(), "stale" to false))
         }
 
         // Nothing indexed yet: this is the one moment the project is opened,

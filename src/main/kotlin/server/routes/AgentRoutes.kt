@@ -1249,6 +1249,15 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 workerError = e.message ?: e.javaClass.simpleName
                 throw e
             } finally {
+                // The worker had the project open; with it gone the index can be
+                // rebuilt, which is what keeps the browser's tree current.
+                sessionInfo.projectName?.takeIf { it.isNotBlank() }?.let { name ->
+                    runCatching {
+                        withContext(Dispatchers.IO) {
+                            ProjectIndex.refresh(name, projectDirectory)
+                        }
+                    }
+                }
                 ManualAgentTurnRegistry.remove(token)
                 runCatching { Files.deleteIfExists(workerConfig.file) }
                 // The worker JVM exits with its terminal chunk possibly still
@@ -1578,8 +1587,35 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             }
             call.respond(mapOf("status" to "cancelled", "sessionId" to id))
         } else {
-            call.respond(HttpStatusCode.Conflict, mapOf(
-                "error" to "No running manual chat process for this session"
+            // Nothing is running: either the turn already ended, or the server
+            // restarted under it and left the row "running". Either way the
+            // session must not stay un-abortable, so close it here.
+            val instance = call.instanceHeader()
+            if (instance != null && !call.requireInstanceOwnership(instance))
+                return@post
+            var recovered = false
+            if (instance != null) {
+                runCatching {
+                    withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                        val agentDbClient = AgentDatabaseClient(dbClient)
+                        val session = agentDbClient.getSession(id)
+                        if (session != null &&
+                            (session.status == "running" || session.runtimeState == "running")
+                        ) {
+                            agentDbClient.updateSession(id, status = "closed")
+                            agentDbClient.setRuntimeState(
+                                id,
+                                org.iotsplab.akiba.llm.agent.runtime.RuntimeState.CLOSED.wire(),
+                                "orphaned_chat_closed_by_user"
+                            )
+                            recovered = true
+                        }
+                    }
+                }
+            }
+            call.respond(mapOf(
+                "status" to if (recovered) "recovered" else "idle",
+                "sessionId" to id,
             ))
         }
     }
