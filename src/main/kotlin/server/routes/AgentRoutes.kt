@@ -65,12 +65,20 @@ data class CreateAgentSessionRequest(
     val parentSessionId: String? = null
 )
 
+/** Fields a client may change on an existing session. */
+data class SessionPatchRequest(
+    val sessionName: String? = null,
+    val programName: String? = null,
+)
+
 data class AgentSessionResponse(
     val sessionId: String,
     val sessionName: String?,
     val status: String,
     val modelName: String?,
     val projectName: String?,
+    /** Program the session is working on inside [projectName]. */
+    val currentProgram: String? = null,
     val moduleName: String?,
     /** Workflow run that spawned this session (null for interactive sessions). */
     val workflowId: String? = null,
@@ -1195,7 +1203,8 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             // all: the worker cannot run any analysis tool without one.
             var programName: String? = null
             if (sessionInfo.binaryId == null && sessionInfo.projectName != null) {
-                programName = findFirstProgramName(sessionInfo.projectName, call.currentUserGhidraProjectsRoot())
+                programName = sessionInfo.currentProgram?.takeIf { it.isNotBlank() }
+                    ?: findFirstProgramName(sessionInfo.projectName, call.currentUserGhidraProjectsRoot())
                 if (programName == null) {
                     markManualChatFailed(daemonHost, daemonPort, instance, id,
                         "project has no program")
@@ -1741,6 +1750,42 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
     }
 
     // ------ Delete session ----------------------------------------------------
+    /**
+     * Rename a conversation or point it at a different program.
+     *
+     * Both live on the session row so the choice survives a restart and is the
+     * one the next turn starts from.
+     */
+    patch("/agent/sessions/{id}") {
+        if (!call.requireAuthenticated()) return@patch
+        val instance = call.requireInstanceHeader() ?: return@patch
+        val id = call.parameters["id"].orEmpty()
+        if (id.isBlank()) {
+            return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
+        }
+        val req = call.receive<SessionPatchRequest>()
+        if (req.sessionName == null && req.programName == null) {
+            return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Nothing to update"))
+        }
+        val name = req.sessionName?.trim()?.takeIf { it.isNotEmpty() }
+        try {
+            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                AgentDatabaseClient(dbClient).updateSession(
+                    id,
+                    sessionName = name,
+                    programName = req.programName?.trim()?.takeIf { it.isNotEmpty() },
+                )
+            }
+            val info = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                AgentDatabaseClient(dbClient).getSession(id)
+            }
+            call.respond(info.toResponse())
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
     delete("/agent/sessions/{id}") {
         val instance = call.requireInstanceHeader() ?: return@delete
         val id = call.parameters["id"].orEmpty()
@@ -2425,6 +2470,7 @@ private fun SessionInfo.toResponse(
     status = status,
     modelName = modelName,
     projectName = projectName,
+    currentProgram = currentProgram,
     moduleName = moduleName,
     workflowId = workflowId,
     createdAt = createdAt,
