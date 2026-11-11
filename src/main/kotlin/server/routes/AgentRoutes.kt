@@ -1293,9 +1293,20 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     .filter { it.role != "system" }
             }
             val userMsg = msgs.lastOrNull { it.role == "user" }
-                ?: throw IllegalStateException("User message was not persisted")
             val asstMsg = msgs.lastOrNull { it.role == "assistant" }
-                ?: throw IllegalStateException("Assistant message was not persisted")
+            if (asstMsg == null || userMsg == null) {
+                // The worker ran but recorded nothing, or died before it could.
+                // These used to throw IllegalStateException, which the catch
+                // below reported as "Agent is not configured" — a wrong reason
+                // for what is almost always a model failure or a killed worker.
+                val reason = workerError?.let { "The agent worker stopped before replying ($it)." }
+                    ?: "The agent produced no reply."
+                markManualChatFailed(daemonHost, daemonPort, instance, id, reason)
+                return@post call.respond(
+                    HttpStatusCode.BadGateway,
+                    mapOf("error" to reason)
+                )
+            }
 
             call.respond(ChatResponse(
                 sessionId = id,
