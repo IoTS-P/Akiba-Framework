@@ -1219,16 +1219,13 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             var workerError: String? = null
             try {
                 val lockedProject = sessionInfo.projectName?.takeIf { it.isNotBlank() }
-                if (lockedProject == null) {
-                    runManualAgentWorker(
-                        workerConfig = workerConfig,
-                        serverPort = serverPort,
-                        token = token,
-                        sessionInfo = sessionInfo,
-                        instance = instance
-                    )
-                } else {
-                    ProjectLock.asOwner(lockedProject, projectDirectory, sessionInfo.sessionId, instance) {
+                // The worker runs for the whole turn and this call waits for it.
+                // Doing that on the caller's Netty event loop pins the browser's
+                // keep-alive connection: every other request on it — the message
+                // and chunk polls included — queues behind the turn, so the UI
+                // freezes until the answer is finished.
+                withContext(Dispatchers.IO) {
+                    if (lockedProject == null) {
                         runManualAgentWorker(
                             workerConfig = workerConfig,
                             serverPort = serverPort,
@@ -1236,6 +1233,16 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                             sessionInfo = sessionInfo,
                             instance = instance
                         )
+                    } else {
+                        ProjectLock.asOwner(lockedProject, projectDirectory, sessionInfo.sessionId, instance) {
+                            runManualAgentWorker(
+                                workerConfig = workerConfig,
+                                serverPort = serverPort,
+                                token = token,
+                                sessionInfo = sessionInfo,
+                                instance = instance
+                            )
+                        }
                     }
                 }
             } catch (e: Exception) {
