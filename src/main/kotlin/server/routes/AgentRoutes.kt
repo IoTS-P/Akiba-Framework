@@ -1146,6 +1146,9 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             req.systemPrompt?.takeIf { it.isNotBlank() } ?: DEFAULT_AGENT_SYSTEM_PROMPT
         )
         val projectDirectory = call.currentUserProjectDirectory()
+        // Resolved here, not inside the finally block: the index is keyed by
+        // this root and the call object must not be touched once responding.
+        val indexRoot = call.currentUserGhidraProjectsRoot()
         val serverPort = call.request.local.serverPort
 
         // Validate a requested model switch against the configured LLM
@@ -1255,7 +1258,9 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 sessionInfo.projectName?.takeIf { it.isNotBlank() }?.let { name ->
                     runCatching {
                         withContext(Dispatchers.IO) {
-                            ProjectIndex.refresh(name, projectDirectory)
+                            // The index is keyed by the Ghidra projects root, not by
+                            // the session workspace directory.
+                            ProjectIndex.refresh(name, indexRoot)
                         }
                     }
                 }
