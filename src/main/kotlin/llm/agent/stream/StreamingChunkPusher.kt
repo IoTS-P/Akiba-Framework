@@ -42,6 +42,7 @@ object StreamingChunkPusher {
         val error: String?,
         val instanceName: String?,
         val newGeneration: Boolean,
+        val kind: String,
     )
 
     /**
@@ -119,6 +120,7 @@ object StreamingChunkPusher {
                             "done" to c.done,
                             "error" to c.error,
                             "newGeneration" to c.newGeneration,
+                            "kind" to c.kind,
                         )
                     },
                 )
@@ -292,6 +294,7 @@ object StreamingChunkPusher {
         error: String? = null,
         instanceName: String? = null,
         newGeneration: Boolean = false,
+        kind: String = "text",
     ) {
         if (sessionId.isBlank()) return
         val port = serverPort()
@@ -306,6 +309,7 @@ object StreamingChunkPusher {
                     done = done,
                     error = error,
                     newGeneration = newGeneration,
+                    kind = kind,
                 )
             )
             return
@@ -323,6 +327,7 @@ object StreamingChunkPusher {
                 error = error,
                 instanceName = instanceName,
                 newGeneration = newGeneration,
+                kind = kind,
             )
         )
     }

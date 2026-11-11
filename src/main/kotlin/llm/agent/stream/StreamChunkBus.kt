@@ -17,6 +17,13 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object StreamChunkBus {
 
+    /** Answer text. */
+    const val KIND_TEXT = "text"
+    /** A tool call started; `delta` carries its JSON description. */
+    const val KIND_TOOL_START = "tool_start"
+    /** That tool call finished; `delta` carries its JSON result summary. */
+    const val KIND_TOOL_END = "tool_end"
+
     /** Maximum chunks retained per generation. */
     private const val MAX_CHUNKS = 8192
 
@@ -41,6 +48,8 @@ object StreamChunkBus {
         val seq: Long = 0L,
         /** True on the producer's first chunk of a new LLM call. */
         val newGeneration: Boolean = false,
+        /** `text` for answer deltas, `tool_start` / `tool_end` for tool events. */
+        val kind: String = KIND_TEXT,
     )
 
     /** Rolling per-session history of one LLM generation. */
@@ -90,7 +99,10 @@ object StreamChunkBus {
         if (chunk.sessionId.isBlank()) return
         val hist = histories.getOrPut(chunk.sessionId) { SessionHistory() }
         synchronized(hist.lock) {
-            val implicitStart = chunk.delta.isNotEmpty() && chunk.chunkCount <= 1
+            val isText = chunk.kind == KIND_TEXT
+            // Tool events ride the same stream but never start or update a
+            // generation: their payload is not answer text.
+            val implicitStart = isText && chunk.delta.isNotEmpty() && chunk.chunkCount <= 1
             if (chunk.newGeneration || (!hist.generationExplicit && implicitStart)) {
                 // New LLM generation — drop anything from the previous one.
                 hist.generation++
@@ -100,7 +112,9 @@ object StreamChunkBus {
                 hist.error = null
                 hist.maxDeltaCount = 0
             }
-            if (chunk.delta.isNotEmpty()) {
+            // Text deltas are deduped by chunkCount; tool events carry no
+            // count of their own and must always land.
+            if (isText && chunk.delta.isNotEmpty()) {
                 if (chunk.chunkCount <= hist.maxDeltaCount) return
                 hist.maxDeltaCount = chunk.chunkCount
             }

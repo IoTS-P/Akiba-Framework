@@ -249,4 +249,35 @@ class StreamedTextToolCallTest {
         assertTrue(calls.isEmpty(), "unregistered tool must not run: $calls")
         assertTrue(ToolCallParser.hasExplicitTextCall(reply))
     }
+
+    @Test
+    fun `a tool event rides the stream without starting a generation`() {
+        val sessionId = "session-tool-event"
+        val payload = """{"id":"script_library:1","name":"script_library","args":"{}"}"""
+        StreamChunkBus.publish(
+            StreamChunkBus.Chunk(sessionId, delta = "", chunkCount = 0, byteCount = 0, newGeneration = true)
+        )
+        StreamChunkBus.publish(
+            StreamChunkBus.Chunk(sessionId, delta = "hello", chunkCount = 1, byteCount = 5)
+        )
+        // A tool starts in the middle of the answer: the event must not wipe
+        // the text already streamed, and must not be read as answer text.
+        StreamChunkBus.publish(
+            StreamChunkBus.Chunk(
+                sessionId = sessionId,
+                delta = payload,
+                chunkCount = 0,
+                byteCount = 0,
+                kind = StreamChunkBus.KIND_TOOL_START,
+            )
+        )
+        StreamChunkBus.publish(
+            StreamChunkBus.Chunk(sessionId, delta = " world", chunkCount = 2, byteCount = 11)
+        )
+        val snapshot = StreamChunkBus.historySince(sessionId, since = 0)!!
+        val textChunks = snapshot.chunks.filter { it.kind == StreamChunkBus.KIND_TEXT }
+        assertEquals("hello world", textChunks.joinToString("") { it.delta })
+        assertEquals(1, snapshot.chunks.count { it.kind == StreamChunkBus.KIND_TOOL_START })
+        assertEquals(1, snapshot.generation)
+    }
 }

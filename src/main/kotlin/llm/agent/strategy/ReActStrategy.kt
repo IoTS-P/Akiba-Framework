@@ -8,11 +8,15 @@ import org.iotsplab.akiba.llm.client.ChatCompletion
 import org.iotsplab.akiba.llm.memory.AgentChatMessage
 import org.iotsplab.akiba.llm.memory.ChatMemory
 import org.iotsplab.akiba.llm.tool.core.ToolCallParser
+import org.iotsplab.akiba.utils.AkibaJson
 import org.iotsplab.akiba.llm.agent.core.AgentHarness
 import org.iotsplab.akiba.llm.agent.core.AgentHarnessDirective
 import org.iotsplab.akiba.llm.agent.core.AgentPrompts
 import org.iotsplab.akiba.llm.agent.core.AgentResult
 import org.iotsplab.akiba.llm.agent.core.AgentStrategy
+import org.iotsplab.akiba.llm.agent.core.ParsedToolCall
+import org.iotsplab.akiba.llm.agent.stream.StreamChunkBus
+import org.iotsplab.akiba.llm.agent.stream.StreamingChunkPusher
 import org.iotsplab.akiba.llm.agent.core.DUPLICATE_LOOP_FORCE_COMPACT_THRESHOLD
 import org.iotsplab.akiba.llm.agent.core.LoopStats
 import org.iotsplab.akiba.llm.agent.core.MAX_BATCH_TOOL_CALLS
@@ -278,7 +282,10 @@ class ReActStrategy : AgentStrategy {
                             0L,
                         )
                     } else {
-                        ctx.executeToolWithDuration(toolCall)
+                        publishToolEvent(ctx, toolCall, StreamChunkBus.KIND_TOOL_START, 0L)
+                        val executed = ctx.executeToolWithDuration(toolCall)
+                        publishToolEvent(ctx, toolCall, StreamChunkBus.KIND_TOOL_END, executed.durationMs)
+                        executed
                     }
                     val observation = toolResult.output
                     val durationMs = toolResult.durationMs
@@ -513,6 +520,40 @@ class ReActStrategy : AgentStrategy {
      * Whether tools are supplied through the provider's structured function
      * calling channel (as opposed to `tool_call` JSON embedded in prose).
      */
+    /**
+     * Push a tool lifecycle event onto the session's live stream.
+     *
+     * Without it the UI only learned about a tool once the next message was
+     * stored, which on a long analysis meant staring at silence for minutes.
+     */
+    private fun publishToolEvent(
+        ctx: StrategyContext,
+        toolCall: ParsedToolCall,
+        kind: String,
+        durationMs: Long,
+    ) {
+        val sessionId = ctx.sessionId ?: return
+        val payload = runCatching {
+            AkibaJson.mapper.writeValueAsString(
+                mapOf(
+                    "id" to "${toolCall.name}:${toolCall.argumentsJson.hashCode()}",
+                    "name" to toolCall.name,
+                    "args" to toolCall.argumentsJson.take(300),
+                    "ms" to durationMs,
+                )
+            )
+        }.getOrNull() ?: return
+        runCatching {
+            StreamingChunkPusher.publish(
+                sessionId = sessionId,
+                delta = payload,
+                chunkCount = 0,
+                byteCount = 0,
+                kind = kind,
+            )
+        }
+    }
+
     private fun usesNativeToolProtocol(ctx: StrategyContext): Boolean =
         !ctx.toolRegistry.isEmpty() && ctx.client.supportsToolCalling()
 

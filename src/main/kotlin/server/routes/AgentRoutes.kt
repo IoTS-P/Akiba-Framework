@@ -586,6 +586,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 mapOf(
                     "seq" to c.seq,
                     "delta" to c.delta,
+                    "kind" to c.kind,
                     "chunkCount" to c.chunkCount,
                     "byteCount" to c.byteCount,
                     "done" to c.done,
