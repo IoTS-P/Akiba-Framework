@@ -148,6 +148,9 @@ data class ImportProgramRequest(
 data class FolderRequest(val path: String = "", val name: String)
 data class RenameRequest(val path: String, val newName: String)
 
+/** Rename a whole Ghidra project (the .gpr/.rep pair on disk). */
+data class ProjectRenameRequest(val newName: String)
+
 fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
 
     val logger: Logger = LogManager.getLogger("ProjectRoutes")
@@ -232,6 +235,73 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
      *  - `deleteAgentSessions`  delete all agent session trees of the project
      *  - `deleteWorkspace`      delete `<workspaceRoot>/<projectName>/`
      */
+    /**
+     * Rename a Ghidra project: the `.gpr` and `.rep` move together, so the
+     * name stays consistent and Ghidra keeps opening it by the new name.
+     */
+    patch("/projects/{name}") {
+        if (!call.requireAuthenticated()) return@patch
+        val projectName = call.parameters["name"]
+            ?: return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing project name"))
+        if (!isValidProjectName(projectName)) {
+            return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name: $projectName"))
+        }
+        val req = call.receive<ProjectRenameRequest>()
+        val newName = req.newName.trim()
+        if (!isValidProjectName(newName)) {
+            return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name: $newName"))
+        }
+        if (newName == projectName) {
+            return@patch call.respond(mapOf("name" to newName, "renamed" to false))
+        }
+
+        val projectDirectory = call.currentUserGhidraProjectsRoot()
+        val gprFile = projectDirectory.resolve("$projectName.gpr")
+        val repDir = projectDirectory.resolve("$projectName.rep")
+        if (!gprFile.isRegularFile() && !repDir.isDirectory()) {
+            return@patch call.respond(HttpStatusCode.NotFound, mapOf("error" to "Project '$projectName' not found"))
+        }
+        if (Files.exists(projectDirectory.resolve("$newName.gpr")) ||
+            Files.exists(projectDirectory.resolve("$newName.rep"))
+        ) {
+            return@patch call.respond(
+                HttpStatusCode.Conflict,
+                mapOf("error" to "A project named '$newName' already exists")
+            )
+        }
+        ProjectLock.owner(projectDirectory, projectName)?.let { holder ->
+            return@patch call.respond(
+                HttpStatusCode.Conflict,
+                mapOf(
+                    "error" to "Project '$projectName' is in use by session " +
+                        "${holder.sessionId ?: "?"} (pid ${holder.pid})",
+                    "locked" to holder
+                )
+            )
+        }
+
+        try {
+            if (WorkspaceManager.isProjectInitialized &&
+                WorkspaceManager.activeProjectName == projectName
+            ) {
+                WorkspaceManager.releaseActiveProject()
+            }
+            if (Files.exists(gprFile)) Files.move(gprFile, projectDirectory.resolve("$newName.gpr"))
+            if (Files.exists(repDir)) Files.move(repDir, projectDirectory.resolve("$newName.rep"))
+            // The index is keyed by project name, so the old rows have to go.
+            ProjectIndex.forget(projectName, projectDirectory)
+            ProjectIndex.refresh(newName, projectDirectory)
+            logger.info("[projects] renamed '$projectName' to '$newName'")
+            call.respond(mapOf("name" to newName, "renamed" to true))
+        } catch (e: Exception) {
+            logger.error("[projects] rename '$projectName' -> '$newName' failed: ${e.message}", e)
+            call.respond(
+                HttpStatusCode.InternalServerError,
+                mapOf("error" to (e.message ?: "Rename failed"))
+            )
+        }
+    }
+
     delete("/projects/{name}") {
         if (!call.requireAuthenticated()) return@delete
         val projectName = call.parameters["name"]
