@@ -1306,8 +1306,17 @@ private fun isValidProjectName(name: String): Boolean =
     Regex("^[A-Za-z0-9._-]{1,64}$").matches(name) && !name.contains("..")
 
 /** Rows of the tree route, in the shape the Projects browser consumes. */
-private fun List<ProjectIndex.Entry>.toWireEntries(): List<Map<String, Any>> =
-    map { mapOf("path" to it.path, "name" to it.name, "folder" to it.folder, "size" to it.size) }
+private fun List<ProjectIndex.Entry>.toWireEntries(): List<Map<String, Any?>> =
+    map {
+        mapOf<String, Any?>(
+            "path" to it.path,
+            "name" to it.name,
+            "folder" to it.folder,
+            "size" to it.size,
+            // Null until the program has been opened since identities existed.
+            "programId" to it.programId,
+        )
+    }
 
 /** Find the `bin/akiba` launch script (same logic as FileRoutes / WorkflowRoutes). */
 /** Recursively collect all files under [root] into [zip], preserving relative paths. */

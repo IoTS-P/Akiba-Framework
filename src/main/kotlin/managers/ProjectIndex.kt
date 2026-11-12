@@ -92,7 +92,7 @@ object ProjectIndex {
         val dir = projectKey(projectName, projectDirectory)
         return ServerDatabase.newConnection().use { conn ->
             conn.prepareStatement(
-                "SELECT path, name, folder, size FROM project_entries " +
+                "SELECT path, name, folder, size, program_id FROM project_entries " +
                     "WHERE project_dir = ? ORDER BY folder DESC, path"
             ).use { stmt ->
                 stmt.setString(1, dir)
@@ -104,6 +104,7 @@ object ProjectIndex {
                             name = rs.getString("name"),
                             folder = rs.getBoolean("folder"),
                             size = rs.getLong("size"),
+                            programId = rs.getString("program_id"),
                         )
                     }
                     rows
