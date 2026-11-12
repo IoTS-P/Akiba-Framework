@@ -202,6 +202,96 @@ object ProjectPrograms {
         }
     }
 
+    /**
+     * Move [path] into [targetFolderPath], keeping its name unless [newName] is
+     * given. Returns the entry's new path.
+     */
+    fun moveEntry(
+        projectName: String,
+        projectDirectory: Path,
+        path: String,
+        targetFolderPath: String,
+        newName: String? = null,
+    ): String = mutate(projectName, projectDirectory) { root ->
+        val (parent, name) = resolveParent(root, path)
+        val target = resolveFolder(root, targetFolderPath)
+        require(path != targetFolderPath) { "Cannot move '$path' into itself" }
+        require(!targetFolderPath.startsWith("$path/")) { "Cannot move '$path' into its own subtree" }
+        val finalName = newName?.takeIf { it.isNotBlank() } ?: name
+        if (parent.pathname != target.pathname || finalName != name) {
+            require(target.getFolder(finalName) == null && target.getFile(finalName) == null) {
+                "'$finalName' already exists in ${targetFolderPath.ifBlank { "/" }}"
+            }
+        }
+        val folder = parent.getFolder(name)
+        if (folder != null) {
+            folder.moveTo(target)
+        } else {
+            val file = parent.getFile(name) ?: throw IllegalArgumentException("'$path' does not exist")
+            file.moveTo(target)
+        }
+        if (finalName != name) {
+            val movedFolder = target.getFolder(name)
+            if (movedFolder != null) {
+                movedFolder.setName(finalName)
+            } else {
+                (target.getFile(name)
+                    ?: throw IllegalArgumentException("'$path' vanished during the move"))
+                    .setName(finalName)
+            }
+        }
+        target.pathname.trimEnd('/') + "/" + finalName
+    }
+
+    /**
+     * Copy [path] into [targetFolderPath]. A name already used there gets a
+     * `_1`, `_2`, … suffix, the way a file manager would.
+     */
+    fun copyEntry(
+        projectName: String,
+        projectDirectory: Path,
+        path: String,
+        targetFolderPath: String,
+    ): String = mutate(projectName, projectDirectory) { root ->
+        val (parent, name) = resolveParent(root, path)
+        val target = resolveFolder(root, targetFolderPath)
+        require(!targetFolderPath.startsWith("$path/")) { "Cannot copy '$path' into its own subtree" }
+        val folder = parent.getFolder(name)
+        if (folder != null) {
+            val copyName = uniqueName(target, name)
+            val created = target.createFolder(copyName)
+            copyFolderInto(folder, created)
+            created.pathname
+        } else {
+            val file = parent.getFile(name) ?: throw IllegalArgumentException("'$path' does not exist")
+            val copyName = uniqueName(target, name)
+            val copy = file.copyTo(target, TaskMonitor.DUMMY)
+            if (copy.name != copyName) copy.setName(copyName)
+            "$targetFolderPath/$copyName".trimStart('/')
+        }
+    }
+
+    /** First free name in [folder] derived from [name] by adding `_1`, `_2`, … */
+    private fun uniqueName(folder: DomainFolder, name: String): String {
+        fun taken(candidate: String) =
+            folder.getFolder(candidate) != null || folder.getFile(candidate) != null
+        if (!taken(name)) return name
+        var i = 1
+        while (taken("${name}_$i")) i++
+        return "${name}_$i"
+    }
+
+    private fun copyFolderInto(source: DomainFolder, target: DomainFolder) {
+        source.folders.forEach { child ->
+            copyFolderInto(child, target.createFolder(uniqueName(target, child.name)))
+        }
+        source.files.forEach { file ->
+            val copy = file.copyTo(target, TaskMonitor.DUMMY)
+            val wanted = uniqueName(target, file.name)
+            if (copy.name != wanted) copy.setName(wanted)
+        }
+    }
+
     fun deleteEntry(projectName: String, projectDirectory: Path, path: String) {
         mutate(projectName, projectDirectory) { root ->
             val (parent, name) = resolveParent(root, path)

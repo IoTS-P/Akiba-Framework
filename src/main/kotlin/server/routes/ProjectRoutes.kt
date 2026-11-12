@@ -146,7 +146,20 @@ data class ImportProgramRequest(
 
 /** Body of `POST /projects/{name}/folders` and `PATCH /projects/{name}/entries`. */
 data class FolderRequest(val path: String = "", val name: String)
-data class RenameRequest(val path: String, val newName: String)
+/**
+ * Rename and/or move an entry inside a project.
+ *
+ * `newName` without `targetFolder` renames in place; `targetFolder` moves (and
+ * optionally renames). Both null is rejected.
+ */
+data class RenameRequest(
+    val path: String,
+    val newName: String? = null,
+    val targetFolder: String? = null,
+)
+
+/** Copy an entry into a folder of the same project. */
+data class CopyEntryRequest(val path: String, val targetFolder: String = "")
 
 /** Rename a whole Ghidra project (the .gpr/.rep pair on disk). */
 data class ProjectRenameRequest(val newName: String)
@@ -698,11 +711,51 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name"))
         }
         val req = call.receive<RenameRequest>()
+        val newName = req.newName?.trim()
+        if (newName.isNullOrEmpty() && req.targetFolder == null) {
+            return@patch call.respond(
+                HttpStatusCode.BadRequest,
+                mapOf("error" to "Nothing to update: pass newName, targetFolder, or both"),
+            )
+        }
         try {
-            ProjectPrograms.renameEntry(name, call.currentUserGhidraProjectsRoot(), req.path, req.newName)
-            call.respond(mapOf("status" to "ok"))
+            val root = call.currentUserGhidraProjectsRoot()
+            val result = if (req.targetFolder != null) {
+                mapOf(
+                    "status" to "ok",
+                    "path" to ProjectPrograms.moveEntry(name, root, req.path, req.targetFolder, newName),
+                )
+            } else {
+                ProjectPrograms.renameEntry(name, root, req.path, newName!!)
+                mapOf("status" to "ok", "path" to req.path)
+            }
+            call.respond(result)
         } catch (e: IllegalArgumentException) {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Cannot rename")))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    /** Copy an entry (program or folder, recursively) into another folder. */
+    post("/projects/{name}/entries/copy") {
+        if (!call.requireAuthenticated()) return@post
+        val name = call.parameters["name"].orEmpty()
+        if (!isValidProjectName(name)) {
+            return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name"))
+        }
+        val req = call.receive<CopyEntryRequest>()
+        try {
+            val path = ProjectPrograms.copyEntry(
+                name,
+                call.currentUserGhidraProjectsRoot(),
+                req.path,
+                req.targetFolder,
+            )
+            call.respond(mapOf("status" to "ok", "path" to path))
+        } catch (e: IllegalArgumentException) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Cannot copy")))
         } catch (e: Exception) {
             val (status, body) = errorPayload(e)
             call.respond(status, body)
