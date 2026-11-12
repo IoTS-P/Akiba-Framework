@@ -275,7 +275,12 @@ object ProjectPrograms {
             val copyName = uniqueName(target, name)
             val copy = file.copyTo(target, TaskMonitor.DUMMY)
             if (copy.name != copyName) copy.setName(copyName)
-            reissueIdentity(project, target, copyName)
+            val newId = reissueIdentity(project, target, copyName)
+            if (newId != null) {
+                ProjectIndex.setProgramId(
+                    projectName, projectDirectory, "$targetFolderPath/$copyName".trimStart('/'), newId
+                )
+            }
             "$targetFolderPath/$copyName".trimStart('/')
         }
     }
@@ -326,7 +331,13 @@ object ProjectPrograms {
                     ?: throw IllegalArgumentException("'$path' does not exist in '$sourceProject'")
                 val copied = file.copyTo(targetParent, TaskMonitor.DUMMY)
                 if (copied.name != wanted) copied.setName(wanted)
-                reissueIdentity(target, targetParent, wanted)
+                val newId = reissueIdentity(target, targetParent, wanted)
+                if (newId != null) {
+                    ProjectIndex.setProgramId(
+                        targetProject, targetDirectory,
+                        targetFolder.trimEnd('/') + "/" + wanted, newId
+                    )
+                }
                 if (move) file.delete()
                 targetParent.pathname.trimEnd('/') + "/" + wanted
             }
@@ -388,9 +399,9 @@ object ProjectPrograms {
      * A copy is a new artifact: sharing the source id would make two programs
      * indistinguishable to anything that tracks work by program.
      */
-    private fun reissueIdentity(project: GhidraProject, folder: DomainFolder, fileName: String) {
-        runCatching {
-            val program = project.openProgram(folder.pathname, fileName, false) ?: return@runCatching
+    private fun reissueIdentity(project: GhidraProject, folder: DomainFolder, fileName: String): String? {
+        return runCatching {
+            val program = project.openProgram(folder.pathname, fileName, false) ?: return@runCatching null
             try {
                 val tx = program.startTransaction("copy-identity")
                 try {
@@ -399,12 +410,13 @@ object ProjectPrograms {
                     program.endTransaction(tx, true)
                 }
                 project.save(program)
+                ProgramIdentity.read(program)
             } finally {
                 runCatching { project.close(program) }
             }
         }.onFailure {
             logger.warn("Could not reissue the identity of '{}': {}", fileName, it.message)
-        }
+        }.getOrNull()
     }
 
     /** First free name in [folder] derived from [name] by adding `_1`, `_2`, … */
