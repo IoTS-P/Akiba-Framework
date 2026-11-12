@@ -161,6 +161,9 @@ data class RenameRequest(
 /** Copy an entry into a folder of the same project. */
 data class CopyEntryRequest(val path: String, val targetFolder: String = "")
 
+/** Create an empty project with this name. */
+data class CreateProjectRequest(val name: String)
+
 /** Rename a whole Ghidra project (the .gpr/.rep pair on disk). */
 data class ProjectRenameRequest(val newName: String)
 
@@ -248,6 +251,31 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
      *  - `deleteAgentSessions`  delete all agent session trees of the project
      *  - `deleteWorkspace`      delete `<workspaceRoot>/<projectName>/`
      */
+    /** Create an empty Ghidra project. */
+    post("/projects") {
+        if (!call.requireAuthenticated()) return@post
+        val req = call.receive<CreateProjectRequest>()
+        val name = req.name.trim()
+        if (!isValidProjectName(name)) {
+            return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name: $name"))
+        }
+        val root = call.currentUserGhidraProjectsRoot()
+        if (Files.exists(root.resolve("$name.gpr")) || Files.exists(root.resolve("$name.rep"))) {
+            return@post call.respond(HttpStatusCode.Conflict, mapOf("error" to "A project named '$name' already exists"))
+        }
+        try {
+            ProjectLock.asOwner(name, root, null, null) {
+                WorkspaceManager.openOrCreateInteractiveProject(name, false, root)
+                WorkspaceManager.releaseActiveProject()
+            }
+            ProjectIndex.refresh(name, root)
+            call.respond(HttpStatusCode.Created, mapOf("name" to name))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
     /**
      * Rename a Ghidra project: the `.gpr` and `.rep` move together, so the
      * name stays consistent and Ghidra keeps opening it by the new name.
