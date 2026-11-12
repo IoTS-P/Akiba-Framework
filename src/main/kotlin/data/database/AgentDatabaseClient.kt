@@ -101,6 +101,50 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
             throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
     }
 
+    /** A session attached to a project/program, as far as a move cares. */
+    data class SessionRef(
+        val sessionId: String,
+        val sessionName: String? = null,
+        val currentProgram: String? = null,
+    )
+
+    private data class SessionRefList(val sessions: List<SessionRef> = emptyList())
+
+    /** Sessions bound to [project], optionally only those on [program]. */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun findSessions(project: String, program: String? = null): List<SessionRef> = runBlocking {
+        val response = dbClient.post("/agent/session/find", mapOf("project" to project, "program" to program))
+        if (response.first == HttpStatusCode.OK) {
+            mapper.readValue<SessionRefList>(response.second).sessions
+        } else {
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+        }
+    }
+
+    /** Re-point sessions of [fromProject]/[program] at another project. */
+    @Throws(DatabaseClient.DatabaseDaemonException::class)
+    fun relocateSessions(
+        fromProject: String,
+        program: String,
+        toProject: String,
+        newProgram: String,
+    ): Int = runBlocking {
+        val response = dbClient.post(
+            "/agent/session/relocate",
+            mapOf(
+                "fromProject" to fromProject,
+                "program" to program,
+                "toProject" to toProject,
+                "newProgram" to newProgram,
+            ),
+        )
+        if (response.first == HttpStatusCode.OK) {
+            mapper.readTree(response.second).path("moved").asInt()
+        } else {
+            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
+        }
+    }
+
     /**
      * List sessions with optional filters.
      *

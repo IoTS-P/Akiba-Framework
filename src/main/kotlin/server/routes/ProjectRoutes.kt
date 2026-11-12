@@ -774,6 +774,26 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
         }
     }
 
+    /** Conversations bound to one entry, so the UI can warn before moving it. */
+    get("/projects/{name}/entries/sessions") {
+        if (!call.requireAuthenticated()) return@get
+        val project = call.parameters["name"].orEmpty()
+        val path = call.request.queryParameters["path"].orEmpty()
+        if (path.isBlank()) {
+            return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "path is required"))
+        }
+        val instance = call.requireInstanceHeader() ?: return@get
+        try {
+            val sessions = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                AgentDatabaseClient(dbClient).findSessions(project, path)
+            }
+            call.respond(mapOf("sessions" to sessions))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
     /**
      * Move or copy an entry from another project into this one.
      *
@@ -790,6 +810,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
         if (!isValidProjectName(req.fromProject)) {
             return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid source project"))
         }
+        val instance = call.requireInstanceHeader() ?: return@post
         try {
             val root = call.currentUserGhidraProjectsRoot()
             val path = ProjectPrograms.transferAcross(
@@ -801,7 +822,17 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                 targetFolder = req.targetFolder,
                 move = req.move,
             )
-            call.respond(mapOf("status" to "ok", "path" to path))
+            // A conversation bound to the moved program follows it: otherwise it
+            // keeps pointing at a project that no longer holds its program.
+            val migrated = if (req.move) {
+                runCatching {
+                    withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                        AgentDatabaseClient(dbClient)
+                            .relocateSessions(req.fromProject, req.path, targetProject, path)
+                    }
+                }.getOrDefault(0)
+            } else 0
+            call.respond(mapOf("status" to "ok", "path" to path, "migratedSessions" to migrated))
         } catch (e: IllegalArgumentException) {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Cannot transfer")))
         } catch (e: Exception) {
