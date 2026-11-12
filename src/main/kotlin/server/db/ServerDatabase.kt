@@ -88,10 +88,18 @@ object ServerDatabase {
                     name        TEXT NOT NULL,
                     folder      BOOLEAN NOT NULL,
                     size        BIGINT NOT NULL DEFAULT 0,
+                    program_id  UUID,
                     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
                     PRIMARY KEY (project_dir, path)
                 )
             """.trimIndent())
+            // Instances created before program identity existed gain the column
+            // in place; the index backfills ids as programs are opened.
+            stmt.execute("ALTER TABLE project_entries ADD COLUMN IF NOT EXISTS program_id UUID")
+            stmt.execute(
+                "CREATE INDEX IF NOT EXISTS project_entries_program_id_idx " +
+                    "ON project_entries (program_id)"
+            )
         }
 
         ensureSchemaUpgrades()

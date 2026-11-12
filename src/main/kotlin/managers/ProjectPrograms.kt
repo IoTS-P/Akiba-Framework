@@ -164,6 +164,8 @@ object ProjectPrograms {
         val folder: Boolean,
         val size: Long,
         val modified: Long,
+        /** Filled by the index, not by the walk: reading it needs the program open. */
+        val programId: String? = null,
     )
 
     /** Full tree of a project, folders first at every level. */

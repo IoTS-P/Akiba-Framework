@@ -27,6 +27,9 @@ object ProjectIndex {
         val name: String,
         val folder: Boolean,
         val size: Long,
+        /** Program identity, when it is already known; null for folders and
+         *  for programs that have not been opened since the scheme existed. */
+        val programId: String? = null,
     )
 
     /**
@@ -110,6 +113,42 @@ object ProjectIndex {
     }
 
     /** Drop every row of [projectName]; called when the project is deleted. */
+    /** Record a program's identity after it was opened and stamped. */
+    fun setProgramId(projectName: String, projectDirectory: Path, path: String, programId: String): Boolean {
+        val dir = projectKey(projectName, projectDirectory)
+        return runCatching {
+            ServerDatabase.newConnection().use { conn ->
+                conn.prepareStatement(
+                    "UPDATE project_entries SET program_id = ?::uuid WHERE project_dir = ? AND path = ?"
+                ).use { stmt ->
+                    stmt.setString(1, programId)
+                    stmt.setString(2, dir)
+                    stmt.setString(3, path)
+                    stmt.executeUpdate() > 0
+                }
+            }
+        }.getOrElse {
+            logger.warn("Could not record program id for '{}': {}", path, it.message)
+            false
+        }
+    }
+
+    /** Path of the program carrying [programId], or null when it is gone. */
+    fun pathOfProgram(projectName: String, projectDirectory: Path, programId: String): String? {
+        val dir = projectKey(projectName, projectDirectory)
+        return runCatching {
+            ServerDatabase.newConnection().use { conn ->
+                conn.prepareStatement(
+                    "SELECT path FROM project_entries WHERE project_dir = ? AND program_id = ?::uuid LIMIT 1"
+                ).use { stmt ->
+                    stmt.setString(1, dir)
+                    stmt.setString(2, programId)
+                    stmt.executeQuery().use { rs -> if (rs.next()) rs.getString("path") else null }
+                }
+            }
+        }.getOrNull()
+    }
+
     fun forget(projectName: String, projectDirectory: Path): Boolean {
         if (!ServerDatabase.isInitialized) return false
         val dir = projectKey(projectName, projectDirectory)
@@ -191,6 +230,18 @@ object ProjectIndex {
         ServerDatabase.newConnection().use { conn ->
             conn.autoCommit = false
             try {
+                // Keep the ids of entries that are still there: the tree walk
+                // cannot read program metadata cheaply, so it reports null and
+                // the previous value is the only one we have.
+                val known = mutableMapOf<String, String>()
+                conn.prepareStatement(
+                    "SELECT path, program_id FROM project_entries WHERE project_dir = ? AND program_id IS NOT NULL"
+                ).use { stmt ->
+                    stmt.setString(1, projectDir)
+                    stmt.executeQuery().use { rs ->
+                        while (rs.next()) known[rs.getString("path")] = rs.getString("program_id")
+                    }
+                }
                 conn.prepareStatement(
                     "DELETE FROM project_entries WHERE project_dir = ?"
                 ).use { stmt ->
@@ -198,8 +249,8 @@ object ProjectIndex {
                     stmt.executeUpdate()
                 }
                 conn.prepareStatement(
-                    "INSERT INTO project_entries (project_dir, path, name, folder, size) " +
-                        "VALUES (?, ?, ?, ?, ?)"
+                    "INSERT INTO project_entries (project_dir, path, name, folder, size, program_id) " +
+                        "VALUES (?, ?, ?, ?, ?, ?::uuid)"
                 ).use { stmt ->
                     entries.forEach { entry ->
                         stmt.setString(1, projectDir)
@@ -207,6 +258,7 @@ object ProjectIndex {
                         stmt.setString(3, entry.name)
                         stmt.setBoolean(4, entry.folder)
                         stmt.setLong(5, entry.size)
+                        stmt.setString(6, entry.programId ?: known[entry.path])
                         stmt.addBatch()
                     }
                     stmt.executeBatch()
