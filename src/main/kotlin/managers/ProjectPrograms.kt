@@ -344,6 +344,45 @@ object ProjectPrograms {
     }
 
     /**
+     * Read the identity of [path], assigning one if the program predates the
+     * scheme, and record it in the index.
+     *
+     * Called when a conversation is about to use a program: the project is
+     * opened and closed again before the worker takes it, so identity always
+     * exists by the time the UI can ask for it.
+     *
+     * @return the id, or null when the program could not be opened.
+     */
+    fun ensureProgramIdentity(
+        projectName: String,
+        projectDirectory: Path,
+        path: String,
+    ): String? {
+        val id = runCatching {
+            mutateProject(projectName, projectDirectory) { project, root ->
+                val (parent, name) = resolveParent(root, path)
+                val program = project.openProgram(parent.pathname, name, false)
+                try {
+                    val tx = program.startTransaction("program-identity")
+                    try {
+                        ProgramIdentity.ensure(program)
+                    } finally {
+                        program.endTransaction(tx, true)
+                    }
+                    project.save(program)
+                    ProgramIdentity.read(program)
+                } finally {
+                    runCatching { project.close(program) }
+                }
+            }
+        }.onFailure {
+            logger.warn("Could not ensure an identity for '{}': {}", path, it.message)
+        }.getOrNull()
+        if (id != null) ProjectIndex.setProgramId(projectName, projectDirectory, path, id)
+        return id
+    }
+
+    /**
      * Give a freshly copied program its own identity.
      *
      * A copy is a new artifact: sharing the source id would make two programs

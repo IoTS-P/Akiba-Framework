@@ -37,6 +37,7 @@ import org.iotsplab.akiba.llm.tool.ui.UserChoiceEvent
 import org.iotsplab.akiba.llm.tool.ui.UserChoiceManager
 import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.managers.ProjectIndex
+import org.iotsplab.akiba.managers.ProjectPrograms
 import org.iotsplab.akiba.managers.ProjectLock
 import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
@@ -1233,6 +1234,21 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     "Tell the user to import a binary into the project (Projects page → Details → Import) " +
                     "and to select it in the header before asking for analysis."
             } else ""
+            // Make sure the program has an identity before the worker takes the
+            // project: this is the only moment a conversation can create one,
+            // and the UI needs it while the turn is still running.
+            programName?.let { program ->
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        ProjectPrograms.ensureProgramIdentity(
+                            sessionInfo.projectName!!,
+                            indexRoot,
+                            program,
+                        )
+                    }
+                }
+            }
+
             ManualAgentTurnRegistry.put(token, ManualAgentTurnJob(
                 id, req.content, systemPrompt + noProgramNotice, call.currentUsernameOrDefault(),
                 programName
