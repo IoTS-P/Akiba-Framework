@@ -31,7 +31,6 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         val status: String,
         val binaryId: Int?,
         val moduleName: String?,
-        val graphId: String?,
         val modelName: String?,
         val projectName: String? = null,
         /** Program inside [projectName] the session is currently working on. */
@@ -221,7 +220,6 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         sessionId: String,
         status: String? = null,
         sessionName: String? = null,
-        graphId: String? = null,
         modelName: String? = null,
         transcript: String? = null,
         programName: String? = null
@@ -230,7 +228,6 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
             "sessionId" to sessionId,
             "status" to status,
             "sessionName" to sessionName,
-            "graphId" to graphId,
             "modelName" to modelName,
             "transcript" to transcript,
             "programName" to programName
