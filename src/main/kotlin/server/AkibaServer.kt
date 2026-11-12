@@ -42,6 +42,7 @@ import org.iotsplab.akiba.server.routes.queryRoutes
 import org.iotsplab.akiba.server.routes.runtimeConfigRoutes
 import org.iotsplab.akiba.server.routes.scriptRoutes
 import org.iotsplab.akiba.server.routes.skillRoutes
+import org.iotsplab.akiba.server.routes.systemRoutes
 import org.iotsplab.akiba.server.routes.updateRoutes
 import org.iotsplab.akiba.server.routes.workflowRoutes
 import org.iotsplab.akiba.server.security.JwtService
@@ -196,6 +197,7 @@ object AkibaServer {
                     llmConfigRoutes()
                     runtimeConfigRoutes()
                     updateRoutes()
+                    systemRoutes()
                 }
             }
         }.start(wait = true)
