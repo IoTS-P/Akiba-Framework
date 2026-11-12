@@ -415,38 +415,7 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         val updatedAt: String?
     )
 
-    /**
-     * Save or update session context.
-     */
-    @Throws(DatabaseClient.DatabaseDaemonException::class)
-    fun saveContext(
-        sessionId: String,
-        environment: String? = null,
-        contextConfig: String? = null,
-        moduleData: String? = null
-    ) = runBlocking {
-        val body = mapOf(
-            "sessionId" to sessionId,
-            "environment" to environment,
-            "contextConfig" to contextConfig,
-            "moduleData" to moduleData
-        )
-        val response = dbClient.post("/agent/context/save", body)
-        if (response.first != HttpStatusCode.OK)
-            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
-    }
 
-    /**
-     * Load session context.
-     */
-    @Throws(DatabaseClient.DatabaseDaemonException::class)
-    fun loadContext(sessionId: String): ContextInfo = runBlocking {
-        val response = dbClient.post("/agent/context/load", mapOf("sessionId" to sessionId))
-        if (response.first == HttpStatusCode.OK)
-            mapper.readValue<ContextInfo>(response.second)
-        else
-            throw DatabaseClient.DatabaseDaemonException(response.first, response.first.description)
-    }
 
     // ============================================================
     //  Transcript Append
