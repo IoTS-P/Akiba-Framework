@@ -23,7 +23,8 @@ object ProjectPrograms {
 
     data class CopyOutcome(val source: String, val program: String, val target: String, val targetFile: String)
 
-    data class ImportOutcome(val program: String, val folder: String)
+    /** @property programId identity written into the program's metadata. */
+    data class ImportOutcome(val program: String, val folder: String, val programId: String? = null)
 
     /**
      * Import a binary file into a folder of a project.
@@ -47,6 +48,7 @@ object ProjectPrograms {
         requireExists(projectDirectory, projectName)
 
         var project: GhidraProject? = null
+        var programId: String? = null
         val outcome = try {
             project = open(projectName, projectDirectory)
             val target = ensureFolder(project.projectData.rootFolder, folder)
@@ -63,6 +65,9 @@ object ProjectPrograms {
                 val txId = program.startTransaction("import")
                 try {
                     program.name = name
+                    // Identity is issued once, at import, and then travels with
+                    // the artifact through every rename and move.
+                    programId = ProgramIdentity.ensure(program)
                 } finally {
                     program.endTransaction(txId, true)
                 }
@@ -74,7 +79,7 @@ object ProjectPrograms {
                 "Imported binary '{}' into project '{}' as '{}'",
                 source.fileName, projectName, name
             )
-            ImportOutcome(program = name, folder = target.pathname)
+            ImportOutcome(program = name, folder = target.pathname, programId = programId)
         } finally {
             runCatching { project?.close() }
         }
