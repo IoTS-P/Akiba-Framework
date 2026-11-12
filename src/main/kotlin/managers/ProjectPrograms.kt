@@ -124,6 +124,7 @@ object ProjectPrograms {
             if (asName != null && asName.isNotBlank() && asName != copied.name) {
                 copied.setName(asName)
             }
+            reissueIdentity(target, target.projectData.rootFolder, copied.name)
             logger.info(
                 "Copied program '{}' from project '{}' to '{}' as '{}'",
                 programName, sourceProject, targetProject, copied.name
@@ -259,7 +260,7 @@ object ProjectPrograms {
         projectDirectory: Path,
         path: String,
         targetFolderPath: String,
-    ): String = mutate(projectName, projectDirectory) { root ->
+    ): String = mutateProject(projectName, projectDirectory) { project, root ->
         val (parent, name) = resolveParent(root, path)
         val target = resolveFolder(root, targetFolderPath)
         require(!targetFolderPath.startsWith("$path/")) { "Cannot copy '$path' into its own subtree" }
@@ -267,13 +268,14 @@ object ProjectPrograms {
         if (folder != null) {
             val copyName = uniqueName(target, name)
             val created = target.createFolder(copyName)
-            copyFolderInto(folder, created)
+            copyFolderInto(folder, created, project, target)
             created.pathname
         } else {
             val file = parent.getFile(name) ?: throw IllegalArgumentException("'$path' does not exist")
             val copyName = uniqueName(target, name)
             val copy = file.copyTo(target, TaskMonitor.DUMMY)
             if (copy.name != copyName) copy.setName(copyName)
+            reissueIdentity(project, target, copyName)
             "$targetFolderPath/$copyName".trimStart('/')
         }
     }
@@ -316,7 +318,7 @@ object ProjectPrograms {
             val folder = parent.getFolder(name)
             val resultingPath = if (folder != null) {
                 val created = targetParent.createFolder(wanted)
-                copyFolderInto(folder, created)
+                copyFolderInto(folder, created, target, targetParent)
                 if (move) folder.delete()
                 created.pathname
             } else {
@@ -324,6 +326,7 @@ object ProjectPrograms {
                     ?: throw IllegalArgumentException("'$path' does not exist in '$sourceProject'")
                 val copied = file.copyTo(targetParent, TaskMonitor.DUMMY)
                 if (copied.name != wanted) copied.setName(wanted)
+                reissueIdentity(target, targetParent, wanted)
                 if (move) file.delete()
                 targetParent.pathname.trimEnd('/') + "/" + wanted
             }
@@ -340,6 +343,31 @@ object ProjectPrograms {
         }
     }
 
+    /**
+     * Give a freshly copied program its own identity.
+     *
+     * A copy is a new artifact: sharing the source id would make two programs
+     * indistinguishable to anything that tracks work by program.
+     */
+    private fun reissueIdentity(project: GhidraProject, folder: DomainFolder, fileName: String) {
+        runCatching {
+            val program = project.openProgram(folder.pathname, fileName, false) ?: return@runCatching
+            try {
+                val tx = program.startTransaction("copy-identity")
+                try {
+                    ProgramIdentity.reissue(program)
+                } finally {
+                    program.endTransaction(tx, true)
+                }
+                project.save(program)
+            } finally {
+                runCatching { project.close(program) }
+            }
+        }.onFailure {
+            logger.warn("Could not reissue the identity of '{}': {}", fileName, it.message)
+        }
+    }
+
     /** First free name in [folder] derived from [name] by adding `_1`, `_2`, … */
     private fun uniqueName(folder: DomainFolder, name: String): String {
         fun taken(candidate: String) =
@@ -350,14 +378,20 @@ object ProjectPrograms {
         return "${name}_$i"
     }
 
-    private fun copyFolderInto(source: DomainFolder, target: DomainFolder) {
+    private fun copyFolderInto(
+        source: DomainFolder,
+        target: DomainFolder,
+        project: GhidraProject,
+        targetParent: DomainFolder = target,
+    ) {
         source.folders.forEach { child ->
-            copyFolderInto(child, target.createFolder(uniqueName(target, child.name)))
+            copyFolderInto(child, target.createFolder(uniqueName(target, child.name)), project, targetParent)
         }
         source.files.forEach { file ->
-            val copy = file.copyTo(target, TaskMonitor.DUMMY)
             val wanted = uniqueName(target, file.name)
+            val copy = file.copyTo(target, TaskMonitor.DUMMY)
             if (copy.name != wanted) copy.setName(wanted)
+            reissueIdentity(project, target, wanted)
         }
     }
 
@@ -372,12 +406,20 @@ object ProjectPrograms {
         }
     }
 
-    private fun <T> mutate(projectName: String, projectDirectory: Path, block: (DomainFolder) -> T): T {
+    private fun <T> mutate(projectName: String, projectDirectory: Path, block: (DomainFolder) -> T): T =
+        mutateProject(projectName, projectDirectory) { _, root -> block(root) }
+
+    /** Like [mutate], but the caller also gets the project handle. */
+    private fun <T> mutateProject(
+        projectName: String,
+        projectDirectory: Path,
+        block: (GhidraProject, DomainFolder) -> T,
+    ): T {
         requireExists(projectDirectory, projectName)
         var project: GhidraProject? = null
         val result = try {
             project = open(projectName, projectDirectory)
-            block(project.projectData.rootFolder)
+            block(project, project.projectData.rootFolder)
         } finally {
             runCatching { project?.close() }
         }
