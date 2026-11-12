@@ -1203,21 +1203,38 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             // all: the worker cannot run any analysis tool without one.
             var programName: String? = null
             if (sessionInfo.binaryId == null && sessionInfo.projectName != null) {
-                programName = sessionInfo.currentProgram?.takeIf { it.isNotBlank() }
-                    ?: findFirstProgramName(sessionInfo.projectName, call.currentUserGhidraProjectsRoot())
-                if (programName == null) {
-                    markManualChatFailed(daemonHost, daemonPort, instance, id,
-                        "project has no program")
-                    call.respond(HttpStatusCode.BadRequest, mapOf(
-                        "error" to "Project '${sessionInfo.projectName}' contains no analyzable binary " +
-                            "(Ghidra program). Import a binary into the project first (e.g. via the " +
-                            "Files/Projects page), then chat again."
-                    ))
-                    return@post
+                val project = sessionInfo.projectName
+                val root = call.currentUserGhidraProjectsRoot()
+                val bound = sessionInfo.currentProgram?.takeIf { it.isNotBlank() }
+                if (bound != null) {
+                    programName = bound
+                } else {
+                    // No implicit "first program" any more: a conversation works
+                    // on the program the operator picked. An empty project is the
+                    // one case where a turn may run without one, because the agent
+                    // has to be able to tell the user what to do next.
+                    val hasAnyProgram = findFirstProgramName(project, root) != null
+                    if (hasAnyProgram) {
+                        markManualChatFailed(daemonHost, daemonPort, instance, id, "no program selected")
+                        call.respond(HttpStatusCode.BadRequest, mapOf(
+                            "error" to "This conversation has no program selected. " +
+                                "Pick one in the header (Program selector) and send again."
+                        ))
+                        return@post
+                    }
                 }
             }
+            // With an empty project the turn still runs, but the agent must know
+            // there is nothing to inspect instead of reporting empty results.
+            val noProgramNotice = if (programName == null &&
+                sessionInfo.binaryId == null && sessionInfo.projectName != null
+            ) {
+                "\n\nNo program is loaded in this project, so no binary can be inspected. " +
+                    "Tell the user to import a binary into the project (Projects page → Details → Import) " +
+                    "and to select it in the header before asking for analysis."
+            } else ""
             ManualAgentTurnRegistry.put(token, ManualAgentTurnJob(
-                id, req.content, systemPrompt, call.currentUsernameOrDefault(),
+                id, req.content, systemPrompt + noProgramNotice, call.currentUsernameOrDefault(),
                 programName
             ))
 
