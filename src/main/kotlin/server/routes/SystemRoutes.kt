@@ -84,20 +84,39 @@ private fun readMemory(): Map<String, Any?> {
     )
 }
 
-/** Disk usage of the filesystem that holds the Ghidra projects. */
-private fun readDisk(path: java.nio.file.Path): Map<String, Any?> = runCatching {
-    val store = Files.getFileStore(path)
-    val total = store.totalSpace
-    val free = store.usableSpace
-    mapOf(
-        "path" to path.toString(),
-        "totalBytes" to total,
-        "freeBytes" to free,
-        "usedBytes" to (total - free).coerceAtLeast(0),
-        "usagePercent" to if (total > 0) (total - free).toDouble() / total * 100.0 else 0.0,
-    )
-}.getOrElse {
-    mapOf("path" to path.toString(), "error" to (it.message ?: "unavailable"))
+/**
+ * Disk usage of the filesystem that holds the Ghidra projects.
+ *
+ * The projects directory does not exist until the first project is created, so
+ * the measurement walks up to the nearest ancestor that does. Every field is
+ * always present: a missing percentage used to crash the dashboard renderer.
+ */
+private fun readDisk(path: java.nio.file.Path): Map<String, Any?> {
+    val existing = generateSequence(path) { it.parent }
+        .firstOrNull { Files.exists(it) }
+        ?: java.nio.file.Path.of("/")
+    return runCatching {
+        val store = Files.getFileStore(existing)
+        val total = store.totalSpace
+        val free = store.usableSpace
+        mapOf(
+            "path" to path.toString(),
+            "measuredOn" to existing.toString(),
+            "totalBytes" to total,
+            "freeBytes" to free,
+            "usedBytes" to (total - free).coerceAtLeast(0),
+            "usagePercent" to if (total > 0) (total - free).toDouble() / total * 100.0 else 0.0,
+        )
+    }.getOrElse {
+        mapOf(
+            "path" to path.toString(),
+            "totalBytes" to 0L,
+            "freeBytes" to 0L,
+            "usedBytes" to 0L,
+            "usagePercent" to 0.0,
+            "error" to (it.message ?: "unavailable"),
+        )
+    }
 }
 
 /** Every java process with a bound on its resident memory, largest first. */
