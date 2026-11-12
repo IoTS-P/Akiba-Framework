@@ -158,6 +158,14 @@ data class RenameRequest(
     val targetFolder: String? = null,
 )
 
+/** Move or copy an entry from another project. */
+data class TransferEntryRequest(
+    val fromProject: String,
+    val path: String,
+    val targetFolder: String = "",
+    val move: Boolean = false,
+)
+
 /** Copy an entry into a folder of the same project. */
 data class CopyEntryRequest(val path: String, val targetFolder: String = "")
 
@@ -760,6 +768,42 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             call.respond(result)
         } catch (e: IllegalArgumentException) {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Cannot rename")))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    /**
+     * Move or copy an entry from another project into this one.
+     *
+     * Cross-project moves are a copy plus a delete in the source, which is what
+     * Ghidra can express.
+     */
+    post("/projects/{name}/entries/transfer") {
+        if (!call.requireAuthenticated()) return@post
+        val targetProject = call.parameters["name"].orEmpty()
+        if (!isValidProjectName(targetProject)) {
+            return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid project name"))
+        }
+        val req = call.receive<TransferEntryRequest>()
+        if (!isValidProjectName(req.fromProject)) {
+            return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid source project"))
+        }
+        try {
+            val root = call.currentUserGhidraProjectsRoot()
+            val path = ProjectPrograms.transferAcross(
+                sourceProject = req.fromProject,
+                sourceDirectory = root,
+                path = req.path,
+                targetProject = targetProject,
+                targetDirectory = root,
+                targetFolder = req.targetFolder,
+                move = req.move,
+            )
+            call.respond(mapOf("status" to "ok", "path" to path))
+        } catch (e: IllegalArgumentException) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Cannot transfer")))
         } catch (e: Exception) {
             val (status, body) = errorPayload(e)
             call.respond(status, body)

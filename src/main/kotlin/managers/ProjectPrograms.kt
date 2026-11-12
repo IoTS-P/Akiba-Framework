@@ -271,6 +271,68 @@ object ProjectPrograms {
         }
     }
 
+    /**
+     * Copy or move an entry between two projects.
+     *
+     * Ghidra can only move inside one project, so a cross-project move is a
+     * copy followed by a delete in the source. A name already used in the
+     * target gets the same `_1`, `_2` suffix a local copy would.
+     *
+     * @return the entry's path in the target project.
+     */
+    fun transferAcross(
+        sourceProject: String,
+        sourceDirectory: Path,
+        path: String,
+        targetProject: String,
+        targetDirectory: Path,
+        targetFolder: String,
+        move: Boolean,
+    ): String {
+        require(sourceProject != targetProject) {
+            "Source and target project are the same ('$sourceProject')"
+        }
+        requireExists(sourceDirectory, sourceProject)
+        requireExists(targetDirectory, targetProject)
+
+        var source: GhidraProject? = null
+        var target: GhidraProject? = null
+        try {
+            source = open(sourceProject, sourceDirectory)
+            target = open(targetProject, targetDirectory)
+            val sourceRoot = source.projectData.rootFolder
+            val targetRoot = target.projectData.rootFolder
+            val (parent, name) = resolveParent(sourceRoot, path)
+            val targetParent = resolveFolder(targetRoot, targetFolder)
+            val wanted = uniqueName(targetParent, name)
+
+            val folder = parent.getFolder(name)
+            val resultingPath = if (folder != null) {
+                val created = targetParent.createFolder(wanted)
+                copyFolderInto(folder, created)
+                if (move) folder.delete()
+                created.pathname
+            } else {
+                val file = parent.getFile(name)
+                    ?: throw IllegalArgumentException("'$path' does not exist in '$sourceProject'")
+                val copied = file.copyTo(targetParent, TaskMonitor.DUMMY)
+                if (copied.name != wanted) copied.setName(wanted)
+                if (move) file.delete()
+                targetParent.pathname.trimEnd('/') + "/" + wanted
+            }
+            logger.info(
+                "{} '{}' from '{}' to '{}' as '{}'",
+                if (move) "Moved" else "Copied", path, sourceProject, targetProject, wanted
+            )
+            return resultingPath
+        } finally {
+            runCatching { source?.close() }
+            runCatching { target?.close() }
+            runCatching { ProjectIndex.refresh(targetProject, targetDirectory) }
+            runCatching { ProjectIndex.refresh(sourceProject, sourceDirectory) }
+        }
+    }
+
     /** First free name in [folder] derived from [name] by adding `_1`, `_2`, … */
     private fun uniqueName(folder: DomainFolder, name: String): String {
         fun taken(candidate: String) =
