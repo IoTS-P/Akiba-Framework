@@ -87,6 +87,11 @@ dependencies {
     // transitive deps such as Ktor compiled with the same Kotlin).
     implementation("org.jetbrains.kotlin:kotlin-compiler-embeddable:2.3.20")
 
+    // Scripting host: lets a task plan be a real .kts with top-level statements
+    // (filter(sql).forEach { it.importTo(...) }) instead of a JSON task list.
+    implementation("org.jetbrains.kotlin:kotlin-scripting-jvm:2.3.20")
+    implementation("org.jetbrains.kotlin:kotlin-scripting-jvm-host:2.3.20")
+
     // For debug
     // implementation(fileTree("modules"))
 }
