@@ -5,6 +5,7 @@ import org.iotsplab.akiba.plan.ModuleSpec
 import org.iotsplab.akiba.plan.PlanCompileException
 import org.iotsplab.akiba.plan.PlanCompiler
 import org.iotsplab.akiba.plan.PlanRuntime
+import org.iotsplab.akiba.plan.ProgramHandle
 import org.iotsplab.akiba.plan.PlanScope
 import org.iotsplab.akiba.plan.ProjectRef
 import java.io.File
@@ -35,6 +36,11 @@ private class RecordingRuntime : PlanRuntime {
     override fun runModule(spec: ModuleSpec, programIds: List<String>): Int {
         calls += "run:${spec.className}:${programIds.size}"; return programIds.size
     }
+
+    override fun findPrograms(filter: String): List<ProgramHandle> {
+        calls += "find:$filter"
+        return listOf(ProgramHandle("p-1", "one.elf"))
+    }
 }
 
 /** A `.kts` file must be able to drive the scope with nothing but the DSL in scope. */
@@ -59,6 +65,23 @@ class PlanCompilerTest {
         PlanCompiler().run(file, PlanScope(runtime))
 
         assertEquals(listOf("open:fx20_batch", "import:fx20_batch:raw:2", "run:org.iotsplab.akiba.module.AkibaUtils:2"), runtime.calls)
+    }
+
+    @Test
+    fun `a plan script branches on what the query returns`() {
+        val file = script(
+            """
+            val arm = programs("arch = 'arm'").expect()
+            val target = createOrOpenProject("arm_batch").expect()
+            importAll(arm, target / "arm").expect()
+            "seen " + arm.size
+            """.trimIndent()
+        )
+        val runtime = RecordingRuntime()
+
+        PlanCompiler().run(file, PlanScope(runtime))
+
+        assertEquals(listOf("find:arch = 'arm'", "open:arm_batch", "import:arm_batch:arm:1"), runtime.calls)
     }
 
     @Test

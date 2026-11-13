@@ -21,6 +21,10 @@ import kotlin.test.assertTrue
 private class FakeRuntime(
     private val existing: MutableSet<String> = mutableSetOf(),
     private val failImport: Boolean = false,
+    private val programs: List<ProgramHandle> = listOf(
+        ProgramHandle("p-1", "one.elf", arch = "x86"),
+        ProgramHandle("p-2", "two.elf", arch = "arm"),
+    ),
 ) : PlanRuntime {
     val calls = mutableListOf<String>()
 
@@ -48,6 +52,12 @@ private class FakeRuntime(
     override fun runModule(spec: ModuleSpec, programIds: List<String>): Int {
         calls += "run:${spec.className}:${programIds.size}"
         return programIds.size
+    }
+
+    override fun findPrograms(filter: String): List<ProgramHandle> {
+        calls += "find:$filter"
+        if (filter.contains("boom")) error("bad sql")
+        return if (filter.isBlank()) programs else programs.filter { it.arch == filter }
     }
 }
 
@@ -119,5 +129,25 @@ class PlanScopeTest {
     fun `expect throws the same typed failure`() {
         val scope = PlanScope(FakeRuntime(existing = mutableSetOf("dup")))
         assertFailsWith<ProjectExistsException> { scope.createProject("dup").expect() }
+    }
+
+    @Test
+    fun `programs returns what the runtime matched`() {
+        val scope = PlanScope(FakeRuntime())
+
+        val all = scope.programs().expect()
+        val arm = scope.programs("arm").expect()
+
+        assertEquals(listOf("one.elf", "two.elf"), all.map { it.name })
+        assertEquals(listOf("two.elf"), arm.map { it.name })
+    }
+
+    @Test
+    fun `a failing query is an outcome, not an exception`() {
+        val scope = PlanScope(FakeRuntime())
+
+        val failed = scope.programs("arch = boom").let { it as Outcome.Failed }
+
+        assertTrue(failed.error.message!!.contains("bad sql"))
     }
 }
