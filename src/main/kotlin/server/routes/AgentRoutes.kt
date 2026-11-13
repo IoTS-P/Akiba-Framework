@@ -39,6 +39,7 @@ import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.managers.ProjectIndex
 import org.iotsplab.akiba.managers.ProjectPrograms
 import org.iotsplab.akiba.managers.ProjectLock
+import org.iotsplab.akiba.managers.ProjectWorkers
 import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import org.iotsplab.akiba.utils.AkibaJson
@@ -1297,7 +1298,20 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 // and chunk polls included — queues behind the turn, so the UI
                 // freezes until the answer is finished.
                 withContext(Dispatchers.IO) {
-                    if (lockedProject == null) {
+                    if (lockedProject != null && ProjectWorkers.poolingEnabled) {
+                        // One worker per project, shared by every session on it; the turn
+                        // carries the message, so the worker never calls back for details.
+                        ResidentWorkers.ensure(lockedProject, workerConfig, serverPort, instance)
+                        runPooledTurn(
+                            project = lockedProject,
+                            sessionId = id,
+                            programId = sessionInfo.currentProgramId,
+                            prompt = req.content,
+                            systemPrompt = systemPrompt + noProgramNotice,
+                            username = call.currentUsernameOrDefault(),
+                            programName = programName,
+                        )
+                    } else if (lockedProject == null) {
                         runManualAgentWorker(
                             workerConfig = workerConfig,
                             serverPort = serverPort,
@@ -2422,6 +2436,93 @@ private fun createManualAgentConfig(
     val file = Files.createTempFile("akiba-manual-agent-", ".json")
     file.toFile().writeText(agentRouteMapper.writerWithDefaultPrettyPrinter().writeValueAsString(root))
     return ManualAgentWorkerConfig(file, mapOf(llmEnvName to keyEntry.apiKey))
+}
+
+/**
+ * The worker that owns a project, kept alive across turns.
+ *
+ * Starting a JVM per turn meant reopening the Ghidra project every time, and it made two
+ * sessions on one project impossible. One worker per project is started on demand and
+ * then reused; if it dies, the next turn starts a fresh one.
+ */
+private object ResidentWorkers {
+
+    private val running = java.util.concurrent.ConcurrentHashMap<String, Process>()
+
+    fun ensure(
+        project: String,
+        workerConfig: ManualAgentWorkerConfig,
+        serverPort: Int,
+        instance: String,
+    ) {
+        synchronized(this) {
+            running[project]?.takeIf { it.isAlive }?.let { return }
+
+            val scriptPath = findAkibaScriptForAgent()
+            val pb = ProcessBuilder(scriptPath, "-c", "${workerConfig.file}@/main")
+            pb.directory(File(System.getProperty("user.dir", ".")))
+            val env = pb.environment()
+            env.putAll(workerConfig.environment)
+            env["AKIBA_PROJECT_WORKERS"] = "1"
+            env["AKIBA_MANUAL_AGENT_SERVER_PORT"] = serverPort.toString()
+            env["AKIBA_MANUAL_AGENT_INSTANCE"] = instance
+            env["AKIBA_MANUAL_AGENT_PROJECT_NAME"] = project
+            pb.redirectErrorStream(true)
+            val logFile = File(System.getProperty("user.home", "."), ".akiba/logs/worker-$project.log")
+            logFile.parentFile?.mkdirs()
+            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
+            agentRouteLogger.info("Starting the resident worker for project {} (log {})", project, logFile)
+            running[project] = pb.start()
+        }
+    }
+
+    fun forget(project: String) {
+        synchronized(this) { running.remove(project) }
+    }
+}
+
+/**
+ * Queues one turn for the project's worker and waits for it.
+ *
+ * The wait is on the turn's future rather than on a process, so several sessions can be
+ * waiting on one worker at the same time without any of them owning the process.
+ */
+private fun runPooledTurn(
+    project: String,
+    sessionId: String,
+    programId: String?,
+    prompt: String,
+    systemPrompt: String,
+    username: String,
+    programName: String?,
+) {
+    ProjectWorkers.registry.attach(sessionId, project)
+    val turn = org.iotsplab.akiba.managers.TurnBroker.Turn(
+        id = java.util.UUID.randomUUID().toString(),
+        project = project,
+        sessionId = sessionId,
+        programId = programId,
+        prompt = prompt,
+        systemPrompt = systemPrompt,
+        username = username,
+        programName = programName,
+    )
+    if (!ProjectWorkers.broker.submit(turn)) {
+        throw ManualAgentWorkerException(
+            "Too many turns are already queued for this conversation. Wait for the current one to finish.")
+    }
+    val future = ProjectWorkers.broker.resultOf(turn.id)
+        ?: throw ManualAgentWorkerException("The turn was dropped before it could run.")
+    val result = try {
+        future.get(MANUAL_AGENT_TIMEOUT_MINUTES, TimeUnit.MINUTES)
+    } catch (e: Exception) {
+        ResidentWorkers.forget(project)
+        throw ManualAgentWorkerException(
+            "The agent worker stopped before this turn finished. It will be restarted on the next message.")
+    }
+    if (!result.ok) {
+        throw ManualAgentWorkerException(result.error ?: "The agent worker failed this turn.")
+    }
 }
 
 private fun runManualAgentWorker(

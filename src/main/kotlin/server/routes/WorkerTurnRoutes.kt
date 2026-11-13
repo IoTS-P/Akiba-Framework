@@ -18,6 +18,9 @@ data class TurnDto(
     val sessionId: String,
     val programId: String? = null,
     val prompt: String,
+    val systemPrompt: String = "",
+    val username: String = "",
+    val programName: String? = null,
 )
 
 /** The worker's poll result; `turn` is null when the wait expired with nothing to do. */
@@ -55,7 +58,9 @@ fun Route.workerTurnRoutes(broker: TurnBroker = ProjectWorkers.broker) {
         val turn = withContext(Dispatchers.IO) { broker.next(project, waitMs) }
         call.respond(
             TurnNextResponse(
-                turn?.let { TurnDto(it.id, it.sessionId, it.programId, it.prompt) },
+                turn?.let {
+                    TurnDto(it.id, it.sessionId, it.programId, it.prompt, it.systemPrompt, it.username, it.programName)
+                },
             ),
         )
     }

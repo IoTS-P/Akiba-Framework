@@ -13,13 +13,22 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class TurnBroker(private val capacityPerSession: Int = 8) {
 
-    /** A turn waiting for, or running on, a worker. */
+    /**
+     * A turn waiting for, or running on, a worker.
+     *
+     * It carries the whole request — prompt, system prompt, user and program — because
+     * the worker does not call back for details: forwarding the message once and letting
+     * the worker own the conversation with the model keeps the two sides in step.
+     */
     data class Turn(
         val id: String,
         val project: String,
         val sessionId: String,
         val programId: String?,
         val prompt: String,
+        val systemPrompt: String = "",
+        val username: String = "",
+        val programName: String? = null,
     )
 
     /** How a turn ended; [error] is the message the user should see. */
