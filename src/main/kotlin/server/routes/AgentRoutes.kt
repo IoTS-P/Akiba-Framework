@@ -1097,7 +1097,10 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         val systemPrompt = withCommonAgentRules(
             req.systemPrompt?.takeIf { it.isNotBlank() } ?: DEFAULT_AGENT_SYSTEM_PROMPT
         )
-        val projectDirectory = call.currentUserProjectDirectory()
+        // The worker opens the project from its config, so it has to be told the same
+        // root the server uses. currentUserProjectDirectory() is empty here, which made
+        // the worker create an empty project in the server's working directory.
+        val projectDirectory = call.currentUserGhidraProjectsRoot()
         // Resolved here, not inside the finally block: the index is keyed by
         // this root and the call object must not be touched once responding.
         val indexRoot = call.currentUserGhidraProjectsRoot()
