@@ -300,35 +300,6 @@ data class StreamChunkPayload(
     val newGeneration: Boolean = false,
 )
 
-private data class ManualAgentTurnJob(
-    val sessionId: String,
-    val content: String,
-    val systemPrompt: String,
-    val username: String,
-    val programName: String? = null
-)
-
-private data class ManualAgentWorkerConfig(
-    val file: Path,
-    val environment: Map<String, String>,
-    /** Model and key for this session; the worker is told per turn, so config changes apply at once. */
-    val llm: org.iotsplab.akiba.managers.TurnBroker.TurnLlm? = null,
-)
-
-private object ManualAgentTurnRegistry {
-    private val jobs = ConcurrentHashMap<String, ManualAgentTurnJob>()
-
-    fun put(token: String, job: ManualAgentTurnJob) {
-        jobs[token] = job
-    }
-
-    fun take(token: String): ManualAgentTurnJob? = jobs.remove(token)
-
-    fun remove(token: String) {
-        jobs.remove(token)
-    }
-}
-
 private object ManualAgentProcessRegistry {
     private val processes = ConcurrentHashMap<String, Process>()
     /** Sessions whose running worker was deliberately killed via /cancel-chat. */
@@ -440,23 +411,6 @@ private fun withCommonAgentRules(prompt: String): String =
 // ============================================================
 
 fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
-
-    // ------ Internal manual-agent worker handshake ---------------------------
-    post("/agent/internal/manual-turn/start") {
-        val req = call.receive<ManualAgentStartRequest>()
-        val job = ManualAgentTurnRegistry.take(req.token)
-        if (job == null) {
-            call.respond(HttpStatusCode.Forbidden, mapOf("error" to "Invalid or expired manual-agent token"))
-            return@post
-        }
-        call.respond(ManualAgentStartResponse(
-            sessionId = job.sessionId,
-            content = job.content,
-            systemPrompt = job.systemPrompt,
-            username = job.username,
-            programName = job.programName
-        ))
-    }
 
     // ------ Internal: force-close all live LLM clients -----------------------
     //
@@ -1203,7 +1157,6 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 info
             }
 
-            val token = UUID.randomUUID().toString()
             // For project-based sessions (no binaryId), locate the
             // program in the project so the manual agent worker can
             // open it.  FAIL FAST when the project has no program at
@@ -1278,11 +1231,6 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 }
             }
 
-            ManualAgentTurnRegistry.put(token, ManualAgentTurnJob(
-                id, req.content, systemPrompt + noProgramNotice, call.currentUsernameOrDefault(),
-                programName
-            ))
-
             val workerConfig = createManualAgentConfig(
                 sessionInfo = sessionInfo,
                 instanceName = instance,
@@ -1293,14 +1241,17 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
 
             var workerError: String? = null
             try {
+                // A session without a project still gets a worker of its own; the key only
+                // has to be unique, and nothing else shares that project.
                 val lockedProject = sessionInfo.projectName?.takeIf { it.isNotBlank() }
+                    ?: "session:$id"
                 // The worker runs for the whole turn and this call waits for it.
                 // Doing that on the caller's Netty event loop pins the browser's
                 // keep-alive connection: every other request on it — the message
                 // and chunk polls included — queues behind the turn, so the UI
                 // freezes until the answer is finished.
                 withContext(Dispatchers.IO) {
-                    if (lockedProject != null && ProjectWorkers.poolingEnabled) {
+                    if (ProjectWorkers.poolingEnabled) {
                         // One worker per project, shared by every session on it; the turn
                         // carries the message, so the worker never calls back for details.
                         ResidentWorkers.ensure(lockedProject, workerConfig, serverPort, instance)
@@ -1314,24 +1265,11 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                             programName = programName,
                             llm = workerConfig.llm,
                         )
-                    } else if (lockedProject == null) {
-                        runManualAgentWorker(
-                            workerConfig = workerConfig,
-                            serverPort = serverPort,
-                            token = token,
-                            sessionInfo = sessionInfo,
-                            instance = instance
-                        )
                     } else {
-                        ProjectLock.asOwner(lockedProject, projectDirectory, sessionInfo.sessionId, instance) {
-                            runManualAgentWorker(
-                                workerConfig = workerConfig,
-                                serverPort = serverPort,
-                                token = token,
-                                sessionInfo = sessionInfo,
-                                instance = instance
-                            )
-                        }
+                        // Without the switch there is no worker to talk to; say so instead
+                        // of silently leaving the browser waiting.
+                        throw ManualAgentWorkerException(
+                            "Project workers are disabled on this server (AKIBA_PROJECT_WORKERS).")
                     }
                 }
             } catch (e: Exception) {
@@ -1349,7 +1287,6 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                         }
                     }
                 }
-                ManualAgentTurnRegistry.remove(token)
                 runCatching { Files.deleteIfExists(workerConfig.file) }
                 // The worker JVM exits with its terminal chunk possibly still
                 // in flight (a hung POST, a kill).  The turn is over either
@@ -1414,16 +1351,6 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 // Respond 200 so the frontend ends the turn calmly.
                 ManualAgentProcessRegistry.consumeCancelled(id) ->
                     call.respond(mapOf("status" to "cancelled", "sessionId" to id))
-                // A busy project is not a configuration error: answer 409 with
-                // the holder so the UI can say who is using it.
-                e is org.iotsplab.akiba.managers.ProjectBusyException -> {
-                    // The session was flipped to running before the lock was
-                    // attempted; leaving it there made the turn look live
-                    // forever (spinner, out-of-date status).
-                    markManualChatFailed(daemonHost, daemonPort, instance, id, e.message)
-                    val (status, body) = errorPayload(e)
-                    call.respond(status, body)
-                }
                 e is IllegalStateException -> {
                     markManualChatFailed(daemonHost, daemonPort, instance, id, e.message)
                     call.respond(HttpStatusCode.ServiceUnavailable,
@@ -2364,6 +2291,14 @@ private fun markManualChatFailed(
     }
 }
 
+/** What a worker process needs to start: its config file, and the model for this session. */
+private data class ManualAgentWorkerConfig(
+    val file: Path,
+    val environment: Map<String, String>,
+    /** Model and key for this session; the worker is told per turn, so config changes apply at once. */
+    val llm: org.iotsplab.akiba.managers.TurnBroker.TurnLlm? = null,
+)
+
 private fun createManualAgentConfig(
     sessionInfo: SessionInfo,
     instanceName: String,
@@ -2488,6 +2423,9 @@ private object ResidentWorkers {
         }
     }
 
+    /** The worker serving [project], while it is alive. */
+    fun processOf(project: String): Process? = running[project]?.takeIf { it.isAlive }
+
     fun forget(project: String) {
         synchronized(this) { running.remove(project) }
     }
@@ -2509,7 +2447,6 @@ private fun runPooledTurn(
     programName: String?,
     llm: org.iotsplab.akiba.managers.TurnBroker.TurnLlm?,
 ) {
-    ProjectWorkers.registry.attach(sessionId, project)
     val turn = org.iotsplab.akiba.managers.TurnBroker.Turn(
         id = java.util.UUID.randomUUID().toString(),
         project = project,
@@ -2527,84 +2464,22 @@ private fun runPooledTurn(
     }
     val future = ProjectWorkers.broker.resultOf(turn.id)
         ?: throw ManualAgentWorkerException("The turn was dropped before it could run.")
+    val worker = ResidentWorkers.processOf(project)
+    if (worker != null) ManualAgentProcessRegistry.put(sessionId, worker)
     val result = try {
         future.get(MANUAL_AGENT_TIMEOUT_MINUTES, TimeUnit.MINUTES)
     } catch (e: Exception) {
         ResidentWorkers.forget(project)
         throw ManualAgentWorkerException(
             "The agent worker stopped before this turn finished. It will be restarted on the next message.")
+    } finally {
+        if (worker != null) ManualAgentProcessRegistry.remove(sessionId, worker)
     }
     if (!result.ok) {
         throw ManualAgentWorkerException(result.error ?: "The agent worker failed this turn.")
     }
 }
 
-private fun runManualAgentWorker(
-    workerConfig: ManualAgentWorkerConfig,
-    serverPort: Int,
-    token: String,
-    sessionInfo: SessionInfo,
-    instance: String
-) {
-    val scriptPath = findAkibaScriptForAgent()
-    val pb = ProcessBuilder(scriptPath, "-c", "${workerConfig.file}@/main")
-    pb.directory(File(System.getProperty("user.dir", ".")))
-    val env = pb.environment()
-    env.putAll(workerConfig.environment)
-    env["AKIBA_MANUAL_AGENT"] = "1"
-    // The server may be running with the pooled switch on; this worker is the one-shot
-    // kind and must not start polling for turns.
-    env["AKIBA_PROJECT_WORKERS"] = "0"
-    env["AKIBA_MANUAL_AGENT_TOKEN"] = token
-    agentRouteLogger.info("Manual worker for {} will call back on port {}", sessionInfo.sessionId, serverPort)
-    env["AKIBA_MANUAL_AGENT_SERVER_PORT"] = serverPort.toString()
-    env["AKIBA_MANUAL_AGENT_SESSION_ID"] = sessionInfo.sessionId
-    env["AKIBA_MANUAL_AGENT_INSTANCE"] = instance
-    sessionInfo.projectName?.let { env["AKIBA_MANUAL_AGENT_PROJECT_NAME"] = it }
-    pb.redirectErrorStream(true)
-    val logFile = Files.createTempFile("akiba-manual-agent-${sessionInfo.sessionId.take(8)}-", ".log")
-    pb.redirectOutput(logFile.toFile())
-
-    val process = pb.start()
-    ManualAgentProcessRegistry.put(sessionInfo.sessionId, process)
-    val finished = try {
-        process.waitFor(MANUAL_AGENT_TIMEOUT_MINUTES, TimeUnit.MINUTES)
-    } finally {
-        ManualAgentProcessRegistry.remove(sessionInfo.sessionId, process)
-    }
-    val output = runCatching { Files.readString(logFile) }.getOrDefault("")
-    runCatching { Files.deleteIfExists(logFile) }
-    if (!finished) {
-        process.destroyForcibly()
-        agentRouteLogger.warn("Manual agent worker {} timed out after {} minutes. Worker output:\n{}",
-            sessionInfo.sessionId, MANUAL_AGENT_TIMEOUT_MINUTES, output)
-        throw ManualAgentWorkerException(
-            "The agent worker timed out after $MANUAL_AGENT_TIMEOUT_MINUTES minutes. " +
-                "Details were written to the server log.")
-    }
-    val exitCode = process.exitValue()
-    if (exitCode != 0) {
-        // Keep the full worker stdout/stderr in the SERVER log only.
-        // The exception message (and therefore the HTTP error shown to
-        // the user) stays short — dumping thousands of log lines into
-        // the chat UI left users unable to tell what actually happened.
-        agentRouteLogger.warn("Manual agent worker {} failed with exit code {}. Worker output:\n{}",
-            sessionInfo.sessionId, exitCode, output)
-        throw ManualAgentWorkerException(
-            "The agent worker exited unexpectedly (code $exitCode). " +
-                "Details were written to the server log.")
-    }
-    if (output.isNotBlank()) {
-        agentRouteLogger.debug("[manual-agent ${sessionInfo.sessionId}]\n$output")
-    }
-}
-
-/** Best-effort lookup of the first program in a Ghidra project,
- *  searched RECURSIVELY through all folders (Ghidra projects can
- *  organise programs into subfolders; a root-only scan misses
- *  those).  Returns the full project pathname ("/dir/prog" — "/prog"
- *  for root-level files) so the worker can open it directly.
- *  Used by the manual-agent chat endpoint. */
 private fun findFirstProgramName(projectName: String, projectDir: java.nio.file.Path): String? {
     val grpFile = projectDir.resolve("$projectName.gpr")
     val repFile = projectDir.resolve("$projectName.rep")

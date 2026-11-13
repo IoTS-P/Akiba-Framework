@@ -3,15 +3,15 @@ package org.iotsplab.akiba.managers
 /**
  * The process-wide pieces of the pooled worker topology.
  *
- * One instance each: the server serves every project, so a second broker or scheduler
- * would mean two callers that cannot see each other's queues — which is exactly the
- * double-use of a program the scheduler exists to prevent.
+ * One broker for the whole server: turns are queued per project and handed to whichever
+ * worker owns that project. Nothing else is shared — the program queue lives inside the
+ * worker, because the worker is the only process holding the Ghidra project.
  */
 object ProjectWorkers {
-    val broker = TurnBroker()
-    val registry = ProjectWorkerRegistry()
-    val programs = ProgramScheduler()
 
-    /** True when the pooled topology is switched on; otherwise the per-turn worker runs. */
-    val poolingEnabled: Boolean get() = ProjectWorkerRegistry.poolingEnabled()
+    /** Turns waiting for, or running on, a project's worker. */
+    val broker = TurnBroker()
+
+    /** Off by default; the switch decides whether /chat uses pooled workers. */
+    val poolingEnabled: Boolean get() = System.getenv("AKIBA_PROJECT_WORKERS") == "1"
 }
