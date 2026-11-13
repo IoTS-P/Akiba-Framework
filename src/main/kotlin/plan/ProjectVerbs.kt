@@ -31,7 +31,7 @@ internal class ProjectOps(
 
     override fun openProject(name: String): Outcome<ProjectRef> =
         support.step("openProject", mapOf("project" to name)) {
-            if (!runtime.projectExists(name)) throw ProjectExistsException("$name (missing)")
+            if (!runtime.projectExists(name)) throw ProjectMissingException(name)
             runtime.openProject(name, createIfMissing = false)
         }
 }

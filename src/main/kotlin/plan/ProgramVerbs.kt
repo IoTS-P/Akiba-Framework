@@ -3,7 +3,7 @@ package org.iotsplab.akiba.plan
 /** Moving programs between projects and folders. */
 interface ProgramVerbs {
 
-    /** Imports every program in [programs] into [target]. */
+    /** Copies every program in [programs] into [target]; the sources are untouched. */
     fun importAll(programs: List<ProgramHandle>, target: ImportTarget): Outcome<Int>
 }
 
@@ -14,7 +14,7 @@ internal class ProgramOps(
 
     override fun importAll(programs: List<ProgramHandle>, target: ImportTarget): Outcome<Int> =
         support.step(
-            "import",
+            "importPrograms",
             mapOf(
                 "project" to target.project.name,
                 "folder" to (target.folder ?: ""),
@@ -22,6 +22,6 @@ internal class ProgramOps(
             ),
         ) {
             if (programs.isEmpty()) throw ProgramMissingException("<none matched>")
-            runtime.importPrograms(programs.map { it.id }, target)
+            runtime.copyPrograms(programs, target)
         }
 }

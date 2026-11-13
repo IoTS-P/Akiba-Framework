@@ -18,7 +18,9 @@ interface ProjectRuntime {
 
 /** What a plan can do to the programs on disk. */
 interface ProgramRuntime {
-    fun importPrograms(programIds: List<String>, target: ImportTarget): Int
+
+    /** Copies each program out of the project it lives in and into [target]. */
+    fun copyPrograms(programs: List<ProgramHandle>, target: ImportTarget): Int
 
     /**
      * Programs matching [filter], a bare SQL condition over the program index.

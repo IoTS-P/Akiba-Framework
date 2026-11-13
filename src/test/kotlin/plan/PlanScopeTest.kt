@@ -43,10 +43,10 @@ private class FakeRuntime(
         return ProjectRef(name)
     }
 
-    override fun importPrograms(programIds: List<String>, target: ImportTarget): Int {
-        calls += "import:${target.project.name}:${target.folder}:${programIds.size}"
+    override fun copyPrograms(programs: List<ProgramHandle>, target: ImportTarget): Int {
+        calls += "copy:${target.project.name}:${target.folder}:${programs.size}"
         if (failImport) error("disk full")
-        return programIds.size
+        return programs.size
     }
 
     override fun runModule(spec: ModuleSpec, programIds: List<String>): Int {

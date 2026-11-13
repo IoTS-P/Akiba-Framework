@@ -9,13 +9,17 @@ data class ProjectRef(val name: String) {
 /** Where imports land: a project and its folder. */
 data class ImportTarget(val project: ProjectRef, val folder: String?)
 
-/** A program as the plan sees it: identity plus the facts a script may branch on. */
+/**
+ * A program as the plan sees it: identity, where it lives, and the facts a script may
+ * branch on. The project is part of it because copying a program needs a source.
+ */
 data class ProgramHandle(
     val id: String,
     val name: String,
     val arch: String? = null,
     val sizeBytes: Long? = null,
     val path: String? = null,
+    val project: String? = null,
 )
 
 /** `module("…") { timeout = 600 }` */

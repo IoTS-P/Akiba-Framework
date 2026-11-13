@@ -41,6 +41,23 @@ class Main : Runnable {
             return@runBlocking
         }
 
+        // A plan is a whole run on its own: it must not start the binary pipeline too.
+        planScript?.let { path ->
+            try {
+                val scope = org.iotsplab.akiba.plan.PlanScope(
+                    org.iotsplab.akiba.plan.CliPlanRuntime(),
+                    org.iotsplab.akiba.plan.PlanJournal.at(java.io.File(path).resolveSibling("run.jsonl")),
+                )
+                org.iotsplab.akiba.plan.PlanCompiler().run(java.io.File(path), scope)
+                globalLogger.info("Plan finished: $path (journal beside the script)")
+            } catch (e: Exception) {
+                globalLogger.error("Plan failed: ${e.message}")
+            } finally {
+                finally()
+            }
+            return@runBlocking
+        }
+
         // If it's importing mode, import files and exit
         try {
             importConfig ?.let {
@@ -85,6 +102,13 @@ class Main : Runnable {
                 required = false
             )
             var importConfig: String? = null
+
+            @CommandLine.Option(
+                names = ["-p", "--plan"],
+                description = ["Run a .kts plan script"],
+                required = false
+            )
+            var plan: String? = null
         }
 
         @ArgGroup(exclusive = true, multiplicity = "0..1")
@@ -93,6 +117,8 @@ class Main : Runnable {
             get() = Mode.restore
         val importConfig: String?
             get() = Mode.importConfig
+        val planScript: String?
+            get() = Mode.plan
 
         @CommandLine.Option(
             names = ["-c", "--main-config"],

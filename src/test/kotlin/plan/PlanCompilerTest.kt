@@ -28,9 +28,9 @@ private class RecordingRuntime : PlanRuntime {
         calls += "open:$name"; projects += name; return ProjectRef(name)
     }
 
-    override fun importPrograms(programIds: List<String>, target: ImportTarget): Int {
-        calls += "import:${target.project.name}:${target.folder}:${programIds.size}"
-        return programIds.size
+    override fun copyPrograms(programs: List<ProgramHandle>, target: ImportTarget): Int {
+        calls += "copy:${target.project.name}:${target.folder}:${programs.size}"
+        return programs.size
     }
 
     override fun runModule(spec: ModuleSpec, programIds: List<String>): Int {
@@ -64,7 +64,7 @@ class PlanCompilerTest {
 
         PlanCompiler().run(file, PlanScope(runtime))
 
-        assertEquals(listOf("open:fx20_batch", "import:fx20_batch:raw:2", "run:org.iotsplab.akiba.module.AkibaUtils:2"), runtime.calls)
+        assertEquals(listOf("open:fx20_batch", "copy:fx20_batch:raw:2", "run:org.iotsplab.akiba.module.AkibaUtils:2"), runtime.calls)
     }
 
     @Test
@@ -81,7 +81,7 @@ class PlanCompilerTest {
 
         PlanCompiler().run(file, PlanScope(runtime))
 
-        assertEquals(listOf("find:arch = 'arm'", "open:arm_batch", "import:arm_batch:arm:1"), runtime.calls)
+        assertEquals(listOf("find:arch = 'arm'", "open:arm_batch", "copy:arm_batch:arm:1"), runtime.calls)
     }
 
     @Test

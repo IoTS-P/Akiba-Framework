@@ -14,6 +14,10 @@ open class PlanException(
 class ProjectExistsException(val project: String, step: Int? = null) :
     PlanException("Project '$project' already exists", step)
 
+/** `openProject` was asked for a project that is not there. A typo must not create one. */
+class ProjectMissingException(val project: String, step: Int? = null) :
+    PlanException("Project '$project' does not exist; use createOrOpenProject to create it", step)
+
 /** A verb referenced a program the plan cannot resolve. */
 class ProgramMissingException(val programId: String, step: Int? = null) :
     PlanException("Program '$programId' is not in the index any more", step)
