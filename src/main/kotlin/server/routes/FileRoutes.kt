@@ -352,7 +352,7 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
         logger.info("File delete requested for instance '{}': {} id(s)", instance, ids.size)
         try {
             // 1. Delete the DB rows.  The daemon's DELETE cascades to
-            //    processed_binaries and results via ON DELETE CASCADE.
+            //    results via ON DELETE CASCADE.
             val deleted = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 dbClient.deleteBinaries(ids)
             }
