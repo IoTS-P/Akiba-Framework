@@ -300,38 +300,21 @@ data class StreamChunkPayload(
     val newGeneration: Boolean = false,
 )
 
-private object ManualAgentProcessRegistry {
-    private val processes = ConcurrentHashMap<String, Process>()
-    /** Sessions whose running worker was deliberately killed via /cancel-chat. */
+/** Sessions whose last turn the user stopped, so /chat answers calmly. */
+private object ChatCancellations {
     private val cancelled = ConcurrentHashMap.newKeySet<String>()
 
-    fun put(sessionId: String, process: Process) {
-        // A new turn is starting — drop any stale cancellation marker so
-        // a later, unrelated failure is not misreported as a user cancel.
+    /** A new turn is starting — drop any stale marker. */
+    fun clear(sessionId: String) {
         cancelled.remove(sessionId)
-        processes[sessionId] = process
     }
 
-    fun remove(sessionId: String, process: Process) {
-        processes.remove(sessionId, process)
-    }
-
-    fun cancel(sessionId: String): Boolean {
-        val process = processes.remove(sessionId) ?: return false
+    fun mark(sessionId: String) {
         cancelled.add(sessionId)
-        process.destroyForcibly()
-        // End the live stream generation: the killed worker will never
-        // publish its own terminal chunk, so without this the frontend
-        // streaming bubble stalls on "waiting for model…" forever.
-        org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.finish(sessionId, USER_CANCELLED_STREAM_ERROR)
-        return true
     }
 
-    /**
-     * True (exactly once) when [sessionId]'s last worker failure was
-     * caused by a user cancel; consumes the marker.
-     */
-    fun consumeCancelled(sessionId: String): Boolean = cancelled.remove(sessionId)
+    /** True (exactly once) when [sessionId]'s last turn was stopped by the user. */
+    fun consume(sessionId: String): Boolean = cancelled.remove(sessionId)
 }
 
 /** Stream-bus error label used when a chat turn is cancelled by the user.
@@ -1168,18 +1151,32 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 val boundId = sessionInfo.currentProgramId
                 val bound = sessionInfo.currentProgram?.takeIf { it.isNotBlank() }
                 if (boundId != null) {
-                    // Identity first: the name can be stale after a rename, and a
-                    // deleted program must say so instead of running on nothing.
+                    // Identity first: the name can be stale after a rename. The index is
+                    // written whenever a project is opened — by the worker that holds it —
+                    // so a resident worker's project is covered as long as it refreshes.
                     val resolved = ProjectIndex.pathOfProgram(project, root, boundId)
-                    if (resolved == null) {
-                        markManualChatFailed(daemonHost, daemonPort, instance, id, "program deleted")
-                        call.respond(HttpStatusCode.Conflict, mapOf(
-                            "error" to "The program this conversation was using no longer exists. " +
-                                "Pick another program in the header and send again."
-                        ))
-                        return@post
+                        ?: bound?.let { name ->
+                            ProjectIndex.entries(project, root).firstOrNull { it.name == name }?.path
+                        }
+                    programName = when {
+                        resolved != null -> resolved
+                        // No index entry: the name the session already knows is still what
+                        // the worker opens by. It reports back if the file is really gone.
+                        bound != null -> {
+                            agentRouteLogger.info(
+                                "program {} ({}) is not in the index for {}; using the name",
+                                bound, boundId, project)
+                            bound
+                        }
+                        else -> {
+                            markManualChatFailed(daemonHost, daemonPort, instance, id, "program deleted")
+                            call.respond(HttpStatusCode.Conflict, mapOf(
+                                "error" to "The program this conversation was using no longer exists. " +
+                                    "Pick another program in the header and send again."
+                            ))
+                            return@post
+                        }
                     }
-                    programName = resolved
                 } else if (bound != null) {
                     programName = bound
                 } else {
@@ -1349,8 +1346,22 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 // failure, and do NOT dump the killed worker's log
                 // (exit code + full stdout) into the HTTP response.
                 // Respond 200 so the frontend ends the turn calmly.
-                ManualAgentProcessRegistry.consumeCancelled(id) ->
+                ChatCancellations.consume(id) -> {
+                    // The agent may have written ERROR on its way out; a stop is not a
+                    // failure, so park the session where the user left it.
+                    runCatching {
+                        withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                            val agentDbClient = AgentDatabaseClient(dbClient)
+                            agentDbClient.updateSession(id, status = "closed")
+                            agentDbClient.setRuntimeState(
+                                id,
+                                org.iotsplab.akiba.llm.agent.runtime.RuntimeState.CLOSED.wire(),
+                                "user_cancelled_chat"
+                            )
+                        }
+                    }
                     call.respond(mapOf("status" to "cancelled", "sessionId" to id))
+                }
                 e is IllegalStateException -> {
                     markManualChatFailed(daemonHost, daemonPort, instance, id, e.message)
                     call.respond(HttpStatusCode.ServiceUnavailable,
@@ -1584,12 +1595,11 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         }
     }
 
-    // ------ Cancel a running manual chat turn --------------------------------
+    // ------ Stop a running chat turn ----------------------------------------
     //
-    // When the user sends a chat message via /chat, the server spawns
-    // a child process and blocks until it finishes.  This endpoint
-    // forcibly kills that child process so the /chat call returns with
-    // an error, letting the user send a new message.
+    // The stop is aimed at the turn, not at the process: one worker serves every
+    // session on a project, so killing it would take the other sessions down too.
+    // The worker polls the turn's cancel flag and aborts there.
 
     post("/agent/sessions/{id}/cancel-chat") {
         val id = call.parameters["id"].orEmpty()
@@ -1597,7 +1607,13 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
             return@post
         }
-        val cancelled = ManualAgentProcessRegistry.cancel(id)
+        val cancelled = ProjectWorkers.broker.cancel(id)
+        if (cancelled) {
+            ChatCancellations.mark(id)
+            // The worker ends the turn quietly, so the stream needs its terminal
+            // marker here or the bubble waits on "waiting for model…" forever.
+            org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.finish(id, USER_CANCELLED_STREAM_ERROR)
+        }
         // Release any tool threads blocked on human-in-the-loop prompts
         // (confirmation / user choice) for this session.
         ConfirmationManager.clear(id)
@@ -1840,10 +1856,9 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                 agentRouteLogger.info("[delete-session] hard-deleted $deleted session(s) for root=$id")
             }
 
-            // Cancel any lingering manual agent process and clear
-            // pending confirmations (defensive — the session should
-            // already be terminal, but just in case).
-            ManualAgentProcessRegistry.cancel(id)
+            // Stop anything still running for this session and clear pending
+            // confirmations (defensive — the session should already be terminal).
+            ProjectWorkers.broker.cancel(id)
             ConfirmationManager.clear(id)
             UserChoiceManager.clear(id)
 
@@ -2423,9 +2438,6 @@ private object ResidentWorkers {
         }
     }
 
-    /** The worker serving [project], while it is alive. */
-    fun processOf(project: String): Process? = running[project]?.takeIf { it.isAlive }
-
     fun forget(project: String) {
         synchronized(this) { running.remove(project) }
     }
@@ -2464,16 +2476,13 @@ private fun runPooledTurn(
     }
     val future = ProjectWorkers.broker.resultOf(turn.id)
         ?: throw ManualAgentWorkerException("The turn was dropped before it could run.")
-    val worker = ResidentWorkers.processOf(project)
-    if (worker != null) ManualAgentProcessRegistry.put(sessionId, worker)
+    ChatCancellations.clear(sessionId)
     val result = try {
         future.get(MANUAL_AGENT_TIMEOUT_MINUTES, TimeUnit.MINUTES)
     } catch (e: Exception) {
         ResidentWorkers.forget(project)
         throw ManualAgentWorkerException(
             "The agent worker stopped before this turn finished. It will be restarted on the next message.")
-    } finally {
-        if (worker != null) ManualAgentProcessRegistry.remove(sessionId, worker)
     }
     if (!result.ok) {
         throw ManualAgentWorkerException(result.error ?: "The agent worker failed this turn.")

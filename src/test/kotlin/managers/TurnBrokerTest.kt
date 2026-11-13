@@ -108,4 +108,35 @@ class TurnBrokerTest {
         assertEquals(1, broker.pending("fx20"))
         assertEquals("b1", broker.next("fx20", 100)!!.prompt)
     }
+
+    @Test
+    fun `stopping one session leaves the others running`() {
+        val broker = TurnBroker()
+        broker.submit(turn("session-a", prompt = "a"))
+        broker.submit(turn("session-b", prompt = "b"))
+        val first = broker.next("fx20", 500)!!
+        val second = broker.next("fx20", 500)!!
+
+        assertTrue(broker.cancel(first.sessionId))
+
+        assertTrue(broker.isCancelled(first.id))
+        assertFalse(broker.isCancelled(second.id))
+    }
+
+    @Test
+    fun `stopping also drops what was queued behind the turn`() {
+        val broker = TurnBroker()
+        broker.submit(turn("session-a"))
+        val running = broker.next("fx20", 500)!!
+        broker.submit(turn("session-a", prompt = "queued"))
+        val queuedResult = broker.resultOf(
+            broker.pending("fx20").let { "t-${counter - 1}" },
+        )
+
+        broker.cancel("session-a")
+
+        assertEquals(0, broker.pending("fx20"))
+        assertEquals("cancelled", queuedResult?.get(1, TimeUnit.SECONDS)?.status)
+        assertTrue(broker.isCancelled(running.id))
+    }
 }

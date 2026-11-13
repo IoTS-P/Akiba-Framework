@@ -36,6 +36,10 @@ data class TurnLlmDto(
 @Serializable
 data class TurnNextResponse(val turn: TurnDto? = null)
 
+/** Whether the user has asked to stop this turn. */
+@Serializable
+data class TurnCancelState(val cancelled: Boolean = false)
+
 /** How a turn ended, as the worker reports it back. */
 @Serializable
 data class TurnFinishedRequest(
@@ -75,6 +79,22 @@ fun Route.workerTurnRoutes(broker: TurnBroker = ProjectWorkers.broker) {
                 },
             ),
         )
+    }
+
+    // Polled by the worker while it runs a turn: a stop request has to reach the turn,
+    // not the process, or cancelling one session would stop every session on the project.
+    get("/agent/internal/turn/{turnId}/cancelled") {
+        val instance = call.requireInstanceHeader() ?: return@get
+        if (instance.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance header"))
+            return@get
+        }
+        val turnId = call.parameters["turnId"].orEmpty()
+        if (turnId.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing turn id"))
+            return@get
+        }
+        call.respond(TurnCancelState(broker.isCancelled(turnId)))
     }
 
     post("/agent/internal/turn/finished") {

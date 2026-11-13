@@ -284,7 +284,10 @@ private val INTERNAL_WORKER_PATHS = setOf(
  * still requires a signed-in user.
  */
 private fun ApplicationCall.isInternalChunkPush(): Boolean {
-    if (request.path() !in INTERNAL_WORKER_PATHS) return false
+    val path = request.path()
+    // Turn paths carry the turn id, so they are matched by prefix.
+    val allowed = path in INTERNAL_WORKER_PATHS || path.startsWith("/api/agent/internal/turn/")
+    if (!allowed) return false
     return InternalToken.matches(request.header(InternalToken.HEADER))
 }
 

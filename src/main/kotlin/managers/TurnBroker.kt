@@ -58,6 +58,10 @@ class TurnBroker(private val capacityPerSession: Int = 8) {
     // project -> (session -> its queue); LinkedHashMap keeps a stable rotation order.
     private val byProject = ConcurrentHashMap<String, LinkedHashMap<String, SessionSlot>>()
     private val results = ConcurrentHashMap<String, CompletableFuture<Result>>()
+    /** Turn a session is running right now: turnId -> sessionId. */
+    private val running = ConcurrentHashMap<String, String>()
+    /** Turns the user asked to stop; the worker polls this while it runs one. */
+    private val cancelRequests = ConcurrentHashMap.newKeySet<String>()
     private var cursor = 0
 
     /** Queues [turn]; false when that session already has [capacityPerSession] waiting. */
@@ -90,6 +94,7 @@ class TurnBroker(private val capacityPerSession: Int = 8) {
                     val turn = slots[index].turns.removeFirstOrNull()
                     if (turn != null) {
                         cursor = (index + 1) % slots.size
+                        running[turn.id] = turn.sessionId
                         return turn
                     }
                 }
@@ -102,8 +107,40 @@ class TurnBroker(private val capacityPerSession: Int = 8) {
 
     /** Records how [turnId] ended and wakes whoever is waiting on it. */
     fun finish(turnId: String, result: Result) {
+        running.remove(turnId)
+        cancelRequests.remove(turnId)
         results.remove(turnId)?.complete(result)
     }
+
+    /**
+     * Asks the worker to stop [sessionId]'s current turn, and drops anything queued
+     * behind it.
+     *
+     * The stop is cooperative: the worker polls [isCancelled] while it runs the turn and
+     * aborts it there, so the other sessions sharing the worker are untouched. Killing
+     * the process would stop all of them.
+     */
+    fun cancel(sessionId: String): Boolean {
+        val dropped = byProject.values.sumOf { slots ->
+            synchronized(this) {
+                slots.remove(sessionId)?.let { slot ->
+                    val held = slot.turns.size
+                    slot.turns.forEach { results.remove(it.id)?.complete(Result("cancelled", CANCELLED)) }
+                    slot.turns.clear()
+                    held
+                } ?: 0
+            }
+        }
+        val turnId = running.entries.firstOrNull { it.value == sessionId }?.key
+        if (turnId != null) {
+            cancelRequests.add(turnId)
+            return true
+        }
+        return dropped > 0
+    }
+
+    /** True once the user asked to stop [turnId]. */
+    fun isCancelled(turnId: String): Boolean = cancelRequests.contains(turnId)
 
     /** Drops a session's backlog and fails anyone still waiting on those turns. */
     @Synchronized
@@ -113,6 +150,11 @@ class TurnBroker(private val capacityPerSession: Int = 8) {
         slot.turns.forEach { results.remove(it.id)?.complete(Result("failed", "Session was stopped.")) }
         slot.turns.clear()
         return dropped
+    }
+
+    companion object {
+        /** The message a cancelled turn carries; the UI renders it as a calm stop. */
+        const val CANCELLED: String = "cancelled by user"
     }
 
     /** Turns queued for [project] across all its sessions. */

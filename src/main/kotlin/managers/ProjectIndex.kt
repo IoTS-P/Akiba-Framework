@@ -49,7 +49,14 @@ object ProjectIndex {
         }
         return try {
             val key = projectKey(projectName, projectDirectory)
-            write(key, ProjectPrograms.tree(projectName, projectDirectory))
+            val tree = ProjectPrograms.tree(projectName, projectDirectory)
+            // A project held open by a worker can read back empty without failing; an
+            // empty read must not erase a tree the browser is showing.
+            if (tree.isEmpty() && entries(projectName, projectDirectory).isNotEmpty()) {
+                logger.warn("Project index refresh for '{}' read an empty tree; keeping the old one", projectName)
+                return false
+            }
+            write(key, tree)
             true
         } catch (e: Throwable) {
             // Ghidra reports a failed static initializer as an Error, not an
