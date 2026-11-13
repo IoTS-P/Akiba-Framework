@@ -540,6 +540,9 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         call.respond(mapOf("status" to "ok", "accepted" to batch.size))
     }
 
+    // A resident worker asks for its next turn here and reports the outcome after.
+    workerTurnRoutes()
+
     // ------ Incremental poll: live LLM streaming chunks for a session ------
     //
     // The frontend polls this endpoint (~1 s cadence) while a session

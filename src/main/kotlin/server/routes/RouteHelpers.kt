@@ -271,16 +271,20 @@ private fun <T> runDaemonSession(
     return if (lock != null) lock.withLock { doSession() } else doSession()
 }
 
-/** Absolute path of the live-chunk push endpoint, as the server sees it. */
-private const val STREAM_CHUNK_PATH = "/api/agent/internal/stream-chunk"
+/** The endpoints a worker JVM may call with the shared [InternalToken] secret. */
+private val INTERNAL_WORKER_PATHS = setOf(
+    "/api/agent/internal/stream-chunk",
+    "/api/agent/internal/turn/next",
+    "/api/agent/internal/turn/finished",
+)
 
 /**
- * True when [this] request is a worker JVM pushing a live LLM chunk with the
- * shared secret from [InternalToken].  Only that one endpoint accepts the
- * secret: every other /api route still requires a signed-in user.
+ * True when [this] request comes from a worker JVM holding the shared secret from
+ * [InternalToken].  Only the endpoints above accept the secret: every other /api route
+ * still requires a signed-in user.
  */
 private fun ApplicationCall.isInternalChunkPush(): Boolean {
-    if (request.path() != STREAM_CHUNK_PATH) return false
+    if (request.path() !in INTERNAL_WORKER_PATHS) return false
     return InternalToken.matches(request.header(InternalToken.HEADER))
 }
 
