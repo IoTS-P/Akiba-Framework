@@ -43,6 +43,19 @@ class Main : Runnable {
 
         // A plan is a whole run on its own: it must not start the binary pipeline too.
         planScript?.let { path ->
+            // `programs()` reads the project index, which lives in the server database.
+            // A plan without it can still create projects and copy programs by hand, so a
+            // failed connection is a warning here, not a reason to refuse the run.
+            runCatching {
+                org.iotsplab.akiba.server.db.ServerDatabase.init(
+                    org.iotsplab.akiba.server.db.ServerDbConfig(
+                        host = dbHost, port = dbPort, dbName = dbName,
+                        user = dbUser, password = dbPassword,
+                    ),
+                )
+            }.onFailure {
+                globalLogger.warn("Plan started without the project index: ${it.message}")
+            }
             try {
                 val scope = org.iotsplab.akiba.plan.PlanScope(
                     org.iotsplab.akiba.plan.CliPlanRuntime(),
@@ -127,6 +140,46 @@ class Main : Runnable {
         )
         @JvmStatic
         var mainConfigPath: String = "configs/config.yaml${ConfigManager.KEY_SEPARATOR}main"
+
+        @CommandLine.Option(
+            names = ["--db-host"],
+            description = ["Database host for the project index (plans only)"],
+            required = false
+        )
+        @JvmStatic
+        var dbHost: String = "localhost"
+
+        @CommandLine.Option(
+            names = ["--db-port"],
+            description = ["Database port for the project index (plans only)"],
+            required = false
+        )
+        @JvmStatic
+        var dbPort: Int = 5432
+
+        @CommandLine.Option(
+            names = ["--db-name"],
+            description = ["Database name for the project index (plans only)"],
+            required = false
+        )
+        @JvmStatic
+        var dbName: String = "akiba_users"
+
+        @CommandLine.Option(
+            names = ["--db-user"],
+            description = ["Database user for the project index (plans only)"],
+            required = false
+        )
+        @JvmStatic
+        var dbUser: String = "akiba"
+
+        @CommandLine.Option(
+            names = ["--db-password"],
+            description = ["Database password for the project index (plans only)"],
+            required = false
+        )
+        @JvmStatic
+        var dbPassword: String = "akiba"
 
         @CommandLine.Option(
             names = ["--venv"],

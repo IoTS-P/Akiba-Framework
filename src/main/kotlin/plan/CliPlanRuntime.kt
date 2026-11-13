@@ -56,12 +56,23 @@ class CliPlanRuntime(
             val source = program.project
                 ?: throw PlanException("Program '${program.name}' has no source project")
             if (source == target.project.name) continue
-            ProjectPrograms.copy(
+            val result = ProjectPrograms.copy(
                 sourceProject = source,
-                programName = program.path ?: program.name,
+                programName = program.path?.takeIf { it.isNotBlank() } ?: program.name,
                 targetProject = target.project.name,
                 projectDirectory = projectsRoot,
             )
+            // copy() always lands in the project root; a target folder is a second move,
+            // so a plan that says "batch / raw" gets its programs in raw/.
+            val folder = target.folder?.trim('/')
+            if (!folder.isNullOrBlank()) {
+                ProjectPrograms.moveEntry(
+                    projectName = target.project.name,
+                    projectDirectory = projectsRoot,
+                    path = result.targetFile,
+                    targetFolderPath = folder,
+                )
+            }
             copied++
         }
         return copied
