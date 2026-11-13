@@ -71,6 +71,28 @@ object ProjectIndex {
     private val MIN_REFRESH_INTERVAL_MS = 30_000L
 
     /**
+     * Replaces a project's indexed tree with one read by another process.
+     *
+     * A resident worker holds its project open for the whole session, so the server can
+     * never read that tree itself — and the worker has no database pool. The worker
+     * therefore walks the tree it already has open and hands it over here.
+     */
+    fun replace(projectName: String, projectDirectory: Path, entries: List<ProjectPrograms.Entry>): Boolean {
+        if (!ServerDatabase.isInitialized) return false
+        return try {
+            if (entries.isEmpty() && entries(projectName, projectDirectory).isNotEmpty()) {
+                logger.warn("Project index for '{}' replaced with an empty tree; keeping the old one", projectName)
+                return false
+            }
+            write(projectKey(projectName, projectDirectory), entries)
+            true
+        } catch (e: Throwable) {
+            logger.warn("Project index replace for '{}' failed: {}", projectName, e.toString())
+            false
+        }
+    }
+
+    /**
      * Rebuild the index when the project is free and the copy is older than
      * [MIN_REFRESH_INTERVAL_MS].
      *

@@ -36,6 +36,23 @@ data class TurnLlmDto(
 @Serializable
 data class TurnNextResponse(val turn: TurnDto? = null)
 
+/** One row of a project's file tree, as a worker read it. */
+@Serializable
+data class ProjectIndexEntryDto(
+    val path: String,
+    val name: String,
+    val folder: Boolean,
+    val size: Long = 0,
+    val modified: Long = 0,
+)
+
+/** The tree a worker hands over for indexing. */
+@Serializable
+data class ProjectIndexRequest(
+    val project: String,
+    val entries: List<ProjectIndexEntryDto> = emptyList(),
+)
+
 /** Whether the user has asked to stop this turn. */
 @Serializable
 data class TurnCancelState(val cancelled: Boolean = false)
@@ -95,6 +112,36 @@ fun Route.workerTurnRoutes(broker: TurnBroker = ProjectWorkers.broker) {
             return@get
         }
         call.respond(TurnCancelState(broker.isCancelled(turnId)))
+    }
+
+    // The worker is the only process that can read a project it holds open, and it has
+    // no database pool of its own, so it hands the tree over and the server stores it.
+    post("/agent/internal/project/index") {
+        val instance = call.requireInstanceHeader() ?: return@post
+        if (instance.isBlank()) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance header"))
+            return@post
+        }
+        val req = try {
+            call.receive<ProjectIndexRequest>()
+        } catch (e: Exception) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid payload: ${e.message}"))
+            return@post
+        }
+        val root = java.nio.file.Path.of("ghidra_projects").toAbsolutePath().normalize()
+        val stored = withContext(Dispatchers.IO) {
+            org.iotsplab.akiba.managers.ProjectIndex.replace(
+                req.project,
+                root,
+                req.entries.map { e ->
+                    org.iotsplab.akiba.managers.ProjectPrograms.Entry(
+                        path = e.path, name = e.name, folder = e.folder,
+                        size = e.size, modified = e.modified,
+                    )
+                },
+            )
+        }
+        call.respond(mapOf("indexed" to stored, "entries" to req.entries.size, "project" to req.project))
     }
 
     post("/agent/internal/turn/finished") {

@@ -276,6 +276,7 @@ private val INTERNAL_WORKER_PATHS = setOf(
     "/api/agent/internal/stream-chunk",
     "/api/agent/internal/turn/next",
     "/api/agent/internal/turn/finished",
+    "/api/agent/internal/project/index",
 )
 
 /**

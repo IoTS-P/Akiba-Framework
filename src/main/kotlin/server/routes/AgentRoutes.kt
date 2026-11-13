@@ -2329,8 +2329,9 @@ private fun createManualAgentConfig(
     } ?: throw IllegalStateException("No LLM key configured for model '$modelName'")
 
     val llmEnvName = "AKIBA_MANUAL_LLM_${UUID.randomUUID().toString().replace("-", "") }"
-    val projectRoot = Path.of(ConfigManager.projectConf.projectRoot)
-        .resolve(projectDirectory)
+    // The server's own projects root, made absolute. Resolving it against the configured
+    // root put the worker into an empty project that happened to share the name.
+    val projectRoot = projectDirectory.toAbsolutePath().normalize()
         .toAbsolutePath()
         .normalize()
     val projectName = sessionInfo.projectName ?: "manual-agent-${sessionInfo.sessionId.take(8)}"
