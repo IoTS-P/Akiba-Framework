@@ -2552,6 +2552,9 @@ private fun runManualAgentWorker(
     val env = pb.environment()
     env.putAll(workerConfig.environment)
     env["AKIBA_MANUAL_AGENT"] = "1"
+    // The server may be running with the pooled switch on; this worker is the one-shot
+    // kind and must not start polling for turns.
+    env["AKIBA_PROJECT_WORKERS"] = "0"
     env["AKIBA_MANUAL_AGENT_TOKEN"] = token
     agentRouteLogger.info("Manual worker for {} will call back on port {}", sessionInfo.sessionId, serverPort)
     env["AKIBA_MANUAL_AGENT_SERVER_PORT"] = serverPort.toString()

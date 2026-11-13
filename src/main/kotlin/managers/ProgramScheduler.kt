@@ -28,7 +28,7 @@ class ProgramScheduler(private val defaultTimeoutMs: Long = 120_000L) {
         val endedAt: Long,
     )
 
-    private class Slot {
+    internal class Slot {
         /** Fair, so a session cannot be starved by a busier neighbour. */
         val lock = ReentrantLock(true)
         @Volatile var holder: String? = null
@@ -48,7 +48,31 @@ class ProgramScheduler(private val defaultTimeoutMs: Long = 120_000L) {
         val sessionId: String,
         /** Holds by *other* sessions since this session last touched the program. */
         val foreign: List<Hold>,
+        private val slot: Slot? = null,
+        private val operation: String = "tool",
+        private val mutated: Boolean = true,
+        private val startedAt: Long = System.currentTimeMillis(),
     ) {
+        @Volatile private var released = false
+
+        /**
+         * Gives the program back.
+         *
+         * Safe to call twice, and a no-op for a reentrant lease (the outer one owns the
+         * lock). Without this, a caller that wants to hold a program across a longer
+         * stretch — a whole turn — could only do so by wrapping it in a lambda.
+         */
+        fun release() {
+            if (released) return
+            released = true
+            val held = slot ?: return
+            synchronized(held) { record(held, sessionId, operation, mutated, startedAt) }
+            held.depth = 0
+            held.ownerThread = null
+            held.holder = null
+            held.lock.unlock()
+        }
+
         /** True when someone else changed the program behind the agent's back. */
         val stateChanged: Boolean get() = foreign.any { it.mutated }
 
@@ -102,16 +126,35 @@ class ProgramScheduler(private val defaultTimeoutMs: Long = 120_000L) {
         timeoutMs: Long = defaultTimeoutMs,
         block: (Lease) -> R,
     ): R {
+        val lease = acquire(programId, sessionId, operation, mutated, timeoutMs)
+        try {
+            return block(lease)
+        } finally {
+            lease.release()
+        }
+    }
+
+    /**
+     * Takes [programId] for [sessionId] and hands back the lease.
+     *
+     * Use this when the work cannot be expressed as a lambda — a turn that opens the
+     * program, builds an agent and runs it is the case this exists for. Call
+     * [Lease.release] exactly when the work is done; until then nobody else may touch
+     * the program.
+     */
+    fun acquire(
+        programId: String,
+        sessionId: String,
+        operation: String = "tool",
+        mutated: Boolean = true,
+        timeoutMs: Long = defaultTimeoutMs,
+    ): Lease {
         val slot = slots.computeIfAbsent(programId) { Slot() }
         val me = Thread.currentThread().threadId()
 
         if (slot.ownerThread == me) {
             slot.depth += 1
-            return try {
-                block(Lease(programId, sessionId, emptyList()))
-            } finally {
-                slot.depth -= 1
-            }
+            return Lease(programId, sessionId, emptyList())
         }
 
         val acquired = try {
@@ -134,16 +177,7 @@ class ProgramScheduler(private val defaultTimeoutMs: Long = 120_000L) {
         slot.depth = 1
         val started = System.currentTimeMillis()
         val foreign = synchronized(slot) { pendingFor(slot, sessionId) }
-        try {
-            val lease = Lease(programId, sessionId, foreign)
-            return block(lease)
-        } finally {
-            synchronized(slot) { record(slot, sessionId, operation, mutated, started) }
-            slot.depth = 0
-            slot.ownerThread = null
-            slot.holder = null
-            slot.lock.unlock()
-        }
+        return Lease(programId, sessionId, foreign, slot, operation, mutated, started)
     }
 
     /** Holds this session has not been told about yet. */

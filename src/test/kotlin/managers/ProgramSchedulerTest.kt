@@ -159,4 +159,27 @@ class ProgramSchedulerTest {
         Thread.sleep(400)
         assertEquals(listOf(1, 2, 3), order, "fair queue, no barging")
     }
+
+    @Test
+    fun `a lease held across a turn blocks another session until released`() {
+        val scheduler = ProgramScheduler(defaultTimeoutMs = 500)
+        val held = CountDownLatch(1)
+        val done = CountDownLatch(1)
+        val holder = thread {
+            val lease = scheduler.acquire("prog", "session-a", "agent-turn")
+            held.countDown()
+            done.await(2, TimeUnit.SECONDS)
+            lease.release()
+        }
+
+        assertTrue(held.await(2, TimeUnit.SECONDS))
+        assertFailsWith<ProgramScheduler.ProgramBusyException> {
+            scheduler.withProgram("prog", "session-b", timeoutMs = 150) { }
+        }
+
+        done.countDown()
+        holder.join(2_000)
+        scheduler.withProgram("prog", "session-b", timeoutMs = 500) { }
+        assertTrue(scheduler.history("prog").any { it.sessionId == "session-a" })
+    }
 }
