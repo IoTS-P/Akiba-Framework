@@ -222,9 +222,14 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                 // Fast file count: number of packed `.gzf` files in the project's
                 // .rep/ directory. Avoids the cost of opening each project with
                 // Ghidra just to count contents.
-                var fileCount = 0
+                // The index knows the tree (a worker keeps it current); the .gzf scan
+                // below is the old heuristic and misses programs stored under /idata.
+                var fileCount = runCatching {
+                    org.iotsplab.akiba.managers.ProjectIndex.entries(name, projectDirectory)
+                        .count { !it.folder }
+                }.getOrDefault(0)
                 val repDir = projectDirectory.resolve("$name.rep")
-                if (repDir.isDirectory()) {
+                if (fileCount == 0 && repDir.isDirectory()) {
                     Files.list(repDir).use { stream ->
                         fileCount = stream
                             .filter { it.isRegularFile() && it.name.endsWith(".gzf") }
