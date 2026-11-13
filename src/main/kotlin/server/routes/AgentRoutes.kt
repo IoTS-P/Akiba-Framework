@@ -1206,8 +1206,22 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             if (sessionInfo.binaryId == null && sessionInfo.projectName != null) {
                 val project = sessionInfo.projectName
                 val root = call.currentUserGhidraProjectsRoot()
+                val boundId = sessionInfo.currentProgramId
                 val bound = sessionInfo.currentProgram?.takeIf { it.isNotBlank() }
-                if (bound != null) {
+                if (boundId != null) {
+                    // Identity first: the name can be stale after a rename, and a
+                    // deleted program must say so instead of running on nothing.
+                    val resolved = ProjectIndex.pathOfProgram(project, root, boundId)
+                    if (resolved == null) {
+                        markManualChatFailed(daemonHost, daemonPort, instance, id, "program deleted")
+                        call.respond(HttpStatusCode.Conflict, mapOf(
+                            "error" to "The program this conversation was using no longer exists. " +
+                                "Pick another program in the header and send again."
+                        ))
+                        return@post
+                    }
+                    programName = resolved
+                } else if (bound != null) {
                     programName = bound
                 } else {
                     // No implicit "first program" any more: a conversation works
@@ -1238,13 +1252,22 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             // project: this is the only moment a conversation can create one,
             // and the UI needs it while the turn is still running.
             programName?.let { program ->
-                withContext(Dispatchers.IO) {
+                val programId = withContext(Dispatchers.IO) {
                     runCatching {
-                        ProjectPrograms.ensureProgramIdentity(
-                            sessionInfo.projectName!!,
-                            indexRoot,
-                            program,
-                        )
+                        ProjectPrograms.ensureProgramIdentity(sessionInfo.projectName!!, indexRoot, program)
+                    }.getOrNull()
+                }
+                if (programId != null) {
+                    // Bind the session to what this turn actually opens; the
+                    // daemon accumulates it into program_ids.
+                    runCatching {
+                        withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                            AgentDatabaseClient(dbClient).updateSession(
+                                id,
+                                programName = program,
+                                programId = programId,
+                            )
+                        }
                     }
                 }
             }
@@ -1801,12 +1824,32 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
             return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Nothing to update"))
         }
         val name = req.sessionName?.trim()?.takeIf { it.isNotEmpty() }
+        val targetProgram = req.programName?.trim()?.takeIf { it.isNotEmpty() }
         try {
+            // Switching program also rebinds the identity, otherwise the next
+            // turn would resolve the old id and open the wrong program.
+            val targetProgramId = if (targetProgram != null) {
+                val project = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                    AgentDatabaseClient(dbClient).getSession(id).projectName
+                }
+                if (project != null) {
+                    withContext(Dispatchers.IO) {
+                        runCatching {
+                            ProjectPrograms.ensureProgramIdentity(
+                                project,
+                                call.currentUserGhidraProjectsRoot(),
+                                targetProgram,
+                            )
+                        }.getOrNull()
+                    }
+                } else null
+            } else null
             withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
                 AgentDatabaseClient(dbClient).updateSession(
                     id,
                     sessionName = name,
-                    programName = req.programName?.trim()?.takeIf { it.isNotEmpty() },
+                    programName = targetProgram,
+                    programId = targetProgramId,
                 )
             }
             val info = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->

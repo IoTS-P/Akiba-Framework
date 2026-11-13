@@ -35,6 +35,10 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         val projectName: String? = null,
         /** Program inside [projectName] the session is currently working on. */
         val currentProgram: String? = null,
+        /** Identity of [currentProgram]; the name alone breaks on rename. */
+        val currentProgramId: String? = null,
+        /** Every program this conversation has touched. */
+        val programIds: List<String> = emptyList(),
         /** Workflow run that spawned this session (null for interactive sessions). */
         val workflowId: String? = null,
         val createdAt: String?,
@@ -222,7 +226,8 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
         sessionName: String? = null,
         modelName: String? = null,
         transcript: String? = null,
-        programName: String? = null
+        programName: String? = null,
+        programId: String? = null
     ) = runBlocking {
         val body = mapOf(
             "sessionId" to sessionId,
@@ -230,7 +235,8 @@ class AgentDatabaseClient(private val dbClient: DatabaseClient) {
             "sessionName" to sessionName,
             "modelName" to modelName,
             "transcript" to transcript,
-            "programName" to programName
+            "programName" to programName,
+            "programId" to programId
         )
         val response = dbClient.post("/agent/session/update", body)
         if (response.first != HttpStatusCode.OK)
