@@ -105,16 +105,53 @@ class ProgramSchedulerTest {
     }
 
     @Test
+    fun `a session that comes back is told what happened meanwhile`() {
+        scheduler.withProgram("fx20", "session-a", operation = "rename-program") { it }
+
+        scheduler.withProgram("fx20", "6df217e5", operation = "decompile") { it }
+
+        val lease = scheduler.withProgram("fx20", "session-a", operation = "list-symbols") { it }
+        assertEquals(1, lease.foreign.size, "only the other session's call is reported")
+        assertEquals("6df217e5", lease.foreign.single().sessionId)
+        assertTrue(lease.stateChanged, "decompile is recorded as a mutation by default")
+
+        val note = lease.note()!!
+        assertTrue("session 6df217e5" in note, note)
+        assertTrue("decompile" in note, note)
+        assertTrue(note.contains("Re-read"), "the note tells the model what to do about it")
+    }
+
+    @Test
+    fun `a read by someone else does not claim the state changed`() {
+        scheduler.withProgram("fx20", "session-b", operation = "read-bytes", mutated = false) { it }
+
+        val lease = scheduler.withProgram("fx20", "session-a") { it }
+        assertTrue(lease.foreign.isNotEmpty())
+        assertTrue(!lease.stateChanged, "a pure read leaves the program as it was")
+        assertTrue(lease.note()!!.contains("read this program"), lease.note()!!)
+    }
+
+    @Test
+    fun `a session is never told about its own calls`() {
+        scheduler.withProgram("fx20", "session-a", operation = "one") { it }
+        scheduler.withProgram("fx20", "session-a", operation = "two") { it }
+
+        val lease = scheduler.withProgram("fx20", "session-a", operation = "three") { it }
+        assertTrue(lease.foreign.isEmpty(), "own history is not interleaving")
+        assertEquals(null, lease.note())
+    }
+
+    @Test
     fun `waiters queue in order`() {
         val order = Collections.synchronizedList(mutableListOf<Int>())
         val gate = CountDownLatch(1)
 
-        thread { scheduler.withProgram<Unit>("fx20", "owner", 5000) { gate.await(5, TimeUnit.SECONDS) } }
+        thread { scheduler.withProgram<Unit>("fx20", "owner", timeoutMs = 5000) { gate.await(5, TimeUnit.SECONDS) } }
         Thread.sleep(100)
 
         (1..3).forEach { i ->
             thread {
-                scheduler.withProgram<Unit>("fx20", "session-$i", 5000) { order.add(i) }
+                scheduler.withProgram<Unit>("fx20", "session-$i", timeoutMs = 5000) { order.add(i) }
             }
             Thread.sleep(50)
         }
