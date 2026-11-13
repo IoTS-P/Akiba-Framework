@@ -55,6 +55,7 @@ sealed interface ItemSet {
 @Serializable
 sealed interface StepKind {
 
+    /** Fails with [ProjectExistsException] when the name is taken. */
     @Serializable
     @SerialName("createProject")
     data class CreateProject(
@@ -62,9 +63,17 @@ sealed interface StepKind {
         val overwrite: Boolean = false,
     ) : StepKind
 
+    /**
+     * Opens a project, creating it when [createIfMissing] is set — the recorded form
+     * of `createOrOpenProject`. Without the flag a missing project is an error, which
+     * keeps a typo from silently producing a new empty batch.
+     */
     @Serializable
     @SerialName("openProject")
-    data class OpenProject(val project: String) : StepKind
+    data class OpenProject(
+        val project: String,
+        val createIfMissing: Boolean = false,
+    ) : StepKind
 
     @Serializable
     @SerialName("import")
