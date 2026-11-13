@@ -29,6 +29,21 @@ class TurnBroker(private val capacityPerSession: Int = 8) {
         val systemPrompt: String = "",
         val username: String = "",
         val programName: String? = null,
+        val llm: TurnLlm? = null,
+    )
+
+    /**
+     * Where and with what credentials this turn talks to the model.
+     *
+     * The worker holds no credentials of its own: it is told per turn, so changing the
+     * model or the provider in Settings takes effect on the next message instead of
+     * requiring the process to be restarted. The key only travels over loopback.
+     */
+    data class TurnLlm(
+        val provider: String,
+        val modelName: String,
+        val apiKey: String,
+        val baseUrl: String? = null,
     )
 
     /** How a turn ended; [error] is the message the user should see. */

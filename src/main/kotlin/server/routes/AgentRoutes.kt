@@ -310,7 +310,9 @@ private data class ManualAgentTurnJob(
 
 private data class ManualAgentWorkerConfig(
     val file: Path,
-    val environment: Map<String, String>
+    val environment: Map<String, String>,
+    /** Model and key for this session; the worker is told per turn, so config changes apply at once. */
+    val llm: org.iotsplab.akiba.managers.TurnBroker.TurnLlm? = null,
 )
 
 private object ManualAgentTurnRegistry {
@@ -1310,6 +1312,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                             systemPrompt = systemPrompt + noProgramNotice,
                             username = call.currentUsernameOrDefault(),
                             programName = programName,
+                            llm = workerConfig.llm,
                         )
                     } else if (lockedProject == null) {
                         runManualAgentWorker(
@@ -2435,7 +2438,16 @@ private fun createManualAgentConfig(
     val root = linkedMapOf("main" to mainConfig)
     val file = Files.createTempFile("akiba-manual-agent-", ".json")
     file.toFile().writeText(agentRouteMapper.writerWithDefaultPrettyPrinter().writeValueAsString(root))
-    return ManualAgentWorkerConfig(file, mapOf(llmEnvName to keyEntry.apiKey))
+    return ManualAgentWorkerConfig(
+        file = file,
+        environment = mapOf(llmEnvName to keyEntry.apiKey),
+        llm = org.iotsplab.akiba.managers.TurnBroker.TurnLlm(
+            provider = keyEntry.provider,
+            modelName = modelName,
+            apiKey = keyEntry.apiKey,
+            baseUrl = keyEntry.baseUrl,
+        ),
+    )
 }
 
 /**
@@ -2495,6 +2507,7 @@ private fun runPooledTurn(
     systemPrompt: String,
     username: String,
     programName: String?,
+    llm: org.iotsplab.akiba.managers.TurnBroker.TurnLlm?,
 ) {
     ProjectWorkers.registry.attach(sessionId, project)
     val turn = org.iotsplab.akiba.managers.TurnBroker.Turn(
@@ -2506,6 +2519,7 @@ private fun runPooledTurn(
         systemPrompt = systemPrompt,
         username = username,
         programName = programName,
+        llm = llm,
     )
     if (!ProjectWorkers.broker.submit(turn)) {
         throw ManualAgentWorkerException(

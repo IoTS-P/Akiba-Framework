@@ -16,6 +16,19 @@ class TurnBrokerTest {
         TurnBroker.Turn("t-${counter++}", project, session, "program-1", prompt)
 
     @Test
+    fun `a turn carries the model it must use`() {
+        val broker = TurnBroker()
+        val llm = TurnBroker.TurnLlm("OPEN_AI", "gpt-5.5", "sk-this-turn", "https://example.test/v1")
+        broker.submit(TurnBroker.Turn("t-1", "alpha", "session-a", "program-1", "hi", llm = llm))
+
+        val handed = broker.next("alpha", 1_000)!!
+
+        assertEquals("gpt-5.5", handed.llm?.modelName)
+        assertEquals("sk-this-turn", handed.llm?.apiKey)
+        assertEquals("https://example.test/v1", handed.llm?.baseUrl)
+    }
+
+    @Test
     fun `sessions take turns instead of queueing behind a backlog`() {
         val broker = TurnBroker()
         broker.submit(turn("session-a", "a1"))

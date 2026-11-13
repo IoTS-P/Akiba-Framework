@@ -21,6 +21,15 @@ data class TurnDto(
     val systemPrompt: String = "",
     val username: String = "",
     val programName: String? = null,
+    val llm: TurnLlmDto? = null,
+)
+
+@Serializable
+data class TurnLlmDto(
+    val provider: String,
+    val modelName: String,
+    val apiKey: String,
+    val baseUrl: String? = null,
 )
 
 /** The worker's poll result; `turn` is null when the wait expired with nothing to do. */
@@ -59,7 +68,10 @@ fun Route.workerTurnRoutes(broker: TurnBroker = ProjectWorkers.broker) {
         call.respond(
             TurnNextResponse(
                 turn?.let {
-                    TurnDto(it.id, it.sessionId, it.programId, it.prompt, it.systemPrompt, it.username, it.programName)
+                    TurnDto(
+                        it.id, it.sessionId, it.programId, it.prompt, it.systemPrompt, it.username,
+                        it.programName, it.llm?.let { wire -> TurnLlmDto(wire.provider, wire.modelName, wire.apiKey, wire.baseUrl) },
+                    )
                 },
             ),
         )
