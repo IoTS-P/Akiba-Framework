@@ -525,10 +525,6 @@ object ProgramManager {
                         }
                     }
                     programIsCreated = true
-
-                    // If load properties is set, need to adjust the offset first
-                    // We just need to do this once
-                    applyLoadProperties(program!!, metadata.loadProperties)
                 }
             }
 
@@ -667,28 +663,6 @@ object ProgramManager {
         mgr.cancelQueuedTasks()
     }
 
-    private fun applyLoadProperties(program: Program, data: List<ImportManager.FileSegment>?) {
-        if (data.isNullOrEmpty())
-            return
-
-        assert(program.memory.blocks.size == 1)
-        var block = program.memory.blocks[0]
-        val addressSpace = program.addressFactory.defaultAddressSpace
-        data.forEachIndexed { idx, it ->
-            // When we reached the last one, we don't need to split anymore
-            if (idx == data.indices.last)
-                return@forEachIndexed
-            program.memory.split(block, addressSpace.getAddress(it.newOffset + it.length))
-            block = program.memory.blocks.last()
-        }
-        data.reversed().forEach {
-            val b = program.memory.getBlock(addressSpace.getAddress(it.newOffset))
-            globalLogger.info(
-                "Moving ${b.start.offset.toString(16)}(${b.size}) to ${it.oldOffset.toString(16)}")
-            program.memory.moveBlock(b, addressSpace.getAddress(it.oldOffset), TaskMonitor.DUMMY)
-        }
-    }
-
     @Throws(IllegalArgumentException::class, DatabaseClient.DatabaseDaemonException::class)
     private suspend fun importDbData(id: Int) {
         config.dbImports?.forEach { entry ->
@@ -767,8 +741,7 @@ object ProgramManager {
      * @param path: The path to the binary file
      * @return A nullable program, null if failed to create a program
      */
-    fun tryCreateProgramWithoutLang(project: GhidraProject?, path: Path,
-                                    loadProperties: List<ImportManager.FileSegment> = listOf()): Program? {
+    fun tryCreateProgramWithoutLang(project: GhidraProject?, path: Path): Program? {
         val tempProject = if (project == null) {
             GhidraProject.createProject(
                 Path.of(projectConf.projectRoot).toAbsolutePath().toString(),
@@ -789,9 +762,6 @@ object ProgramManager {
                 globalLogger.error("Failed to create program for $path with $lang: ${e.message}")
                 return null
             }
-
-            if (tempProgram.executableFormat == "Raw Binary")
-                applyLoadProperties(tempProgram, loadProperties)
 
             autoAnalyzeInTimeout(tempProgram, mainConf.autoAnalysisTimeout)    // Will wait here
             val functionsGot = tempProgram.functionManager.functionCount

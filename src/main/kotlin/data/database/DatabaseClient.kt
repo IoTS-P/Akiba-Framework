@@ -338,7 +338,6 @@ class DatabaseClient(
         val processedChecksum: String? = null,
         val size: Long,
         val processedSize: Long = -1,
-        val loadProperties: String? = null,
         /**
          * Language, container format and compiler spec Ghidra settled on.
          *

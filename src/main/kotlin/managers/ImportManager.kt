@@ -287,7 +287,6 @@ object ImportManager {
                 processedChecksum = null,
                 size = originalPath.fileSize(),
                 processedSize = -1,
-                loadProperties = null,
                 arch = dataLanguage.languageID.toString(),
                 format = program.executableFormat,
                 compilerSpec = program.compiler,
