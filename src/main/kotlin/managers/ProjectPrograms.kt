@@ -468,6 +468,9 @@ object ProjectPrograms {
                     .delete()
             null
         }
+        // The browser reads the index, not the project: without this the deleted program
+        // keeps its icon until something else happens to refresh the tree.
+        ProjectIndex.refresh(projectName, projectDirectory)
     }
 
     private fun <T> mutate(projectName: String, projectDirectory: Path, block: (DomainFolder) -> T): T =
