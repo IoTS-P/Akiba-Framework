@@ -1,5 +1,7 @@
 package plan
 
+import org.iotsplab.akiba.module.AkibaModule
+import org.iotsplab.akiba.module.ModuleRun
 import org.iotsplab.akiba.plan.ImportTarget
 import org.iotsplab.akiba.plan.ModuleSpec
 import org.iotsplab.akiba.plan.Outcome
@@ -49,9 +51,14 @@ private class FakeRuntime(
         return programs.size
     }
 
-    override fun runModule(spec: ModuleSpec, programIds: List<String>): Int {
-        calls += "run:${spec.className}:${programIds.size}"
-        return programIds.size
+    override fun runModule(spec: ModuleSpec, programs: List<ProgramHandle>): Map<String, ModuleRun> {
+        calls += "run:${spec.className}:${programs.size}"
+        return programs.associate { it.id to ModuleRun(mapOf("seen" to it.name), AkibaModule.SUCCESS, "SUCCESS", 1L) }
+    }
+
+    override fun saveResult(spec: ModuleSpec, binaryId: Int, run: ModuleRun): Boolean {
+        calls += "save:${spec.className}:$binaryId"
+        return binaryId > 0 && run.result != null
     }
 
     override fun findPrograms(filter: String): List<ProgramHandle> {
@@ -106,7 +113,7 @@ class PlanScopeTest {
 
         assertIs<Outcome.Failed>(scope.importAll(progs, target))
         // The next verb still runs; that is the point of returning Outcome.
-        assertEquals(2, scope.runAll(progs, ModuleSpec("org.iotsplab.akiba.module.AkibaUtils")).expect())
+        assertEquals(2, scope.runAll(progs, ModuleSpec("org.iotsplab.akiba.module.AkibaUtils")).expect().size)
         assertTrue(runtime.calls.contains("run:org.iotsplab.akiba.module.AkibaUtils:2"))
     }
 
@@ -149,5 +156,18 @@ class PlanScopeTest {
         val failed = scope.programs("arch = boom").let { it as Outcome.Failed }
 
         assertTrue(failed.error.message!!.contains("bad sql"))
+    }
+
+    @Test
+    fun `a run hands its data back and the script decides what to do with it`() {
+        val scope = PlanScope(FakeRuntime())
+        val runs = scope.runAll(progs, ModuleSpec("ZeroTrimmer")).expect()
+
+        assertEquals(progs.map { it.id }.toSet(), runs.keys)
+        assertTrue(runs.values.all { it.result != null && it.isSuccess })
+
+        // No program here has a binary row, so saving is a no-op the script can ignore.
+        assertTrue(!scope.saveResult(ModuleSpec("ZeroTrimmer"), -1, runs.getValue(progs.first().id)).expect())
+        assertTrue(scope.saveResult(ModuleSpec("ZeroTrimmer"), 42, runs.getValue(progs.first().id)).expect())
     }
 }

@@ -1,8 +1,15 @@
 package org.iotsplab.akiba.plan
 
+import ghidra.program.model.listing.Program
+import kotlinx.coroutines.runBlocking
+import org.apache.logging.log4j.Level
+import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.ProjectIndex
 import org.iotsplab.akiba.managers.ProjectPrograms
 import org.iotsplab.akiba.managers.WorkspaceManager
+import org.iotsplab.akiba.module.AkibaModule
+import org.iotsplab.akiba.module.ModuleRun
+import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import org.iotsplab.akiba.server.db.ServerDatabase
 import java.nio.file.Files
 import java.nio.file.Path
@@ -118,10 +125,79 @@ class CliPlanRuntime(
 
     // ---- modules --------------------------------------------------------
 
-    override fun runModule(spec: ModuleSpec, programIds: List<String>): Int = throw PlanException(
-        "running ${spec.className} from a plan is not supported yet: modules still run off " +
-            "the binary table, not off programs"
-    )
+    /**
+     * Runs [spec] once per program and keeps what each run produced.
+     *
+     * The programs are opened read-only and one at a time, and the module runs with db
+     * writes off — a program a plan found has no binary row to write against, so its data
+     * comes back to the script instead of going into a table.
+     */
+    override fun runModule(spec: ModuleSpec, programs: List<ProgramHandle>): Map<String, ModuleRun> {
+        WorkspaceManager.initializeGhidra()
+        val runs = LinkedHashMap<String, ModuleRun>()
+        programs.forEach { handle -> runs[handle.id] = runOn(handle, spec) }
+        return runs
+    }
+
+    private fun runOn(handle: ProgramHandle, spec: ModuleSpec): ModuleRun {
+        val projectName = handle.project
+            ?: throw PlanException("Program '${handle.name}' does not say which project it lives in")
+        val project = WorkspaceManager.openOrCreateInteractiveProject(projectName, false, projectsRoot)
+        try {
+            val path = handle.path ?: handle.name
+            val folder = path.substringBeforeLast('/', "")
+            val program = project.openProgram(if (folder.isEmpty()) "/" else "/$folder",
+                path.substringAfterLast('/'), true)
+                ?: throw PlanException("Program '${handle.name}' could not be opened in '$projectName'")
+            val module = instantiate(spec, program)
+            val started = System.currentTimeMillis()
+            runBlocking { module.startProcess() }
+            return module.collectResult(System.currentTimeMillis() - started)
+        } finally {
+            WorkspaceManager.releaseActiveProject()
+        }
+    }
+
+    /**
+     * Builds a module the way its jar declares it. The five-argument shape is what every
+     * module in this repository uses; the two-argument one is the minimal form.
+     */
+    private fun instantiate(spec: ModuleSpec, program: Program): AkibaModule {
+        val clazz = ProcedureArgumentsDeserializer.ensureModuleLoaded(spec.className)
+        val shapes = listOf(
+            arrayOf<Class<*>>(Int::class.javaPrimitiveType!!, Program::class.java,
+                Level::class.java, Level::class.java, String::class.java),
+            arrayOf<Class<*>>(Int::class.javaPrimitiveType!!, Program::class.java),
+        )
+        for (types in shapes) {
+            val constructor = runCatching { clazz.getDeclaredConstructor(*types) }.getOrNull() ?: continue
+            constructor.isAccessible = true
+            val args = if (types.size == 5) arrayOf<Any?>(-1, program, Level.INFO, Level.INFO, null)
+                       else arrayOf<Any?>(-1, program)
+            val module = constructor.newInstance(*args) as AkibaModule
+            module.skipDbWrite = true
+            return module
+        }
+        throw PlanException(
+            "${spec.className} has no constructor a plan can call; expected (id, program, ...)")
+    }
+
+    /**
+     * Writes a run's result into the module's table. A program that was never imported has
+     * no row, and a negative id says exactly that, so nothing is written.
+     */
+    override fun saveResult(spec: ModuleSpec, binaryId: Int, run: ModuleRun): Boolean {
+        val result = run.result ?: return false
+        if (binaryId <= 0) return false
+        val client = DatabaseClient.global ?: return false
+        client.updateData(tableNameFor(spec.className), binaryId.toLong(), result)
+        return true
+    }
+
+    private fun tableNameFor(className: String): String =
+        className.substringAfterLast('.')
+            .replace(Regex("([a-z0-9])([A-Z])"), "$1_$2")
+            .lowercase() + "_results"
 
     /** Kept for the index refresh the copy path performs itself. */
     internal fun refreshIndex(project: String) = ProjectIndex.refresh(project, projectsRoot)

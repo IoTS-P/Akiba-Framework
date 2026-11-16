@@ -1,5 +1,7 @@
 package org.iotsplab.akiba.plan
 
+import org.iotsplab.akiba.module.ModuleRun
+
 /**
  * The work a plan can ask for, split by what it touches.
  *
@@ -33,5 +35,18 @@ interface ProgramRuntime {
 
 /** What a plan can run. */
 interface ModuleRuntime {
-    fun runModule(spec: ModuleSpec, programIds: List<String>): Int
+
+    /**
+     * Runs [spec] on each program, keyed by program id in the result.
+     *
+     * Programs a plan knows about have no binary row, so the modules run with db writes
+     * off and hand their data back instead of storing it.
+     */
+    fun runModule(spec: ModuleSpec, programs: List<ProgramHandle>): Map<String, ModuleRun>
+
+    /**
+     * Writes one run's result into the module's own table, for the binary [binaryId].
+     * Returns false when there is nothing to write or no row to write it against.
+     */
+    fun saveResult(spec: ModuleSpec, binaryId: Int, run: ModuleRun): Boolean
 }

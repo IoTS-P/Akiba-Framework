@@ -1,5 +1,7 @@
 package plan
 
+import org.iotsplab.akiba.module.AkibaModule
+import org.iotsplab.akiba.module.ModuleRun
 import org.iotsplab.akiba.plan.ImportTarget
 import org.iotsplab.akiba.plan.ModuleSpec
 import org.iotsplab.akiba.plan.PlanCompileException
@@ -33,8 +35,14 @@ private class RecordingRuntime : PlanRuntime {
         return programs.size
     }
 
-    override fun runModule(spec: ModuleSpec, programIds: List<String>): Int {
-        calls += "run:${spec.className}:${programIds.size}"; return programIds.size
+    override fun runModule(spec: ModuleSpec, programs: List<ProgramHandle>): Map<String, ModuleRun> {
+        calls += "run:${spec.className}:${programs.size}"
+        return programs.associate { it.id to ModuleRun(mapOf("seen" to it.name), AkibaModule.SUCCESS, "SUCCESS", 1L) }
+    }
+
+    override fun saveResult(spec: ModuleSpec, binaryId: Int, run: ModuleRun): Boolean {
+        calls += "save:${spec.className}:$binaryId"
+        return binaryId > 0 && run.result != null
     }
 
     override fun findPrograms(filter: String): List<ProgramHandle> {

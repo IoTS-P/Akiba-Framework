@@ -94,7 +94,7 @@ abstract class AkibaModule (
     fileLogLevel: Level = Level.INFO,
     tableName: String? = null,
     private var runtimeReport: RuntimeReport? = null,
-    val skipDbWrite: Boolean = false,
+    var skipDbWrite: Boolean = false,
     val dbClient: DatabaseClient = DatabaseClient.global
         ?: error("DatabaseClient.global not initialized. In CLI mode this is set by WorkspaceManager.initDatabase(); in server mode pass a per-request instance explicitly."),
 ) : AutoCloseable {
