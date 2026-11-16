@@ -42,7 +42,7 @@ interface ModuleRuntime {
      * Programs a plan knows about have no binary row, so the modules run with db writes
      * off and hand their data back instead of storing it.
      */
-    fun runModule(spec: ModuleSpec, programs: List<ProgramHandle>): Map<String, ModuleRun>
+    fun runModule(programs: List<ProgramHandle>, specFor: (ProgramHandle) -> ModuleSpec): Map<String, ModuleRun>
 
     /**
      * Writes one run's result into the module's own table, for the binary [binaryId].

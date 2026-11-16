@@ -10,7 +10,19 @@ interface RunVerbs {
      *
      * Nothing is written to a database: the script decides what is worth keeping.
      */
-    fun runAll(programs: List<ProgramHandle>, spec: ModuleSpec): Outcome<Map<String, ModuleRun>>
+    fun runAll(programs: List<ProgramHandle>, spec: ModuleSpec): Outcome<Map<String, ModuleRun>> =
+        runAll(programs) { spec }
+
+    /**
+     * Runs the module over [programs], asking [specFor] what each program needs.
+     *
+     * This is the overload to reach for when one setting cannot serve every file — an
+     * output path, a size limit, a flag that depends on the architecture.
+     */
+    fun runAll(
+        programs: List<ProgramHandle>,
+        specFor: (ProgramHandle) -> ModuleSpec,
+    ): Outcome<Map<String, ModuleRun>>
 
     /**
      * Stores one run's result in the module's table for [binaryId].
@@ -26,15 +38,17 @@ internal class RunOps(
     private val support: ScopeSupport,
 ) : RunVerbs {
 
-    override fun runAll(programs: List<ProgramHandle>, spec: ModuleSpec): Outcome<Map<String, ModuleRun>> =
+    override fun runAll(
+        programs: List<ProgramHandle>,
+        specFor: (ProgramHandle) -> ModuleSpec,
+    ): Outcome<Map<String, ModuleRun>> =
         support.step(
             "runModule",
             mapOf(
-                "module" to spec.className,
+                "module" to (programs.firstOrNull()?.let { specFor(it).className } ?: "?"),
                 "count" to programs.size,
-                "timeout" to (spec.timeoutSeconds ?: 0),
             ),
-        ) { runtime.runModule(spec, programs) }
+        ) { runtime.runModule(programs, specFor) }
 
     override fun saveResult(spec: ModuleSpec, binaryId: Int, run: ModuleRun): Outcome<Boolean> =
         support.step(

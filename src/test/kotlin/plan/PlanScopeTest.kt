@@ -51,8 +51,10 @@ private class FakeRuntime(
         return programs.size
     }
 
-    override fun runModule(spec: ModuleSpec, programs: List<ProgramHandle>): Map<String, ModuleRun> {
-        calls += "run:${spec.className}:${programs.size}"
+    override fun runModule(programs: List<ProgramHandle>, specFor: (ProgramHandle) -> ModuleSpec): Map<String, ModuleRun> {
+        calls += "run:${programs.firstOrNull()?.let { specFor(it).className } ?: "?"}:${programs.size}"
+        // Remember what each program was told, so a test can see the per-program settings.
+        programs.forEach { p -> specFor(p).config?.let { calls += "cfg:${p.name}:${it["output"]}" } }
         return programs.associate { it.id to ModuleRun(mapOf("seen" to it.name), AkibaModule.SUCCESS, "SUCCESS", 1L) }
     }
 
@@ -156,6 +158,18 @@ class PlanScopeTest {
         val failed = scope.programs("arch = boom").let { it as Outcome.Failed }
 
         assertTrue(failed.error.message!!.contains("bad sql"))
+    }
+
+    @Test
+    fun `each program can be told something different`() {
+        val runtime = FakeRuntime()
+        val scope = PlanScope(runtime)
+
+        val runs = scope.runAll(progs) { p -> ModuleSpec("FirmXRay").withConfig(mapOf("output" to "${p.name}.fxr")) }.expect()
+
+        assertEquals(progs.size, runs.size)
+        assertTrue(runtime.calls.any { it.startsWith("run:FirmXRay") })
+        progs.forEach { assertTrue(runtime.calls.contains("cfg:${it.name}:${it.name}.fxr"), runtime.calls.toString()) }
     }
 
     @Test

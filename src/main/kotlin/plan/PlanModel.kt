@@ -22,7 +22,17 @@ data class ProgramHandle(
     val project: String? = null,
 )
 
-/** `module("…") { timeout = 600 }` */
-data class ModuleSpec(val className: String, val timeoutSeconds: Int? = null) {
+/**
+ * `module("…") { timeout = 600 }`
+ *
+ * [config] is a plain map on purpose: the module's config class lives in a jar the script
+ * cannot name, so the runtime turns this into the declared class for it.
+ */
+data class ModuleSpec(
+    val className: String,
+    val timeoutSeconds: Int? = null,
+    val config: Map<String, Any?>? = null,
+) {
     fun withTimeout(seconds: Int) = copy(timeoutSeconds = seconds)
+    fun withConfig(values: Map<String, Any?>) = copy(config = values)
 }

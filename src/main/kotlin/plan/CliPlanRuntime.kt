@@ -1,6 +1,7 @@
 package org.iotsplab.akiba.plan
 
 import ghidra.program.model.listing.Program
+import kotlin.reflect.KClass
 import kotlinx.coroutines.runBlocking
 import org.apache.logging.log4j.Level
 import org.iotsplab.akiba.data.database.DatabaseClient
@@ -11,6 +12,8 @@ import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.module.ModuleRun
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import org.iotsplab.akiba.server.db.ServerDatabase
+import org.iotsplab.akiba.utils.AkibaJson
+import org.iotsplab.akiba.utils.WithConfigClass
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -132,10 +135,13 @@ class CliPlanRuntime(
      * writes off — a program a plan found has no binary row to write against, so its data
      * comes back to the script instead of going into a table.
      */
-    override fun runModule(spec: ModuleSpec, programs: List<ProgramHandle>): Map<String, ModuleRun> {
+    override fun runModule(
+        programs: List<ProgramHandle>,
+        specFor: (ProgramHandle) -> ModuleSpec,
+    ): Map<String, ModuleRun> {
         WorkspaceManager.initializeGhidra()
         val runs = LinkedHashMap<String, ModuleRun>()
-        programs.forEach { handle -> runs[handle.id] = runOn(handle, spec) }
+        programs.forEach { handle -> runs[handle.id] = runOn(handle, specFor(handle)) }
         return runs
     }
 
@@ -176,10 +182,27 @@ class CliPlanRuntime(
                        else arrayOf<Any?>(-1, program)
             val module = constructor.newInstance(*args) as AkibaModule
             module.skipDbWrite = true
+            spec.config?.let { values -> applyConfig(module, clazz, values) }
             return module
         }
         throw PlanException(
             "${spec.className} has no constructor a plan can call; expected (id, program, ...)")
+    }
+
+    /**
+     * Hands the module the config the script wrote.
+     *
+     * The script cannot name the module's config class — it lives in a jar the script never
+     * sees — so the map is written as JSON and read back as whatever the module declared.
+     */
+    private fun applyConfig(module: AkibaModule, clazz: Class<*>, values: Map<String, Any?>) {
+        val declared = clazz.kotlin.annotations.filterIsInstance<WithConfigClass>().firstOrNull()?.clazz
+            ?: throw PlanException("${clazz.simpleName} declares no config class, so a plan cannot pass one")
+        val json = AkibaJson.mapper.writeValueAsString(values)
+        @Suppress("UNCHECKED_CAST")
+        val moduleClass = clazz.kotlin as KClass<out AkibaModule>
+        val instance = AkibaModule.getDeserializerMapper(moduleClass).readValue(json, declared.java)
+        module.replaceConfig(instance)
     }
 
     /**

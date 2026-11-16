@@ -35,8 +35,8 @@ private class RecordingRuntime : PlanRuntime {
         return programs.size
     }
 
-    override fun runModule(spec: ModuleSpec, programs: List<ProgramHandle>): Map<String, ModuleRun> {
-        calls += "run:${spec.className}:${programs.size}"
+    override fun runModule(programs: List<ProgramHandle>, specFor: (ProgramHandle) -> ModuleSpec): Map<String, ModuleRun> {
+        calls += "run:${programs.firstOrNull()?.let { specFor(it).className } ?: "?"}:${programs.size}"
         return programs.associate { it.id to ModuleRun(mapOf("seen" to it.name), AkibaModule.SUCCESS, "SUCCESS", 1L) }
     }
 
