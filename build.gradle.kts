@@ -103,6 +103,25 @@ application {
     mainClass.set("org.iotsplab.akiba.Main")
 }
 
+// The generated launcher lists every jar by name, so anything added to lib/ later —
+// a new module jar, a new scripting dependency — is invisible to it. A wildcard keeps
+// the launcher working as long as the jar sits in lib/.
+tasks.startScripts {
+    doLast {
+        listOf(unixScript, windowsScript).filter { it.exists() }.forEach { script ->
+            val text = script.readText()
+            val unix = "CLASSPATH=\$APP_HOME/lib/*"
+            val windows = "set CLASSPATH=%APP_HOME%\\lib\\*"
+            // Lambda replacement: "$APP_HOME" would otherwise read as a group reference.
+            val rewritten = if (script.name.endsWith(".bat"))
+                text.replace(Regex("^set CLASSPATH=.*$", RegexOption.MULTILINE)) { windows }
+            else
+                text.replace(Regex("^CLASSPATH=.*$", RegexOption.MULTILINE)) { unix }
+            script.writeText(rewritten)
+        }
+    }
+}
+
 tasks.distZip {
     into("akiba-${version}/configs/") {
         from("src/main/resources/configs/log4j2.xml")

@@ -153,12 +153,15 @@ class CliPlanRuntime(
             val path = handle.path ?: handle.name
             val folder = path.substringBeforeLast('/', "")
             val program = project.openProgram(if (folder.isEmpty()) "/" else "/$folder",
-                path.substringAfterLast('/'), true)
+                path.substringAfterLast('/'), !spec.writable)
                 ?: throw PlanException("Program '${handle.name}' could not be opened in '$projectName'")
             val module = instantiate(spec, program)
             val started = System.currentTimeMillis()
             runBlocking { module.startProcess() }
-            return module.collectResult(System.currentTimeMillis() - started)
+            val run = module.collectResult(System.currentTimeMillis() - started)
+            // A module that changes the program only keeps its changes once saved.
+            if (spec.writable) project.save(program)
+            return run
         } finally {
             WorkspaceManager.releaseActiveProject()
         }

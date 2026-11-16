@@ -32,7 +32,10 @@ data class ModuleSpec(
     val className: String,
     val timeoutSeconds: Int? = null,
     val config: Map<String, Any?>? = null,
+    /** Open the program for writing and save it after the run. */
+    val writable: Boolean = false,
 ) {
     fun withTimeout(seconds: Int) = copy(timeoutSeconds = seconds)
     fun withConfig(values: Map<String, Any?>) = copy(config = values)
+    fun writable() = copy(writable = true)
 }
