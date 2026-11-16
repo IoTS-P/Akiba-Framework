@@ -41,7 +41,14 @@ object ProjectIndex {
      * missing, or the database is unavailable: the previous rows stay in place,
      * which is all a browser showing a slightly old tree needs.
      */
-    fun refresh(projectName: String, projectDirectory: Path): Boolean {
+    /**
+     * Rebuild the index from the project on disk.
+     *
+     * [force] is for a caller that just changed the tree itself: it knows the project is
+     * free and that an empty read is the truth (the last program was deleted), where a
+     * background refresh would rather keep a stale tree than show nothing.
+     */
+    fun refresh(projectName: String, projectDirectory: Path, force: Boolean = false): Boolean {
         if (!ServerDatabase.isInitialized) return false
         // Reading a tree opens the project, which needs the Ghidra application
         // that a session would otherwise have initialized first.
@@ -54,7 +61,7 @@ object ProjectIndex {
             val tree = ProjectPrograms.tree(projectName, projectDirectory)
             // A project held open by a worker can read back empty without failing; an
             // empty read must not erase a tree the browser is showing.
-            if (tree.isEmpty() && entries(projectName, projectDirectory).isNotEmpty()) {
+            if (!force && tree.isEmpty() && entries(projectName, projectDirectory).isNotEmpty()) {
                 logger.warn("Project index refresh for '{}' read an empty tree; keeping the old one", projectName)
                 return false
             }
@@ -162,6 +169,32 @@ object ProjectIndex {
             }
         }.getOrElse {
             logger.warn("Could not record program id for '{}': {}", path, it.message)
+            false
+        }
+    }
+
+    /**
+     * Drop an entry, and everything under it when it is a folder.
+     *
+     * Deleting the row is what makes the browser stop showing a program: rebuilding the
+     * whole tree afterwards is a nicety, this is the part that must not fail.
+     */
+    fun removeEntry(projectName: String, projectDirectory: Path, path: String): Boolean {
+        val dir = projectKey(projectName, projectDirectory)
+        return runCatching {
+            ServerDatabase.newConnection().use { conn ->
+                conn.prepareStatement(
+                    "DELETE FROM project_entries WHERE project_dir = ? " +
+                        "AND (path = ? OR starts_with(path, ?))"
+                ).use { stmt ->
+                    stmt.setString(1, dir)
+                    stmt.setString(2, path)
+                    stmt.setString(3, "$path/")
+                    stmt.executeUpdate() > 0
+                }
+            }
+        }.getOrElse {
+            logger.warn("Could not drop index entry '{}': {}", path, it.message)
             false
         }
     }

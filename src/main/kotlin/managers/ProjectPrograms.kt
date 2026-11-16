@@ -460,17 +460,26 @@ object ProjectPrograms {
     }
 
     fun deleteEntry(projectName: String, projectDirectory: Path, path: String) {
-        mutate(projectName, projectDirectory) { root ->
-            val (parent, name) = resolveParent(root, path)
-            val folder = parent.getFolder(name)
-            if (folder != null) folder.delete() else
-                (parent.getFile(name) ?: throw IllegalArgumentException("'$path' does not exist"))
-                    .delete()
-            null
+        try {
+            mutate(projectName, projectDirectory) { root ->
+                val (parent, name) = resolveParent(root, path)
+                val folder = parent.getFolder(name)
+                if (folder != null) folder.delete() else
+                    (parent.getFile(name) ?: throw IllegalArgumentException("'$path' does not exist"))
+                        .delete()
+                null
+            }
+        } catch (e: IllegalArgumentException) {
+            // Already gone: a second click, or a row left behind by an older build. The
+            // caller wanted it gone and it is, so the remaining index row is all to fix.
+            if (!(e.message ?: "").contains("does not exist")) throw e
+            logger.info("'{}' is already gone from '{}'; clearing its index row", path, projectName)
         }
-        // The browser reads the index, not the project: without this the deleted program
-        // keeps its icon until something else happens to refresh the tree.
-        ProjectIndex.refresh(projectName, projectDirectory)
+        // The browser reads the index, not the project. Dropping the row is what the user
+        // sees disappear; the refresh afterwards only keeps the rest of the tree honest —
+        // and it refuses to write an empty tree, so it cannot be the only step here.
+        ProjectIndex.removeEntry(projectName, projectDirectory, path)
+        ProjectIndex.refresh(projectName, projectDirectory, force = true)
     }
 
     private fun <T> mutate(projectName: String, projectDirectory: Path, block: (DomainFolder) -> T): T =
