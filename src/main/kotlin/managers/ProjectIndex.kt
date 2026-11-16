@@ -166,8 +166,8 @@ object ProjectIndex {
         }
     }
 
-    /** Record the binary a program was imported from. */
-    fun setBinaryId(projectName: String, projectDirectory: Path, path: String, binaryId: Long): Boolean {
+    /** Record the binary a program was imported from; import, copy and move only. */
+    internal fun setBinaryId(projectName: String, projectDirectory: Path, path: String, binaryId: Long): Boolean {
         val dir = projectKey(projectName, projectDirectory)
         return runCatching {
             ServerDatabase.newConnection().use { conn ->

@@ -33,8 +33,13 @@ object ProgramIdentity {
         program.getOptions(Program.PROGRAM_INFO).getLong(BINARY_KEY, -1L).takeIf { it > 0 }
     }.getOrNull()
 
-    /** Records the binary a freshly imported program came from. Call inside a transaction. */
-    fun setBinaryId(program: Program, binaryId: Long) {
+    /**
+     * Records the binary a freshly imported program came from.
+     *
+     * Internal on purpose: only import, copy and move may say where a program came from.
+     * A module that could rewrite this could point its results at another binary's row.
+     */
+    internal fun setBinaryId(program: Program, binaryId: Long) {
         program.getOptions(Program.PROGRAM_INFO).setLong(BINARY_KEY, binaryId)
     }
 
