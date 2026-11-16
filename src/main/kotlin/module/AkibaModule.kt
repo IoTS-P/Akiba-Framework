@@ -551,7 +551,7 @@ abstract class AkibaModule (
         if (instance.javaClass.annotations.none { it is NoNeedToClose })
             instance.close()
 
-        if (instance.failureSign == FAILED || instance.failureSign == RUNTIME_ERROR) {
+        if (ExitCode.isFatal(instance.failureSign)) {
             logger.warn("callModule(${mainClassName}) finished with failureSign=" +
                 "${instance.failureSign}")
         }
@@ -815,12 +815,7 @@ abstract class AkibaModule (
         return ModuleRun(payload, failureSign, exitName(failureSign), durationMs)
     }
 
-    private fun exitName(code: Int): String = when (code) {
-        SUCCESS -> "SUCCESS"
-        FAILED -> "FAILED"
-        RUNTIME_ERROR -> "RUNTIME_ERROR"
-        else -> "EXIT_$code"
-    }
+    private fun exitName(code: Int): String = ExitCode.nameOf(code)
 
     open suspend fun startProcess() {}
 
@@ -882,9 +877,9 @@ abstract class AkibaModule (
     companion object {
         const val DEFAULT_TIMEOUT: Int = 180
 
-        const val SUCCESS: Int = 0
-        const val FAILED: Int = 1
-        const val RUNTIME_ERROR: Int = 2
+        const val SUCCESS: Int = ExitCode.SUCCESS
+        const val FAILED: Int = ExitCode.FAILED
+        const val RUNTIME_ERROR: Int = ExitCode.RUNTIME_ERROR
 
         fun pascalToSnake(pascal: String): String = buildString {
             var prevLower = false
