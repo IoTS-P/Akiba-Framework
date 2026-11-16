@@ -23,6 +23,13 @@ data class ModuleRun(
     val programId: String = "",
     /** The binaries row behind that program, when it was ever imported. */
     val binaryId: Long? = null,
+    /**
+     * The columns this module declared, as it declared them.
+     *
+     * Carried here because the table has to exist before the data can be written, and the
+     * class that knows the columns is the one that just ran.
+     */
+    val columns: Map<String, String> = emptyMap(),
 ) {
     val isSuccess: Boolean
         get() = status == AkibaModule.SUCCESS

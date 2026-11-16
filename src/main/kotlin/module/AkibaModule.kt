@@ -816,7 +816,15 @@ abstract class AkibaModule (
         val payload = result()
         if (payload != null)
             ModuleResults.check(javaClass.simpleName, payload, allDefinedDbColumns, hasTable)
-        return ModuleRun(payload, failureSign, exitName(failureSign), durationMs, programId, binaryId)
+        return ModuleRun(
+            result = payload,
+            status = failureSign,
+            statusName = exitName(failureSign),
+            durationMs = durationMs,
+            programId = programId,
+            binaryId = binaryId,
+            columns = if (hasTable) allDefinedDbColumns else emptyMap(),
+        )
     }
 
     private fun exitName(code: Int): String = ExitCode.nameOf(code)

@@ -4,6 +4,7 @@ import ghidra.program.model.listing.Program
 import kotlin.reflect.KClass
 import kotlinx.coroutines.runBlocking
 import org.apache.logging.log4j.Level
+import io.ktor.http.HttpStatusCode
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.ProjectIndex
 import org.iotsplab.akiba.managers.ProjectPrograms
@@ -14,6 +15,7 @@ import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import org.iotsplab.akiba.server.db.ServerDatabase
 import org.iotsplab.akiba.utils.AkibaJson
 import org.iotsplab.akiba.utils.WithConfigClass
+import org.iotsplab.akiba.utils.WithTableColumn
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -222,8 +224,33 @@ class CliPlanRuntime(
         val binaryId = run.binaryId ?: return false
         if (binaryId <= 0) return false
         val client = DatabaseClient.global ?: return false
-        client.updateData(tableNameFor(spec.className), binaryId.toLong(), result)
+        val table = tableNameFor(spec.className)
+        // A plan can be the first thing that ever runs this module for this instance, so
+        // the result table may not exist yet. The run carries the columns the module
+        // declared, which keeps that declaration the single source of truth.
+        ensureTable(client, table, run.columns)
+        client.updateData(table, binaryId, result)
         return true
+    }
+
+    /** Create the module's result table if this instance has never seen the module. */
+    private fun ensureTable(client: DatabaseClient, table: String, columns: Map<String, String>) {
+        if (columns.isEmpty())
+            throw PlanException("$table has no columns: the module returned a result but declares none")
+        runCatching { client.createModuleTable(table, columns) }
+            .onFailure { failure ->
+                // Conflict means someone else created it first, which is the good case.
+                val status = (failure as? DatabaseClient.DatabaseDaemonException)?.statusCode
+                if (status != HttpStatusCode.Conflict)
+                    throw PlanException("cannot create '$table': ${failure.message}", cause = failure)
+            }
+        // The daemon only writes into a table it has been told to own; the task path locks
+        // it right after creating it, so a plan has to do the same.
+        runCatching { client.tableLock(table) }.onFailure { failure ->
+            val status = (failure as? DatabaseClient.DatabaseDaemonException)?.statusCode
+            if (status != HttpStatusCode.Conflict)
+                throw PlanException("cannot lock '$table': ${failure.message}", cause = failure)
+        }
     }
 
     private fun tableNameFor(className: String): String =

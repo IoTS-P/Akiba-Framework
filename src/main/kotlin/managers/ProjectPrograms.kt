@@ -21,7 +21,15 @@ private val logger: Logger = LogManager.getLogger("ProjectPrograms")
  */
 object ProjectPrograms {
 
-    data class CopyOutcome(val source: String, val program: String, val target: String, val targetFile: String)
+    data class CopyOutcome(
+        val source: String,
+        val program: String,
+        val target: String,
+        val targetFile: String,
+        /** New identity of the copy, and the binary it inherited from its source. */
+        val programId: String? = null,
+        val binaryId: Long? = null,
+    )
 
     /** @property programId identity written into the program's metadata. */
     data class ImportOutcome(val program: String, val folder: String, val programId: String? = null)
@@ -129,23 +137,37 @@ object ProjectPrograms {
             val copied: DomainFile = program.copyTo(target.projectData.rootFolder, TaskMonitor.DUMMY)
             // Rename the copy, never the source: the source project belongs to
             // another conversation and must not change as a side effect.
-            if (asName != null && asName.isNotBlank() && asName != copied.name) {
+            // `copied.name` keeps the old value after setName(), so the rest of this
+            // function has to use the name the copy actually has.
+            val finalName = if (asName != null && asName.isNotBlank() && asName != copied.name) {
                 copied.setName(asName)
-            }
-            reissueIdentity(target, target.projectData.rootFolder, copied.name)
+                asName
+            } else copied.name
+            val identity = reissueIdentity(target, target.projectData.rootFolder, finalName)
             logger.info(
                 "Copied program '{}' from project '{}' to '{}' as '{}'",
-                programName, sourceProject, targetProject, copied.name
+                programName, sourceProject, targetProject, finalName
             )
             CopyOutcome(
                 source = sourceProject,
                 program = programName,
                 target = targetProject,
-                targetFile = copied.name,
+                targetFile = finalName,
+                programId = identity.programId,
+                binaryId = identity.binaryId,
             )
         } finally {
             runCatching { target?.close() }
             runCatching { source?.close() }
+        }
+        // The copy may land in a project the index has never seen, so the row has to exist
+        // before the ids can be stamped onto it.
+        ProjectIndex.refresh(targetProject, projectDirectory, force = true)
+        outcome.programId?.let {
+            ProjectIndex.setProgramId(targetProject, projectDirectory, outcome.targetFile, it)
+        }
+        outcome.binaryId?.let {
+            ProjectIndex.setBinaryId(targetProject, projectDirectory, outcome.targetFile, it)
         }
 
         // Both handles are released, so the index can reopen the target itself.
@@ -283,11 +305,13 @@ object ProjectPrograms {
             val copyName = uniqueName(target, name)
             val copy = file.copyTo(target, TaskMonitor.DUMMY)
             if (copy.name != copyName) copy.setName(copyName)
-            val newId = reissueIdentity(project, target, copyName)
-            if (newId != null) {
-                ProjectIndex.setProgramId(
-                    projectName, projectDirectory, "$targetFolderPath/$copyName".trimStart('/'), newId
-                )
+            val identity = reissueIdentity(project, target, copyName)
+            val copyPath = "$targetFolderPath/$copyName".trimStart('/')
+            identity.programId?.let {
+                ProjectIndex.setProgramId(projectName, projectDirectory, copyPath, it)
+            }
+            identity.binaryId?.let {
+                ProjectIndex.setBinaryId(projectName, projectDirectory, copyPath, it)
             }
             "$targetFolderPath/$copyName".trimStart('/')
         }
@@ -339,12 +363,13 @@ object ProjectPrograms {
                     ?: throw IllegalArgumentException("'$path' does not exist in '$sourceProject'")
                 val copied = file.copyTo(targetParent, TaskMonitor.DUMMY)
                 if (copied.name != wanted) copied.setName(wanted)
-                val newId = reissueIdentity(target, targetParent, wanted)
-                if (newId != null) {
-                    ProjectIndex.setProgramId(
-                        targetProject, targetDirectory,
-                        targetFolder.trimEnd('/') + "/" + wanted, newId
-                    )
+                val identity = reissueIdentity(target, targetParent, wanted)
+                val copyPath = targetFolder.trimEnd('/') + "/" + wanted
+                identity.programId?.let {
+                    ProjectIndex.setProgramId(targetProject, targetDirectory, copyPath, it)
+                }
+                identity.binaryId?.let {
+                    ProjectIndex.setBinaryId(targetProject, targetDirectory, copyPath, it)
                 }
                 if (move) file.delete()
                 targetParent.pathname.trimEnd('/') + "/" + wanted
@@ -412,7 +437,9 @@ object ProjectPrograms {
      * A copy is a new artifact: sharing the source id would make two programs
      * indistinguishable to anything that tracks work by program.
      */
-    private fun reissueIdentity(project: GhidraProject, folder: DomainFolder, fileName: String): String? {
+    private data class CopyIdentity(val programId: String?, val binaryId: Long?)
+
+    private fun reissueIdentity(project: GhidraProject, folder: DomainFolder, fileName: String): CopyIdentity {
         return runCatching {
             val program = project.openProgram(folder.pathname, fileName, false) ?: return@runCatching null
             try {
@@ -423,13 +450,15 @@ object ProjectPrograms {
                     program.endTransaction(tx, true)
                 }
                 project.save(program)
-                ProgramIdentity.read(program)
+                // The program id is new; the binary id came along with the copy, because a
+                // copy is another view of the same file rather than a different file.
+                CopyIdentity(ProgramIdentity.read(program), ProgramIdentity.readBinaryId(program))
             } finally {
                 runCatching { project.close(program) }
             }
         }.onFailure {
             logger.warn("Could not reissue the identity of '{}': {}", fileName, it.message)
-        }.getOrNull()
+        }.getOrNull() ?: CopyIdentity(null, null)
     }
 
     /** First free name in [folder] derived from [name] by adding `_1`, `_2`, … */
