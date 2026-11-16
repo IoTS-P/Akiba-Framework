@@ -30,6 +30,8 @@ object ProjectIndex {
         /** Program identity, when it is already known; null for folders and
          *  for programs that have not been opened since the scheme existed. */
         val programId: String? = null,
+        /** The binary row this program came from, when the walker knows it. */
+        val binaryId: Long? = null,
     )
 
     /**
@@ -121,7 +123,7 @@ object ProjectIndex {
         val dir = projectKey(projectName, projectDirectory)
         return ServerDatabase.newConnection().use { conn ->
             conn.prepareStatement(
-                "SELECT path, name, folder, size, program_id FROM project_entries " +
+                "SELECT path, name, folder, size, program_id, binary_id FROM project_entries " +
                     "WHERE project_dir = ? ORDER BY folder DESC, path"
             ).use { stmt ->
                 stmt.setString(1, dir)
@@ -134,6 +136,7 @@ object ProjectIndex {
                             folder = rs.getBoolean("folder"),
                             size = rs.getLong("size"),
                             programId = rs.getString("program_id"),
+                            binaryId = rs.getLong("binary_id").takeIf { !rs.wasNull() },
                         )
                     }
                     rows
@@ -159,6 +162,26 @@ object ProjectIndex {
             }
         }.getOrElse {
             logger.warn("Could not record program id for '{}': {}", path, it.message)
+            false
+        }
+    }
+
+    /** Record the binary a program was imported from. */
+    fun setBinaryId(projectName: String, projectDirectory: Path, path: String, binaryId: Long): Boolean {
+        val dir = projectKey(projectName, projectDirectory)
+        return runCatching {
+            ServerDatabase.newConnection().use { conn ->
+                conn.prepareStatement(
+                    "UPDATE project_entries SET binary_id = ? WHERE project_dir = ? AND path = ?"
+                ).use { stmt ->
+                    stmt.setLong(1, binaryId)
+                    stmt.setString(2, dir)
+                    stmt.setString(3, path)
+                    stmt.executeUpdate() > 0
+                }
+            }
+        }.getOrElse {
+            logger.warn("Could not record binary id for '{}': {}", path, it.message)
             false
         }
     }
@@ -264,12 +287,18 @@ object ProjectIndex {
                 // cannot read program metadata cheaply, so it reports null and
                 // the previous value is the only one we have.
                 val known = mutableMapOf<String, String>()
+                val knownBinary = mutableMapOf<String, Long>()
                 conn.prepareStatement(
-                    "SELECT path, program_id FROM project_entries WHERE project_dir = ? AND program_id IS NOT NULL"
+                    "SELECT path, program_id, binary_id FROM project_entries WHERE project_dir = ? " +
+                        "AND (program_id IS NOT NULL OR binary_id IS NOT NULL)"
                 ).use { stmt ->
                     stmt.setString(1, projectDir)
                     stmt.executeQuery().use { rs ->
-                        while (rs.next()) known[rs.getString("path")] = rs.getString("program_id")
+                        while (rs.next()) {
+                            val path = rs.getString("path")
+                            rs.getString("program_id")?.let { known[path] = it }
+                            rs.getLong("binary_id").takeIf { !rs.wasNull() }?.let { knownBinary[path] = it }
+                        }
                     }
                 }
                 conn.prepareStatement(
@@ -279,8 +308,8 @@ object ProjectIndex {
                     stmt.executeUpdate()
                 }
                 conn.prepareStatement(
-                    "INSERT INTO project_entries (project_dir, path, name, folder, size, program_id) " +
-                        "VALUES (?, ?, ?, ?, ?, ?::uuid)"
+                    "INSERT INTO project_entries (project_dir, path, name, folder, size, program_id, binary_id) " +
+                        "VALUES (?, ?, ?, ?, ?, ?::uuid, ?)"
                 ).use { stmt ->
                     entries.forEach { entry ->
                         stmt.setString(1, projectDir)
@@ -289,6 +318,8 @@ object ProjectIndex {
                         stmt.setBoolean(4, entry.folder)
                         stmt.setLong(5, entry.size)
                         stmt.setString(6, entry.programId ?: known[entry.path])
+                        // The walk cannot read program metadata, so a known id wins over nothing.
+                        stmt.setObject(7, knownBinary[entry.path])
                         stmt.addBatch()
                     }
                     stmt.executeBatch()

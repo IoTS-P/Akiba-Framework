@@ -19,6 +19,10 @@ data class ModuleRun(
     val status: Int,
     val statusName: String,
     val durationMs: Long,
+    /** The program this run was about. */
+    val programId: String = "",
+    /** The binaries row behind that program, when it was ever imported. */
+    val binaryId: Long? = null,
 ) {
     val isSuccess: Boolean
         get() = status == AkibaModule.SUCCESS

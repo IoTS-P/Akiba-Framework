@@ -43,6 +43,7 @@ object ProjectPrograms {
         source: Path,
         folder: String = "",
         asName: String? = null,
+        binaryId: Long? = null,
     ): ImportOutcome {
         require(Files.isRegularFile(source)) { "Binary file '${source.fileName}' is missing" }
         requireExists(projectDirectory, projectName)
@@ -68,6 +69,9 @@ object ProjectPrograms {
                     // Identity is issued once, at import, and then travels with
                     // the artifact through every rename and move.
                     programId = ProgramIdentity.ensure(program)
+                    // The binary this came from is inherited by copies: they are other
+                    // views of the same file, not different files.
+                    if (binaryId != null && binaryId > 0) ProgramIdentity.setBinaryId(program, binaryId)
                 } finally {
                     program.endTransaction(txId, true)
                 }
@@ -86,6 +90,10 @@ object ProjectPrograms {
 
         // The handle is released, so the index can reopen the project itself.
         ProjectIndex.refresh(projectName, projectDirectory)
+        if (binaryId != null && binaryId > 0) {
+            val path = "${outcome.folder.trim('/')}/${outcome.program}".trimStart('/')
+            ProjectIndex.setBinaryId(projectName, projectDirectory, path, binaryId)
+        }
         return outcome
     }
 
@@ -381,6 +389,11 @@ object ProjectPrograms {
                         program.endTransaction(tx, true)
                     }
                     project.save(program)
+                    // A copy inherits the binary it came from, so the index learns it the
+                    // first time anyone opens the copy.
+                    val knownBinary = ProgramIdentity.readBinaryId(program)
+                    if (knownBinary != null)
+                        ProjectIndex.setBinaryId(projectName, projectDirectory, path, knownBinary)
                     ProgramIdentity.read(program)
                 } finally {
                     runCatching { project.close(program) }

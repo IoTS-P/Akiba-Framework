@@ -18,7 +18,25 @@ object ProgramIdentity {
     /** Option key inside [Program.PROGRAM_INFO]. */
     const val OPTION_KEY = "akiba.program.id"
 
+    /**
+     * The binary row this program was imported from, if any.
+     *
+     * Unlike the program id, this one is *inherited* by copies: a copy is another view of
+     * the same file, so "which binary is this" does not change.
+     */
+    const val BINARY_KEY = "akiba.binary.id"
+
     private val logger = LogManager.getLogger("ProgramIdentity")
+
+    /** The binary row this program came from, or null when it was never registered. */
+    fun readBinaryId(program: Program): Long? = runCatching {
+        program.getOptions(Program.PROGRAM_INFO).getLong(BINARY_KEY, -1L).takeIf { it > 0 }
+    }.getOrNull()
+
+    /** Records the binary a freshly imported program came from. Call inside a transaction. */
+    fun setBinaryId(program: Program, binaryId: Long) {
+        program.getOptions(Program.PROGRAM_INFO).setLong(BINARY_KEY, binaryId)
+    }
 
     /** The stored id, or null when this program predates the scheme. */
     fun read(program: Program): String? = runCatching {

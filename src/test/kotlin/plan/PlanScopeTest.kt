@@ -55,12 +55,22 @@ private class FakeRuntime(
         calls += "run:${programs.firstOrNull()?.let { specFor(it).className } ?: "?"}:${programs.size}"
         // Remember what each program was told, so a test can see the per-program settings.
         programs.forEach { p -> specFor(p).config?.let { calls += "cfg:${p.name}:${it["output"]}" } }
-        return programs.associate { it.id to ModuleRun(mapOf("seen" to it.name), AkibaModule.SUCCESS, "SUCCESS", 1L) }
+        return programs.associate {
+            it.id to ModuleRun(
+                result = mapOf("seen" to it.name),
+                status = AkibaModule.SUCCESS,
+                statusName = "SUCCESS",
+                durationMs = 1L,
+                programId = it.id,
+                // Half the programs were imported from the binaries table, half were not.
+                binaryId = if (it.id.endsWith("1")) 41L else null,
+            )
+        }
     }
 
-    override fun saveResult(spec: ModuleSpec, binaryId: Int, run: ModuleRun): Boolean {
-        calls += "save:${spec.className}:$binaryId"
-        return binaryId > 0 && run.result != null
+    override fun saveResult(spec: ModuleSpec, run: ModuleRun): Boolean {
+        calls += "save:${spec.className}:${run.binaryId}"
+        return (run.binaryId ?: 0) > 0 && run.result != null
     }
 
     override fun findPrograms(filter: String): List<ProgramHandle> {
@@ -180,8 +190,10 @@ class PlanScopeTest {
         assertEquals(progs.map { it.id }.toSet(), runs.keys)
         assertTrue(runs.values.all { it.result != null && it.isSuccess })
 
-        // No program here has a binary row, so saving is a no-op the script can ignore.
-        assertTrue(!scope.saveResult(ModuleSpec("ZeroTrimmer"), -1, runs.getValue(progs.first().id)).expect())
-        assertTrue(scope.saveResult(ModuleSpec("ZeroTrimmer"), 42, runs.getValue(progs.first().id)).expect())
+        // Only the program that came from a binaries row can be stored.
+        val stored = runs.getValue(progs.first().id)
+        val detached = runs.getValue(progs.last().id)
+        assertTrue(scope.saveResult(ModuleSpec("ZeroTrimmer"), stored).expect())
+        assertTrue(!scope.saveResult(ModuleSpec("ZeroTrimmer"), detached).expect())
     }
 }

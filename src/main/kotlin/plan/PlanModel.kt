@@ -20,6 +20,8 @@ data class ProgramHandle(
     val sizeBytes: Long? = null,
     val path: String? = null,
     val project: String? = null,
+    /** The binaries row this program was imported from; null when it never was. */
+    val binaryId: Long? = null,
 )
 
 /**

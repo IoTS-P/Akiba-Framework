@@ -37,12 +37,22 @@ private class RecordingRuntime : PlanRuntime {
 
     override fun runModule(programs: List<ProgramHandle>, specFor: (ProgramHandle) -> ModuleSpec): Map<String, ModuleRun> {
         calls += "run:${programs.firstOrNull()?.let { specFor(it).className } ?: "?"}:${programs.size}"
-        return programs.associate { it.id to ModuleRun(mapOf("seen" to it.name), AkibaModule.SUCCESS, "SUCCESS", 1L) }
+        return programs.associate {
+            it.id to ModuleRun(
+                result = mapOf("seen" to it.name),
+                status = AkibaModule.SUCCESS,
+                statusName = "SUCCESS",
+                durationMs = 1L,
+                programId = it.id,
+                // Half the programs were imported from the binaries table, half were not.
+                binaryId = if (it.id.endsWith("1")) 41L else null,
+            )
+        }
     }
 
-    override fun saveResult(spec: ModuleSpec, binaryId: Int, run: ModuleRun): Boolean {
-        calls += "save:${spec.className}:$binaryId"
-        return binaryId > 0 && run.result != null
+    override fun saveResult(spec: ModuleSpec, run: ModuleRun): Boolean {
+        calls += "save:${spec.className}:${run.binaryId}"
+        return (run.binaryId ?: 0) > 0 && run.result != null
     }
 
     override fun findPrograms(filter: String): List<ProgramHandle> {

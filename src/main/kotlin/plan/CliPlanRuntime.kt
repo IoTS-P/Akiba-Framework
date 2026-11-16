@@ -100,7 +100,7 @@ class CliPlanRuntime(
         }
         val where = if (filter.isBlank()) "" else " AND ($filter)"
         val sql = """
-            SELECT project_dir, path, name, program_id, size
+            SELECT project_dir, path, name, program_id, size, binary_id
             FROM project_entries
             WHERE NOT folder$where
         """.trimIndent()
@@ -117,6 +117,7 @@ class CliPlanRuntime(
                                     sizeBytes = rs.getLong("size"),
                                     path = rs.getString("path"),
                                     project = Path.of(projectDir).fileName?.toString(),
+                                    binaryId = rs.getLong("binary_id").takeIf { !rs.wasNull() },
                                 ),
                             )
                         }
@@ -158,7 +159,11 @@ class CliPlanRuntime(
             val module = instantiate(spec, program)
             val started = System.currentTimeMillis()
             runBlocking { module.startProcess() }
-            val run = module.collectResult(System.currentTimeMillis() - started)
+            val run = module.collectResult(
+                programId = handle.id,
+                binaryId = handle.binaryId,
+                durationMs = System.currentTimeMillis() - started,
+            )
             // A module that changes the program only keeps its changes once saved.
             if (spec.writable) project.save(program)
             return run
@@ -212,8 +217,9 @@ class CliPlanRuntime(
      * Writes a run's result into the module's table. A program that was never imported has
      * no row, and a negative id says exactly that, so nothing is written.
      */
-    override fun saveResult(spec: ModuleSpec, binaryId: Int, run: ModuleRun): Boolean {
+    override fun saveResult(spec: ModuleSpec, run: ModuleRun): Boolean {
         val result = run.result ?: return false
+        val binaryId = run.binaryId ?: return false
         if (binaryId <= 0) return false
         val client = DatabaseClient.global ?: return false
         client.updateData(tableNameFor(spec.className), binaryId.toLong(), result)

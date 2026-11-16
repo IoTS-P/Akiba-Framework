@@ -292,6 +292,8 @@ object ImportManager {
 
         val txId = program.startTransaction("rename")
         program.name = "$id-${originalPath.fileName}"
+        // Which binary row this program came from, so a plan can save its results later.
+        ProgramIdentity.setBinaryId(program, id)
         program.endTransaction(txId, true)
         project.saveAs(program, "/", program.name, false)
         project.close(program)

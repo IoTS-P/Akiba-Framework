@@ -48,5 +48,5 @@ interface ModuleRuntime {
      * Writes one run's result into the module's own table, for the binary [binaryId].
      * Returns false when there is nothing to write or no row to write it against.
      */
-    fun saveResult(spec: ModuleSpec, binaryId: Int, run: ModuleRun): Boolean
+    fun saveResult(spec: ModuleSpec, run: ModuleRun): Boolean
 }

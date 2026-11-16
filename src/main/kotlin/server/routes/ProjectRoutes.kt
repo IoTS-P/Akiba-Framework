@@ -989,6 +989,7 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                 source = binaryFile,
                 folder = req.folder,
                 asName = req.asName?.takeIf { it.isNotBlank() } ?: originalName,
+                binaryId = binaryId,
             )
             call.respond(mapOf(
                 "target" to targetProject,

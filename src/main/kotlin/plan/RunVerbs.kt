@@ -25,12 +25,13 @@ interface RunVerbs {
     ): Outcome<Map<String, ModuleRun>>
 
     /**
-     * Stores one run's result in the module's table for [binaryId].
+     * Stores one run's result in the module's table, against the binary the program came
+     * from.
      *
-     * Returns false when the module returned nothing, or when [binaryId] is not a real row
-     * (a program that was never imported has none).
+     * Returns false when the module returned nothing, or when the program was never
+     * imported into the binaries table — its data only exists in the script then.
      */
-    fun saveResult(spec: ModuleSpec, binaryId: Int, run: ModuleRun): Outcome<Boolean>
+    fun saveResult(spec: ModuleSpec, run: ModuleRun): Outcome<Boolean>
 }
 
 internal class RunOps(
@@ -50,9 +51,9 @@ internal class RunOps(
             ),
         ) { runtime.runModule(programs, specFor) }
 
-    override fun saveResult(spec: ModuleSpec, binaryId: Int, run: ModuleRun): Outcome<Boolean> =
+    override fun saveResult(spec: ModuleSpec, run: ModuleRun): Outcome<Boolean> =
         support.step(
             "saveResult",
-            mapOf("module" to spec.className, "binaryId" to binaryId),
-        ) { runtime.saveResult(spec, binaryId, run) }
+            mapOf("module" to spec.className, "binaryId" to run.binaryId),
+        ) { runtime.saveResult(spec, run) }
 }

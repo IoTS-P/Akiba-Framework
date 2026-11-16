@@ -808,11 +808,15 @@ abstract class AkibaModule (
      * code, and how long it took. Validation happens here so a broken contract surfaces at
      * the call site instead of halfway through a database write.
      */
-    internal fun collectResult(durationMs: Long): ModuleRun {
+    internal fun collectResult(
+        durationMs: Long,
+        programId: String = "",
+        binaryId: Long? = null,
+    ): ModuleRun {
         val payload = result()
         if (payload != null)
             ModuleResults.check(javaClass.simpleName, payload, allDefinedDbColumns, hasTable)
-        return ModuleRun(payload, failureSign, exitName(failureSign), durationMs)
+        return ModuleRun(payload, failureSign, exitName(failureSign), durationMs, programId, binaryId)
     }
 
     private fun exitName(code: Int): String = ExitCode.nameOf(code)
