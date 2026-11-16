@@ -795,6 +795,33 @@ abstract class AkibaModule (
      * @throws Exception
      */
     @Throws(Exception::class)
+    /**
+     * What this run produced, for callers that want the data rather than the table row.
+     *
+     * Every key must be declared with [WithTableColumn]; returning anything else is a bug
+     * in the module and is rejected rather than written somewhere unexpected.
+     */
+    open fun result(): Map<String, Any?>? = null
+
+    /**
+     * Snapshot of this run, taken right after `startProcess` returns: the result, the exit
+     * code, and how long it took. Validation happens here so a broken contract surfaces at
+     * the call site instead of halfway through a database write.
+     */
+    internal fun collectResult(durationMs: Long): ModuleRun {
+        val payload = result()
+        if (payload != null)
+            ModuleResults.check(javaClass.simpleName, payload, allDefinedDbColumns, hasTable)
+        return ModuleRun(payload, failureSign, exitName(failureSign), durationMs)
+    }
+
+    private fun exitName(code: Int): String = when (code) {
+        SUCCESS -> "SUCCESS"
+        FAILED -> "FAILED"
+        RUNTIME_ERROR -> "RUNTIME_ERROR"
+        else -> "EXIT_$code"
+    }
+
     open suspend fun startProcess() {}
 
     /**

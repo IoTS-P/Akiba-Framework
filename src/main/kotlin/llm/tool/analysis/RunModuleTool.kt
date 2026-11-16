@@ -7,7 +7,9 @@ import kotlin.system.measureTimeMillis
 import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
+import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.module.AkibaModule
+import org.iotsplab.akiba.module.ModuleResults
 import org.iotsplab.akiba.module.RuntimeReport
 import org.iotsplab.akiba.utils.AkibaJson
 
@@ -108,6 +110,15 @@ fun RunModuleTool(parent: AkibaModule): Tool = Tool(
 
                 val report = instance.runtimeReportView
                 val success = instance.failureSign == AkibaModule.SUCCESS
+                // A module may hand back data; small results are printed, big ones go to a
+                // file. Programs that never got a binary id have no table, so this is their
+                // only way out.
+                val resultText = instance.collectResult(0L).result?.let { payload ->
+                    val dir = if (WorkspaceManager.isLogRootDirInitialized)
+                        WorkspaceManager.logRootDir.parent.resolve("module-results")
+                    else java.nio.file.Path.of(System.getProperty("java.io.tmpdir"), "akiba-module-results")
+                    ModuleResults.render(className.substringAfterLast('.'), payload, dir)
+                }
                 @Suppress("UNCHECKED_CAST")
                 val data = report?.get(RuntimeReport.KEY_DATA) as? Map<String, Any?>
                 val errMsg = report?.get(RuntimeReport.KEY_ERR_MSG) as? String
@@ -119,6 +130,7 @@ fun RunModuleTool(parent: AkibaModule): Tool = Tool(
                     "error" to if (success) null else (errMsg ?: "Module finished with failureSign=${instance.failureSign} but did not report an error message"),
                     "traceback" to traceback,
                     "data" to data,
+                    "result" to resultText,
                     "executionTimeMs" to report?.get(RuntimeReport.KEY_EXECUTION_TIME_MS)
                 ))
             }
