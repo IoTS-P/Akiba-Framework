@@ -178,6 +178,18 @@ class DatabaseClient(
     }
 
     @Throws(DatabaseDaemonException::class)
+    /**
+     * A daemon failure carries its reason in the body ("database \"inst_test\" does not
+     * exist"); passing the status text alone turns every one of them into "Not Found".
+     */
+    private fun failure(status: HttpStatusCode, body: String): DatabaseDaemonException {
+        val detail = runCatching {
+            AkibaJson.mapper.readTree(body).path("error").asText().takeIf { it.isNotBlank() }
+        }.getOrNull()
+        return DatabaseDaemonException(
+            status, detail ?: body.takeIf { it.isNotBlank() } ?: status.description)
+    }
+
     suspend fun post(path: String, body: Any?, putToken: Boolean = true): Pair<HttpStatusCode, String> {
         try {
             val response = httpClient.post("$urlHeader/$path") {
@@ -207,7 +219,7 @@ class DatabaseClient(
             if (it.first == HttpStatusCode.OK)
                 it.second
             else
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
         return@runBlocking AkibaJson.mapper.readValue<List<Long>>(response)
     }
@@ -221,7 +233,7 @@ class DatabaseClient(
             if (it.first == HttpStatusCode.OK)
                 it.second
             else
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
         return@runBlocking AkibaJson.mapper.readValue<List<Long>>(response)
     }
@@ -232,7 +244,7 @@ class DatabaseClient(
             if (it.first == HttpStatusCode.OK)
                 it.second
             else
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
         return@runBlocking AkibaJson.mapper.readValue<Long>(response)
     }
@@ -243,7 +255,7 @@ class DatabaseClient(
             if (it.first == HttpStatusCode.OK)
                 it.second
             else
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
         return@runBlocking AkibaJson.mapper.readValue<BinaryMetadata>(response)
     }
@@ -263,7 +275,7 @@ class DatabaseClient(
             if (it.first == HttpStatusCode.OK)
                 it.second
             else
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
         @Suppress("UNCHECKED_CAST")
         return@runBlocking (AkibaJson.mapper.readValue(response) as? List<Map<String, Any?>>) ?: emptyList()
@@ -281,7 +293,7 @@ class DatabaseClient(
             if (it.first == HttpStatusCode.OK)
                 it.second
             else
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
         return@runBlocking AkibaJson.mapper.readValue<List<Long>>(response)
     }
@@ -297,7 +309,7 @@ class DatabaseClient(
             if (it.first == HttpStatusCode.OK)
                 it.second
             else
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
 
         // TODO: Send type here and deserialize with our custom deserializer
@@ -317,7 +329,7 @@ class DatabaseClient(
             if (it.first == HttpStatusCode.OK)
                 it.second
             else
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
         return@runBlocking AkibaJson.mapper.readValue<Boolean>(response)
     }
@@ -363,7 +375,7 @@ class DatabaseClient(
             if (it.first == HttpStatusCode.OK)
                 it.second
             else
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
         return@runBlocking AkibaJson.mapper.readValue<Long>(response)
     }
@@ -378,7 +390,7 @@ class DatabaseClient(
             "columns" to columns
         )).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
     }
 
@@ -390,7 +402,7 @@ class DatabaseClient(
             "overwrite" to overwrite
         )).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
     }
 
@@ -401,7 +413,7 @@ class DatabaseClient(
                 "tableName" to tableName
             )).let {
                 if (it.first != HttpStatusCode.OK)
-                    throw DatabaseDaemonException(it.first, it.first.description)
+                    throw failure(it.first, it.second)
             }
             lockedTables.add(tableName)
         }
@@ -414,7 +426,7 @@ class DatabaseClient(
                 "tableName" to tableName
             )).let {
                 if (it.first != HttpStatusCode.OK)
-                    throw DatabaseDaemonException(it.first, it.first.description)
+                    throw failure(it.first, it.second)
             }
             lockedTables.remove(tableName)
         }
@@ -433,7 +445,7 @@ class DatabaseClient(
                 // If send failed, save it into local database first
                 LocalCacheDatabase.updateData(tableName, id, data)
 
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
             }
         }
     }
@@ -445,7 +457,7 @@ class DatabaseClient(
             "id" to id
         )).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
     }
 
@@ -456,7 +468,7 @@ class DatabaseClient(
             "id" to id
         )).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
     }
 
@@ -468,7 +480,7 @@ class DatabaseClient(
             "route" to route
         )).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
     }
 
@@ -478,7 +490,7 @@ class DatabaseClient(
             "route" to route
         )).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
     }
 
@@ -486,7 +498,7 @@ class DatabaseClient(
     fun sendHeartbeat() = runBlocking {
         post("/heartbeat", null).let {
             if (it.first != HttpStatusCode.NoContent)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
     }
 
@@ -527,7 +539,7 @@ class DatabaseClient(
             if (it.first == HttpStatusCode.OK)
                 it.second
             else
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
         val body = AkibaJson.mapper.readValue<Map<String, Any?>>(response)
         val token = body["token"] as? String
@@ -637,7 +649,7 @@ class DatabaseClient(
             if (it.first == HttpStatusCode.OK)
                 it.second
             else
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
         jacksonObjectMapper()
             .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
@@ -664,7 +676,7 @@ class DatabaseClient(
             if (it.first == HttpStatusCode.OK)
                 it.second
             else
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
         AkibaJson.mapper.readValue<Map<String, String>>(response)["secret"]
             ?: throw DatabaseDaemonException(
@@ -675,7 +687,7 @@ class DatabaseClient(
     fun logout() = runBlocking {
         post("/instance/logout", null).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
     }
 
@@ -716,7 +728,7 @@ class DatabaseClient(
             "instanceName" to instanceName,
         )).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
     }
 
@@ -726,7 +738,7 @@ class DatabaseClient(
             "instanceName" to instanceName,
         )).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
     }
 
@@ -736,7 +748,7 @@ class DatabaseClient(
             "instanceName" to instanceName,
         )).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
     }
 
@@ -746,7 +758,7 @@ class DatabaseClient(
             "instanceName" to instanceName,
         )).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
         }
     }
 
@@ -819,7 +831,7 @@ class DatabaseClient(
     fun backupStatus(instanceName: String? = null): BackupStatus = runBlocking {
         post("/backup/status", mapOf("instance" to instanceName)).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
             AkibaJson.mapper.readValue(it.second)
         }
     }
@@ -863,7 +875,7 @@ class DatabaseClient(
     fun peekBackups(instanceName: String): List<BackupNode> = runBlocking {
         post("/backup/peek", instanceName).let {
             if (it.first != HttpStatusCode.OK)
-                throw DatabaseDaemonException(it.first, it.first.description)
+                throw failure(it.first, it.second)
             else
                 return@runBlocking jacksonObjectMapper().registerModule(
                     SimpleModule().addDeserializer(
