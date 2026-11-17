@@ -3,13 +3,16 @@ package org.iotsplab.akiba.plan
 import ghidra.program.model.listing.Program
 import kotlin.reflect.KClass
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.apache.logging.log4j.Level
 import io.ktor.http.HttpStatusCode
 import org.iotsplab.akiba.data.database.DatabaseClient
 import org.iotsplab.akiba.managers.ProjectIndex
 import org.iotsplab.akiba.managers.ProjectPrograms
 import org.iotsplab.akiba.managers.WorkspaceManager
+import org.iotsplab.akiba.managers.BinaryMetadata
 import org.iotsplab.akiba.module.AkibaModule
+import org.iotsplab.akiba.module.ModuleContext
 import org.iotsplab.akiba.module.ModuleRun
 import org.iotsplab.akiba.utils.ProcedureArgumentsDeserializer
 import org.iotsplab.akiba.server.db.ServerDatabase
@@ -160,7 +163,16 @@ class CliPlanRuntime(
                 ?: throw PlanException("Program '${handle.name}' could not be opened in '$projectName'")
             val module = instantiate(spec, program)
             val started = System.currentTimeMillis()
-            runBlocking { module.startProcess() }
+            // Modules read their target's facts from this context. A program the index
+            // knows a binary for gets that row; one that was never imported is described
+            // by the program itself, with no id.
+            val row = handle.binaryId?.let { binaryId ->
+                runCatching { DatabaseClient.global?.getMetadata(binaryId) }.getOrNull()
+            }
+            val metadata = BinaryMetadata.of(program, row)
+            runBlocking {
+                withContext(ModuleContext(metadata)) { module.startProcess() }
+            }
             val run = module.collectResult(
                 programId = handle.id,
                 binaryId = handle.binaryId,

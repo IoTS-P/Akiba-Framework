@@ -139,7 +139,15 @@ abstract class AkibaModule (
             if (it.exists()) it else null
         }
     }
-    val usingFile: File by lazy { processedFile ?: originalFile }
+    val usingFile: File by lazy {
+        // Nothing was ever stored for a program that was opened without an import, so the
+        // path below would not exist; say why instead of letting a read fail later.
+        check(id > 0) {
+            "${this.javaClass.simpleName} needs the stored binary of its target, but " +
+                "'${program?.name}' was opened without being imported"
+        }
+        processedFile ?: originalFile
+    }
 
     // ============================================================
     //  Module workspace — persistent file storage for modules
@@ -567,11 +575,16 @@ abstract class AkibaModule (
         val contextId = when {
             targetId >= 0 -> targetId
             id >= 0 -> id
-            else -> throw IllegalStateException(
-                "run_module requires a selected binary or an explicit targetId"
-            )
+            else -> null
         }
-        val metadata = dbClient.getMetadata(contextId.toLong())
+        // No id means the program was opened without being imported. It still knows its
+        // own language and format, which is what a module needs from this context; the
+        // missing id is what tells anything that writes to the database to stay away.
+        val metadata = contextId
+            ?.let { runCatching { dbClient.getMetadata(it.toLong()) }.getOrNull() }
+            ?: BinaryMetadata.of(requireNotNull(program) {
+                "run_module needs a program or an explicit targetId"
+            })
         return ModuleContext(metadata)
     }
 
