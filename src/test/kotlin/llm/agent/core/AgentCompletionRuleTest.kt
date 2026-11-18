@@ -172,7 +172,10 @@ class AgentCompletionRuleTest {
     }
 
     @Test
-    fun `text protocol gets one reminder, then the prose is accepted`() = runBlocking {
+    fun `text protocol accepts plain prose as the answer`() = runBlocking {
+        // A model without a tool-calling channel still answers in prose.  Asking it to
+        // call a tool after it has said its piece is noise, and it was happening on
+        // every final answer.
         val client = ScriptedClient(
             listOf(ChatCompletion(content = "I think it is a hello-world binary.", finishReason = "stop")),
             toolCalling = false,
@@ -183,14 +186,39 @@ class AgentCompletionRuleTest {
 
         assertEquals(StopReason.COMPLETED, result.stopReason)
         assertEquals("I think it is a hello-world binary.", result.output)
-        assertEquals(
-            MAX_NO_ACTION_TURNS,
-            client.calls,
-            "text protocol should be reminded once before its answer is accepted",
+        assertEquals(1, client.calls, "plain prose is an answer, not a missed call")
+        assertTrue(
+            ctx.memory.messages().none { msg ->
+                msg.role == "user" && msg.content.contains("contained no tool call")
+            },
+            "no reminder should follow a finished answer",
         )
+    }
+
+    @Test
+    fun `text protocol is reminded once when the call was cut off`() = runBlocking {
+        // A truncated attempt is not an answer: the reply stops inside the JSON, so the
+        // model gets one reminder and only then is prose taken at face value.
+        val client = ScriptedClient(
+            listOf(
+                ChatCompletion(
+                    content = "I will now call binary_info(",
+                    finishReason = "stop",
+                ),
+                ChatCompletion(content = "I could not finish the call.", finishReason = "stop"),
+            ),
+            toolCalling = false,
+        )
+        val ctx = context(client)
+
+        val result = ReActStrategy().execute(ctx)
+
+        assertEquals(StopReason.COMPLETED, result.stopReason)
+        assertEquals("I could not finish the call.", result.output)
+        assertEquals(2, client.calls, "one reminder, then the answer")
         assertTrue(
             ctx.memory.messages().any { msg ->
-                msg.role == "user" && msg.content.contains("tool", ignoreCase = true)
+                msg.role == "user" && msg.content.contains("contained no tool call")
             },
             "the format reminder should have been injected into the conversation",
         )

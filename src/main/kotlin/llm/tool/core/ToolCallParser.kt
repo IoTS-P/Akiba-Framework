@@ -514,6 +514,25 @@ object ToolCallParser {
     }
 
     /** True when [text] holds at least one explicit tool_call object. */
+    /**
+     * True when a reply looks like a tool call that was cut off mid-way.
+     *
+     * The text protocol needs this to tell "the model answered" from "the model tried to
+     * call something and never finished": an unclosed `{`, or a reply ending on an
+     * opening parenthesis after a name, is an attempt rather than an answer.
+     */
+    fun looksInterrupted(text: String): Boolean {
+        if (text.isBlank()) return false
+        if (text.count { it == '{' } > text.count { it == '}' }) return true
+        val trimmed = text.trimEnd()
+        for (tail in listOf("(", ",", "{\"")) {
+            if (!trimmed.endsWith(tail)) continue
+            val before = trimmed.dropLast(tail.length).takeLastWhile { it.isLetterOrDigit() || it == '_' }
+            if (before.length >= 2) return true
+        }
+        return false
+    }
+
     fun hasExplicitTextCall(text: String): Boolean {
         if (text.isBlank()) return false
         val fences = fencedRanges(text)
