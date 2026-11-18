@@ -44,6 +44,8 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
             return@get call.respond(HttpStatusCode.NotFound, mapOf("error" to "No such directory"))
         }
         val entries = Files.list(target).use { stream -> stream.toList() }
+            // The binary is Akiba's, not the user's: it is not part of the file list.
+            .filter { !WorkspacePaths.isReservedName(it.fileName.toString()) }
             .sortedBy { it.fileName.toString().lowercase() }
             .map { p ->
                 mapOf<String, Any>(
@@ -62,6 +64,9 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
         val (root, _) = sessionWorkspace(call, daemonHost, daemonPort) ?: return@delete
         val target = WorkspacePaths.resolveInside(root, call.request.queryParameters["path"].orEmpty())
             ?: return@delete call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Path escapes the workspace"))
+        if (isReservedRootTarget(root, target)) {
+            return@delete call.respond(HttpStatusCode.BadRequest, mapOf("error" to "'binary' is reserved by Akiba"))
+        }
         if (target == root.normalize()) {
             return@delete call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Refusing to delete the workspace root"))
         }
@@ -105,6 +110,9 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
         val (root, _) = sessionWorkspace(call, daemonHost, daemonPort) ?: return@put
         val target = WorkspacePaths.resolveInside(root, call.request.queryParameters["path"].orEmpty())
             ?: return@put call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Path escapes the workspace"))
+        if (isReservedRootTarget(root, target)) {
+            return@put call.respond(HttpStatusCode.BadRequest, mapOf("error" to "'binary' is reserved by Akiba"))
+        }
         val body = call.receiveText()
         Files.createDirectories(target.parent)
         Files.writeString(target, body)
@@ -122,7 +130,9 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
         call.receiveMultipart().forEachPart { part ->
             if (part is PartData.FileItem) {
                 val name = part.originalFileName?.substringAfterLast('/')?.substringAfterLast('\\')
-                if (!name.isNullOrBlank()) {
+                if (!name.isNullOrBlank() && WorkspacePaths.isReservedName(name) && dir.normalize() == root.normalize()) {
+                    // Silently skipped: the rest of the upload still lands.
+                } else if (!name.isNullOrBlank()) {
                     val dest = WorkspacePaths.resolveInside(root, relative(root, dir.resolve(name)))
                     if (dest != null) {
                         Files.createDirectories(dest.parent)
@@ -183,6 +193,10 @@ private suspend fun sessionWorkspace(
     Files.createDirectories(root)
     return root to instance
 }
+
+/** A direct child of the workspace root may not be called `binary`. */
+private fun isReservedRootTarget(root: Path, target: Path): Boolean =
+    target.parent?.normalize() == root.normalize() && WorkspacePaths.isReservedName(target.fileName.toString())
 
 private fun relative(root: Path, target: Path): String =
     runCatching { root.relativize(target).toString() }.getOrDefault("")

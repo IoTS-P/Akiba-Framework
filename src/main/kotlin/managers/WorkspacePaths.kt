@@ -19,6 +19,19 @@ import java.nio.file.Path
  */
 object WorkspacePaths {
 
+    /**
+     * Names a workspace user may not create.
+     *
+     * `binary` is provisioned by Akiba at the root of every workspace: it is the read-only copy
+     * of the program being analysed. Letting someone replace it, or create a folder with that
+     * name, would hand the agent a different file than the one it was told to analyse.
+     */
+    private val RESERVED_ROOT_NAMES = setOf("binary")
+
+    /** True when [name] is reserved and must not appear in, or be created in, a workspace root. */
+    fun isReservedName(name: String): Boolean = name.lowercase() in RESERVED_ROOT_NAMES
+
+
     /** Longest a single path segment may be on common filesystems. */
     private const val MAX_SEGMENT = 120
 
