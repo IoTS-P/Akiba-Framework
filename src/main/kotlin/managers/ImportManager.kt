@@ -201,8 +201,13 @@ object ImportManager {
                 sourceModule = sourceModule,
             )
         )
-        originalPath.copyTo(
-            WorkspaceManager.binaryPath.resolve("$id.bin"), overwrite = true)
+        val stored = WorkspaceManager.binaryPath.resolve("$id.bin")
+        originalPath.copyTo(stored, overwrite = true)
+        // The store is canonical: every module and every database row points at this one
+        // file, so it is written read-only. A module that needs different bytes copies
+        // them into its own workspace instead of editing this.
+        runCatching { stored.toFile().setReadOnly() }
+            .onFailure { globalLogger.warn("Could not make '{}' read-only: {}", stored, it.message) }
 
         return id
     }
@@ -288,7 +293,9 @@ object ImportManager {
                 sourceModule = sourceModule,
             )
         )
-        originalPath.copyTo(WorkspaceManager.binaryPath.resolve("$id.bin"), overwrite = true)
+        val storedCopy = WorkspaceManager.binaryPath.resolve("$id.bin")
+        originalPath.copyTo(storedCopy, overwrite = true)
+        runCatching { storedCopy.toFile().setReadOnly() }
 
         val txId = program.startTransaction("rename")
         program.name = "$id-${originalPath.fileName}"

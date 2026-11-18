@@ -171,15 +171,20 @@ class CliPlanRuntime(
             }
             val metadata = BinaryMetadata.of(program, row)
             runBlocking {
-                withContext(ModuleContext(metadata)) { module.startProcess() }
+                withContext(ModuleContext(metadata)) {
+                    // Zero means "no limit", which is what most modules want; a plan that
+                    // set one gets a TIMEOUT ending instead of hanging the whole file.
+                    module.startProcess(spec.timeoutSeconds ?: 0)
+                }
             }
             val run = module.collectResult(
                 programId = handle.id,
                 binaryId = handle.binaryId,
                 durationMs = System.currentTimeMillis() - started,
             )
-            // A module that changes the program only keeps its changes once saved.
-            if (spec.writable) project.save(program)
+            // A module that changes the program only keeps its changes once saved, and a
+            // run that failed or timed out may have stopped halfway through its edits.
+            if (spec.writable && run.isSuccess) project.save(program)
             return run
         } finally {
             WorkspaceManager.releaseActiveProject()

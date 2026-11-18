@@ -108,6 +108,10 @@ abstract class AkibaModule (
     // failureSign is used to skip all latter tasks. If it is true, then all latter tasks will be skipped.
     var failureSign: Int = SUCCESS
 
+    /** What [result] answered just before the module closed, if it got that far. */
+    private var sealedResult: Map<String, Any?>? = null
+    private var resultSealed: Boolean = false
+
     /**
      * Read-only view of this module's [RuntimeReport], if one was supplied at
      * construction time (typically by [callModule]); `null` for top-level
@@ -133,20 +137,23 @@ abstract class AkibaModule (
     // (dynamically-compiled scripts use the no-arg constructor, where id is
     // still the -1 default), so eagerly built paths would stay at `-1.bin` —
     // see ScriptClassLoader.instantiateScript.
-    val originalFile: File by lazy { File("${mainConf.binariesRoot}/original/$id.bin") }
-    val processedFile: File? by lazy {
-        File("${mainConf.binariesRoot}/processed/$id.bin").let {
-            if (it.exists()) it else null
-        }
-    }
+    /**
+     * The stored binary this module works on: `<binariesRoot>/original/<id>.bin`.
+     *
+     * Read-only by contract. Importing keeps one canonical copy, and it is the file the
+     * whole database points at — a module that writes to it corrupts every later run of
+     * every module on that binary. A module that needs different bytes copies them into
+     * its own [workspaceDir] first.
+     *
+     * Nothing was ever stored for a program that was opened without being imported, so
+     * that case is refused here, with the reason, instead of failing on a missing path.
+     */
     val usingFile: File by lazy {
-        // Nothing was ever stored for a program that was opened without an import, so the
-        // path below would not exist; say why instead of letting a read fail later.
         check(id > 0) {
             "${this.javaClass.simpleName} needs the stored binary of its target, but " +
                 "'${program?.name}' was opened without being imported"
         }
-        processedFile ?: originalFile
+        File("${mainConf.binariesRoot}/original/$id.bin")
     }
 
     // ============================================================
@@ -782,8 +789,12 @@ abstract class AkibaModule (
         runtimeReport?.recordExecutionTime(executionTime)
 
         if (taskGlobalMonitor.isCancelled) {        // Timeout occurred
-            if (this.javaClass.annotations.any { it is FailOnCancelled })
-                failureSign = FAILED
+            // A run that ran out of time did not finish. Saying so is more useful than the
+            // bare FAILED the old rule produced, and it is still a framework code, so a
+            // task chain still stops here.
+            if (timeout > 0) failureSign = ExitCode.TIMEOUT
+            else if (this.javaClass.annotations.any { it is FailOnCancelled }) failureSign = FAILED
+            runtimeReport?.recordErr("Timed out after ${timeout}s")
         } else {
             try {
                 if (job.isActive)
@@ -800,6 +811,11 @@ abstract class AkibaModule (
 
         if (failureSign == SUCCESS)
             clearErr()
+
+        // Take the result now: after close() the program is gone, and a module whose
+        // result() reads it would fail there instead of here.
+        sealedResult = runCatching { result() }.getOrNull()
+        resultSealed = true
         close()
     }
 
@@ -826,7 +842,7 @@ abstract class AkibaModule (
         programId: String = "",
         binaryId: Long? = null,
     ): ModuleRun {
-        val payload = result()
+        val payload = if (resultSealed) sealedResult else result()
         if (payload != null)
             ModuleResults.check(javaClass.simpleName, payload, allDefinedDbColumns, hasTable)
         return ModuleRun(
