@@ -2,6 +2,9 @@ package plan
 
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.module.ModuleRun
+import org.iotsplab.akiba.plan.BinaryExistsException
+import org.iotsplab.akiba.plan.BinaryHandle
+import org.iotsplab.akiba.plan.BinaryQueryException
 import org.iotsplab.akiba.plan.ImportTarget
 import org.iotsplab.akiba.plan.ModuleSpec
 import org.iotsplab.akiba.plan.Outcome
@@ -73,6 +76,23 @@ private class FakeRuntime(
         return (run.binaryId ?: 0) > 0 && run.result != null
     }
 
+    private val binaries = mutableListOf(
+        BinaryHandle(id = 1L, path = "/store/1.bin", sizeBytes = 16L, arch = "x86"),
+        BinaryHandle(id = 2L, path = "/store/2.bin", sizeBytes = 32L, arch = "arm"),
+    )
+
+    override fun findBinaries(filter: String): List<BinaryHandle> {
+        calls += "binaries:$filter"
+        if (filter.contains("boom")) throw BinaryQueryException(filter, IllegalStateException("bad sql"))
+        return binaries
+    }
+
+    override fun importBinary(path: String): BinaryHandle {
+        calls += "import:$path"
+        if (path.contains("dup")) throw BinaryExistsException(path, "abc123")
+        return BinaryHandle(id = binaries.size + 1L, path = path)
+    }
+
     override fun findPrograms(filter: String): List<ProgramHandle> {
         calls += "find:$filter"
         if (filter.contains("boom")) error("bad sql")
@@ -85,6 +105,53 @@ private class FakeRuntime(
  * one bad import does not take the rest of the batch with it.
  */
 class PlanScopeTest {
+
+    @Test
+    fun `binaries asks the table with the filter it was given`() {
+        val runtime = FakeRuntime()
+        val result = PlanScope(runtime).binaries("arch = 'arm'").expect()
+
+        assertEquals(2, result.size)
+        assertEquals(listOf("binaries:arch = 'arm'"), runtime.calls)
+    }
+
+    @Test
+    fun `a broken filter is a typed failure, not a crash`() {
+        val failure = assertIs<Outcome.Failed>(PlanScope(FakeRuntime()).binaries("boom"))
+
+        assertIs<BinaryQueryException>(failure.error)
+    }
+
+    @Test
+    fun `importBinary hands back the row it registered`() {
+        val runtime = FakeRuntime()
+        val handle = PlanScope(runtime).importBinary("/incoming/fw.bin").expect()
+
+        assertEquals("/incoming/fw.bin", handle.path)
+        assertEquals(listOf("import:/incoming/fw.bin"), runtime.calls)
+    }
+
+    @Test
+    fun `a duplicate checksum is a failure the script can inspect`() {
+        val failure = assertIs<Outcome.Failed>(PlanScope(FakeRuntime()).importBinary("/incoming/dup.bin"))
+
+        assertEquals("abc123", assertIs<BinaryExistsException>(failure.error).checksum)
+    }
+
+    @Test
+    fun `a batch stops at the file that failed`() {
+        val runtime = FakeRuntime()
+        val failure = assertIs<Outcome.Failed>(
+            PlanScope(runtime).importBinaries(listOf("/a.bin", "/dup.bin", "/c.bin")),
+        )
+
+        assertIs<BinaryExistsException>(failure.error)
+        assertEquals(
+            listOf("import:/a.bin", "import:/dup.bin"),
+            runtime.calls,
+            "the file after the failure must not be imported behind the script's back",
+        )
+    }
 
     private val progs = listOf(
         ProgramHandle("id-1", "fx20_slave.elf", arch = "x86_64"),

@@ -18,6 +18,14 @@ class ProjectExistsException(val project: String, step: Int? = null) :
 class ProjectMissingException(val project: String, step: Int? = null) :
     PlanException("Project '$project' does not exist; use createOrOpenProject to create it", step)
 
+/** `importBinary` found the file already registered, by checksum. */
+class BinaryExistsException(val path: String, val checksum: String, step: Int? = null) :
+    PlanException("'$path' is already in the database (checksum $checksum)", step)
+
+/** `binaries(filter)` was given a condition the database rejected. */
+class BinaryQueryException(val sql: String, cause: Throwable, step: Int? = null) :
+    PlanException("Binary query failed: ${cause.message}", step, cause)
+
 /** A verb referenced a program the plan cannot resolve. */
 class ProgramMissingException(val programId: String, step: Int? = null) :
     PlanException("Program '$programId' is not in the index any more", step)

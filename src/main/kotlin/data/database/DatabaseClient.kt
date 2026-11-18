@@ -282,6 +282,25 @@ class DatabaseClient(
     }
 
     /**
+     * Rows of the binaries table matching [where], a bare SQL condition.
+     *
+     * Read-only by construction: the daemon puts the condition inside a SELECT over the
+     * binaries view, so it can narrow a read but never become a statement of its own.
+     */
+    @Throws(DatabaseDaemonException::class)
+    fun queryBinaries(where: String): List<Map<String, Any?>> = runBlocking {
+        val response = post("/get/binaries/sql", mapOf("where" to where)).let {
+            if (it.first == HttpStatusCode.OK)
+                it.second
+            else
+                throw failure(it.first, it.second)
+        }
+        @Suppress("UNCHECKED_CAST")
+        return@runBlocking (AkibaJson.mapper.readValue(response) as? List<Map<String, Any?>>)
+            ?: emptyList()
+    }
+
+    /**
      * Delete binaries (and their FK-cascaded rows) by id list.
      *
      * @param ids Binary ids to delete; unknown ids are skipped by the daemon.

@@ -25,6 +25,21 @@ data class ProgramHandle(
 )
 
 /**
+ * A file in the database: what `importBinary` just registered, or what `binaries()` picked.
+ *
+ * [id] is the row in `binaries`, which is also the name of the stored copy and the key
+ * module results are written against.
+ */
+data class BinaryHandle(
+    val id: Long,
+    val path: String,
+    val sizeBytes: Long? = null,
+    val checksum: String? = null,
+    val arch: String? = null,
+    val format: String? = null,
+)
+
+/**
  * `module("…") { timeout = 600 }`
  *
  * [config] is a plain map on purpose: the module's config class lives in a jar the script

@@ -9,7 +9,7 @@ import org.iotsplab.akiba.module.ModuleRun
  * that needs one domain should not have to stub the other two — so the contract is three
  * interfaces and [PlanRuntime] is only their union.
  */
-interface PlanRuntime : ProjectRuntime, ProgramRuntime, ModuleRuntime
+interface PlanRuntime : ProjectRuntime, ProgramRuntime, ModuleRuntime, BinaryRuntime
 
 /** What a plan can do to a project. */
 interface ProjectRuntime {
@@ -31,6 +31,21 @@ interface ProgramRuntime {
      * typed query language would have to grow a parser before it grew a single use.
      */
     fun findPrograms(filter: String): List<ProgramHandle>
+}
+
+/** What a plan can do with the stored files themselves. */
+interface BinaryRuntime {
+
+    /** Binaries matching [filter], a bare SQL condition over the `binaries` table. */
+    fun findBinaries(filter: String): List<BinaryHandle>
+
+    /**
+     * Registers [path] and returns its row.
+     *
+     * The file is copied under the binaries root and made read-only, which is the same
+     * deal a configured import gets: one canonical copy, no module editing it in place.
+     */
+    fun importBinary(path: String): BinaryHandle
 }
 
 /** What a plan can run. */

@@ -313,6 +313,11 @@ object WorkspaceManager: Closeable {
         context.updateLoggers()
     }
 
+    /** Create the binary store if nothing has yet; safe to call repeatedly. */
+    fun ensureBinDirectories() {
+        if (!::binaryPath.isInitialized || !::processedBinaryPath.isInitialized) initBinDirectories()
+    }
+
     fun initBinDirectories() {
         // Resolve binaries root: auto-compute from username/instance if not explicitly configured
         val resolvedRoot = if (mainConf.binariesRoot.isNotBlank()) {

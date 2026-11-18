@@ -2,6 +2,7 @@ package plan
 
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.module.ModuleRun
+import org.iotsplab.akiba.plan.BinaryHandle
 import org.iotsplab.akiba.plan.ImportTarget
 import org.iotsplab.akiba.plan.ModuleSpec
 import org.iotsplab.akiba.plan.PlanCompileException
@@ -53,6 +54,16 @@ private class RecordingRuntime : PlanRuntime {
     override fun saveResult(spec: ModuleSpec, run: ModuleRun): Boolean {
         calls += "save:${spec.className}:${run.binaryId}"
         return (run.binaryId ?: 0) > 0 && run.result != null
+    }
+
+    override fun findBinaries(filter: String): List<BinaryHandle> {
+        calls += "binaries:$filter"
+        return listOf(BinaryHandle(1L, "/store/1.bin"))
+    }
+
+    override fun importBinary(path: String): BinaryHandle {
+        calls += "import:$path"
+        return BinaryHandle(calls.size.toLong(), path)
     }
 
     override fun findPrograms(filter: String): List<ProgramHandle> {

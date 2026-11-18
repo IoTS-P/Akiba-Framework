@@ -7,6 +7,7 @@ import kotlinx.coroutines.withContext
 import org.apache.logging.log4j.Level
 import io.ktor.http.HttpStatusCode
 import org.iotsplab.akiba.data.database.DatabaseClient
+import org.iotsplab.akiba.managers.ImportManager
 import org.iotsplab.akiba.managers.ProjectIndex
 import org.iotsplab.akiba.managers.ProjectPrograms
 import org.iotsplab.akiba.managers.WorkspaceManager
@@ -130,6 +131,50 @@ class CliPlanRuntime(
                 }
             }
         }
+    }
+
+    // ---- binaries ------------------------------------------------------
+
+    override fun findBinaries(filter: String): List<BinaryHandle> {
+        // `binaries` lives in the instance database, which the daemon owns — the same
+        // connection modules write their results through.
+        val client = DatabaseClient.global
+            ?: throw PlanException(
+                "the binaries table is not reachable; start the plan with a database connection"
+            )
+        val rows = try {
+            client.queryBinaries(filter)
+        } catch (e: Exception) {
+            throw BinaryQueryException(filter, e)
+        }
+        return rows.map {
+            BinaryHandle(
+                id = (it["id"] as? Number)?.toLong() ?: 0L,
+                path = it["original_path"] as? String ?: "",
+                sizeBytes = (it["size"] as? Number)?.toLong(),
+                checksum = it["checksum"] as? String,
+                arch = it["arch"] as? String,
+                format = it["format"] as? String,
+            )
+        }
+    }
+
+    override fun importBinary(path: String): BinaryHandle {
+        // The store has to exist before a row can name a file inside it.
+        WorkspaceManager.ensureBinDirectories()
+        val file = Path.of(path).let {
+            if (it.isAbsolute) it else Path.of("").toAbsolutePath().resolve(it)
+        }
+        require(Files.isRegularFile(file)) { "no such file: $file" }
+        val id = try {
+            ImportManager.importSingleFile(file)
+        } catch (e: ImportManager.DuplicateChecksumException) {
+            throw BinaryExistsException(
+                path = path,
+                checksum = e.message?.substringAfterLast(':')?.trim() ?: "unknown",
+            )
+        }
+        return findBinaries("id = $id").firstOrNull() ?: BinaryHandle(id, file.toString())
     }
 
     // ---- modules --------------------------------------------------------
