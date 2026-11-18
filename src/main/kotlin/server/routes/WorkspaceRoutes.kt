@@ -11,6 +11,7 @@ import io.ktor.server.response.respond
 import io.ktor.server.response.respondFile
 import io.ktor.server.request.receiveText
 import io.ktor.server.routing.Route
+import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.put
@@ -55,6 +56,22 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
                 )
             }
         call.respond(mapOf("path" to relative(root, target), "entries" to entries, "instance" to instance))
+    }
+
+    delete("/agent/sessions/{id}/workspace/entry") {
+        val (root, _) = sessionWorkspace(call, daemonHost, daemonPort) ?: return@delete
+        val target = WorkspacePaths.resolveInside(root, call.request.queryParameters["path"].orEmpty())
+            ?: return@delete call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Path escapes the workspace"))
+        if (target == root.normalize()) {
+            return@delete call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Refusing to delete the workspace root"))
+        }
+        if (!Files.exists(target)) {
+            return@delete call.respond(HttpStatusCode.NotFound, mapOf("error" to "No such path"))
+        }
+        Files.walk(target).use { stream ->
+            stream.sorted(Comparator.reverseOrder()).forEach { Files.deleteIfExists(it) }
+        }
+        call.respond(mapOf("status" to "ok"))
     }
 
     get("/agent/sessions/{id}/workspace/file") {
