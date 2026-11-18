@@ -116,6 +116,10 @@ abstract class AgentModule(
     override val workspaceOutputIsTimestamped: Boolean
         get() = true
 
+    /** A refused run should say which conversation is holding the module. */
+    override val runOwner: String
+        get() = agentSessionId ?: "agent"
+
     /** The session directory is the workspace the agent lives in. */
     override val workspaceIsScopeRoot: Boolean
         get() = true

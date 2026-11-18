@@ -770,8 +770,26 @@ abstract class AkibaModule (
      * @param timeout The timeout for the process in seconds. If 0, there is no timeout.
      * @throws Exception
      */
+    /**
+     * Who to name when this run is refused because another one holds the target.
+     *
+     * A script says `script`; a conversation says which conversation.
+     */
+    open val runOwner: String
+        get() = "script"
+
+    /** Run at most one of these at a time per target; a second attempt is refused, not queued. */
     @Throws(Exception::class)
     open suspend fun startProcess(timeout: Int = 0) {
+        val lock = ModuleRunLock.acquire(workspaceDir, runOwner)
+        try {
+            startProcessLocked(timeout)
+        } finally {
+            lock.release()
+        }
+    }
+
+    private suspend fun startProcessLocked(timeout: Int) {
         // Record the canonical "start" timestamp into the runtime report, regardless of
         // whether the module owns a database table — the report is an independent mirror,
         // and the time at which startProcess() was entered is meaningful in either case.
