@@ -37,7 +37,7 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
     get("/agent/sessions/{id}/workspace/tree") {
         val session = sessionWorkspace(call, daemonHost, daemonPort) ?: return@get
         val (root, instance) = session
-        val target = resolveInside(root, call.request.queryParameters["path"].orEmpty()) ?: return@get call.respond(
+        val target = WorkspacePaths.resolveInside(root, call.request.queryParameters["path"].orEmpty()) ?: return@get call.respond(
             HttpStatusCode.BadRequest, mapOf("error" to "Path escapes the workspace"))
         if (!Files.exists(target)) {
             return@get call.respond(HttpStatusCode.NotFound, mapOf("error" to "No such directory"))
@@ -59,7 +59,7 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
 
     get("/agent/sessions/{id}/workspace/file") {
         val (root, _) = sessionWorkspace(call, daemonHost, daemonPort) ?: return@get
-        val target = resolveInside(root, call.request.queryParameters["path"].orEmpty())
+        val target = WorkspacePaths.resolveInside(root, call.request.queryParameters["path"].orEmpty())
             ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Path escapes the workspace"))
         if (!Files.isRegularFile(target)) {
             return@get call.respond(HttpStatusCode.NotFound, mapOf("error" to "No such file"))
@@ -86,7 +86,7 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
 
     put("/agent/sessions/{id}/workspace/file") {
         val (root, _) = sessionWorkspace(call, daemonHost, daemonPort) ?: return@put
-        val target = resolveInside(root, call.request.queryParameters["path"].orEmpty())
+        val target = WorkspacePaths.resolveInside(root, call.request.queryParameters["path"].orEmpty())
             ?: return@put call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Path escapes the workspace"))
         val body = call.receiveText()
         Files.createDirectories(target.parent)
@@ -96,7 +96,7 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
 
     post("/agent/sessions/{id}/workspace/upload") {
         val (root, _) = sessionWorkspace(call, daemonHost, daemonPort) ?: return@post
-        val dir = resolveInside(root, call.request.queryParameters["path"].orEmpty())
+        val dir = WorkspacePaths.resolveInside(root, call.request.queryParameters["path"].orEmpty())
             ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Path escapes the workspace"))
         if (!Files.isDirectory(dir)) {
             return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Not a directory"))
@@ -106,7 +106,7 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
             if (part is PartData.FileItem) {
                 val name = part.originalFileName?.substringAfterLast('/')?.substringAfterLast('\\')
                 if (!name.isNullOrBlank()) {
-                    val dest = resolveInside(root, relative(root, dir.resolve(name)))
+                    val dest = WorkspacePaths.resolveInside(root, relative(root, dir.resolve(name)))
                     if (dest != null) {
                         Files.createDirectories(dest.parent)
                         Files.newOutputStream(dest).use { out -> part.provider().toInputStream().copyTo(out) }
@@ -121,7 +121,7 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
 
     get("/agent/sessions/{id}/workspace/download") {
         val (root, _) = sessionWorkspace(call, daemonHost, daemonPort) ?: return@get
-        val target = resolveInside(root, call.request.queryParameters["path"].orEmpty())
+        val target = WorkspacePaths.resolveInside(root, call.request.queryParameters["path"].orEmpty())
             ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Path escapes the workspace"))
         if (!Files.exists(target)) {
             return@get call.respond(HttpStatusCode.NotFound, mapOf("error" to "No such path"))
@@ -165,27 +165,6 @@ private suspend fun sessionWorkspace(
     val root = WorkspacePaths.sessionRoot(ConfigManager.mainConf.workspaceRoot, project, id)
     Files.createDirectories(root)
     return root to instance
-}
-
-/**
- * Turn a request path into a file inside [root], or null if it would leave.
- *
- * `..`, absolute paths and symlinks pointing elsewhere are all refused. The one link that is
- * allowed to leave is `binary`, which points at the program's copy by design.
- */
-private fun resolveInside(root: Path, requested: String): Path? {
-    val clean = requested.trim().removePrefix("/")
-    if (clean.contains('\u0000')) return null
-    if (clean.split('/', '\\').any { it == ".." }) return null
-
-    val candidate = root.resolve(clean).normalize()
-    if (!candidate.startsWith(root)) return null
-    if (Files.exists(candidate)) {
-        val real = runCatching { candidate.toRealPath() }.getOrNull() ?: return null
-        val realRoot = runCatching { root.toRealPath() }.getOrNull() ?: return candidate
-        if (!real.startsWith(realRoot) && candidate.fileName?.toString() != "binary") return null
-    }
-    return candidate
 }
 
 private fun relative(root: Path, target: Path): String =

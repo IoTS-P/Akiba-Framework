@@ -80,4 +80,36 @@ object WorkspacePaths {
         val base = scopeRoot.resolve(sanitizeSegment(moduleClass))
         return if (timestamped) base.resolve(sanitizeSegment(stamp)) else base
     }
+
+    /**
+     * Turn a request path into a file inside [root], or null if it would leave.
+     *
+     * `..`, absolute paths and NUL bytes are refused before anything touches the disk. Existing
+     * paths are re-checked after resolving symlinks, because a link inside the tree may point out
+     * of it. The single allowed exception is a file named `binary`, which by design points at the
+     * program's copy rather than the conversation's own files.
+     */
+    fun resolveInside(root: Path, requested: String): Path? {
+        val clean = requested.trim().removePrefix("/")
+        if (clean.contains('\u0000')) return null
+        if (clean.split('/', '\\').any { it == ".." }) return null
+
+        val base = root.normalize()
+        val candidate = base.resolve(clean).normalize()
+        if (!candidate.startsWith(base)) return null
+
+        // A path that does not exist yet is judged by its nearest existing ancestor: a missing
+        // file under `binary/` would otherwise be created on the far side of the link.
+        var probe: Path? = candidate
+        while (probe != null && !java.nio.file.Files.exists(probe)) probe = probe.parent
+        val existing = probe ?: return null
+
+        val real = runCatching { existing.toRealPath() }.getOrNull() ?: return null
+        val realRoot = runCatching { base.toRealPath() }.getOrNull() ?: return null
+        if (real.startsWith(realRoot)) return candidate
+
+        // The one permitted exception: the link to the program's binary, asked for by name.
+        val allowed = existing == candidate && candidate.fileName?.toString() == "binary"
+        return if (allowed) candidate else null
+    }
 }
