@@ -206,7 +206,7 @@ data class UserChoiceBtwRequest(
 )
 
 /** Map a manager snapshot to its wire DTO. */
-private fun org.iotsplab.akiba.llm.tool.ui.PendingChoiceSnapshot.toDto() = PendingUserChoiceDto(
+internal fun org.iotsplab.akiba.llm.tool.ui.PendingChoiceSnapshot.toDto() = PendingUserChoiceDto(
     requestId = choice.requestId,
     question = choice.question,
     options = choice.options,
@@ -307,7 +307,7 @@ data class StreamChunkPayload(
 )
 
 /** Sessions whose last turn the user stopped, so /chat answers calmly. */
-private object ChatCancellations {
+internal object ChatCancellations {
     private val cancelled = ConcurrentHashMap.newKeySet<String>()
 
     /** A new turn is starting — drop any stale marker. */
@@ -326,7 +326,7 @@ private object ChatCancellations {
 /** Stream-bus error label used when a chat turn is cancelled by the user.
  *  The frontend recognises this prefix to render a calm "cancelled"
  *  marker instead of a scary interruption error. */
-private const val USER_CANCELLED_STREAM_ERROR = "cancelled by user"
+internal const val USER_CANCELLED_STREAM_ERROR = "cancelled by user"
 
 /**
  * A manual-agent worker JVM failed (non-zero exit / timeout).  Kept
@@ -334,13 +334,13 @@ private const val USER_CANCELLED_STREAM_ERROR = "cancelled by user"
  * problems) so the /chat handler does not prefix a worker crash with
  * the misleading "Agent is not configured" label.
  */
-private class ManualAgentWorkerException(message: String) : Exception(message)
+internal class ManualAgentWorkerException(message: String) : Exception(message)
 
-private val agentRouteLogger = LogManager.getLogger("AgentRoutes")
-private val agentRouteMapper = AkibaJson.mapper
-private const val MANUAL_AGENT_TIMEOUT_MINUTES: Long = 10
-private const val AGENT_MESSAGES_PAGE_SIZE = 500
-private const val AGENT_MESSAGES_MAX_RETURN = 20_000
+internal val agentRouteLogger = LogManager.getLogger("AgentRoutes")
+internal val agentRouteMapper = AkibaJson.mapper
+internal const val MANUAL_AGENT_TIMEOUT_MINUTES: Long = 10
+internal const val AGENT_MESSAGES_PAGE_SIZE = 500
+internal const val AGENT_MESSAGES_MAX_RETURN = 20_000
 
 /**
  * Fetch a complete session transcript from the daemon despite the daemon's
@@ -351,7 +351,7 @@ private const val AGENT_MESSAGES_MAX_RETURN = 20_000
  * cycles unselectable or make a selected wake appear to have missing messages
  * once a long multi-wake agent session grows beyond 500 rows.
  */
-private fun fetchAllAgentMessages(
+internal fun fetchAllAgentMessages(
     agentDbClient: AgentDatabaseClient,
     sessionId: String,
     fromIndex: Int = 0,
@@ -381,7 +381,7 @@ data class ChatResponse(
     val tokenUsage: Map<String, Int>?
 )
 
-private val DEFAULT_AGENT_SYSTEM_PROMPT: String = """
+internal val DEFAULT_AGENT_SYSTEM_PROMPT: String = """
     ${AgentPrompts.DEFAULT_SYSTEM_PROMPT}
 
     <interactive_session>
@@ -392,1574 +392,20 @@ private val DEFAULT_AGENT_SYSTEM_PROMPT: String = """
     </interactive_session>
 """.trimIndent()
 
-private fun withCommonAgentRules(prompt: String): String =
+internal fun withCommonAgentRules(prompt: String): String =
     if (prompt.contains("<tools_usage_policy>")) prompt else "$prompt\n\n${AgentPrompts.DEFAULT_AGENT_RULES}"
 
 // ============================================================
 //  Routes
 // ============================================================
 
-fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
-
-    // ------ Internal: force-close all live LLM clients -----------------------
-    //
-    // Each AkibaAgent's LLM client keeps a `java.net.http.HttpClient`
-    // connection pool alive for **1200 seconds**; when sessions accumulate,
-    // the provider's per-IP connection budget is exhausted and it deliberately
-    // slows responses, which the frontend sees as a 20-30 minute "hang".
-    // `LLMClientFactory`'s shutdown hook only closes them on graceful
-    // shutdown, so this endpoint lets an operator release the slots before a
-    // rolling restart.
-    //
-    // It is *internal* (`/agent/internal/`) but still bound to the public
-    // listener, so it requires the same instance header as every agent route.
-    post("/agent/internal/llm/close-all") {
-        val instance = call.requireInstanceHeader() ?: return@post
-        if (instance.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance header"))
-            return@post
-        }
-        val liveBefore = org.iotsplab.akiba.llm.client.LLMClientFactory.liveClientCount()
-        val closed = org.iotsplab.akiba.llm.client.LLMClientFactory.closeAllLiveClients(
-            reason = "manual close-all via /agent/internal/llm/close-all (instance=$instance)"
-        )
-        call.respond(mapOf(
-            "status" to "ok",
-            "liveClientsBefore" to liveBefore,
-            "closed" to closed,
-        ))
-    }
-
-    // ------ Internal: receive a live LLM streaming chunk from a worker ----
-    //
-    // Callers (manual-agent worker JVMs and the in-process runtime) POST every
-    // chunk, which is kept in [StreamChunkBus]'s per-session history and
-    // drained by `GET /agent/sessions/{id}/stream-chunks` for a per-token live
-    // view.  No DB write happens here — the worker persists the final message.
-    // The endpoint is on the public listener but requires the instance header,
-    // and chunks are small so the bus is not easily flooded.
-    post("/agent/internal/stream-chunk") {
-        val instance = call.requireInstanceHeader() ?: return@post
-        if (instance.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance header"))
-            return@post
-        }
-        val req = try {
-            call.receive<StreamChunkRequest>()
-        } catch (e: Exception) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid chunk payload: ${e.message}"))
-            return@post
-        }
-        if (req.sessionId.isBlank() && req.chunks.isEmpty()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "sessionId is required"))
-            return@post
-        }
-        // A batch keeps a whole burst to one round-trip; the flat fields stay
-        // supported for single-chunk callers (curl probes, older workers).
-        val batch = if (req.chunks.isEmpty()) {
-            listOf(
-                StreamChunkPayload(
-                    delta = req.delta,
-                    chunkCount = req.chunkCount,
-                    byteCount = req.byteCount,
-                    done = req.done,
-                    error = req.error,
-                    newGeneration = req.newGeneration,
-                    kind = req.kind,
-                )
-            )
-        } else {
-            req.chunks
-        }
-        for (payload in batch) {
-            org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.publish(
-                org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.Chunk(
-                    sessionId = payload.sessionId.takeIf { it.isNotBlank() } ?: req.sessionId,
-                    delta = payload.delta,
-                    chunkCount = payload.chunkCount,
-                    byteCount = payload.byteCount,
-                    done = payload.done,
-                    error = payload.error,
-                    newGeneration = payload.newGeneration,
-                    kind = payload.kind,
-                )
-            )
-        }
-        call.respond(mapOf("status" to "ok", "accepted" to batch.size))
-    }
-
-    // A resident worker asks for its next turn here and reports the outcome after.
-    workerTurnRoutes()
-
-    // ------ Incremental poll: live LLM streaming chunks for a session ------
-    //
-    // The frontend polls this endpoint (~1 s cadence) while a session
-    // is selected and renders the returned deltas with a typewriter
-    // animation, giving true per-token "natural growth" over a plain
-    // JSON GET — a transport that survives every proxy (an earlier
-    // SSE transport died at the outer reverse proxy, which kills
-    // `text/event-stream` connections after the first flush).
-    //
-    // Request:  GET /agent/sessions/{id}/stream-chunks?since=SEQ
-    // Response: { active, generation, latestSeq, latestCount, done, error,
-    //             chunks: [{ seq, delta, chunkCount, byteCount, done, error }] }
-    //
-    // `since` is the last `seq` the client applied.  The bus assigns `seq`
-    // itself and never restarts it at a generation boundary, so resuming from
-    // the client's own cursor can never filter out a new generation's first
-    // chunks.  `generation` still bumps when a new LLM generation starts — the
-    // client discards accumulated text then, but keeps its cursor.
-    get("/agent/sessions/{id}/stream-chunks") {
-        val instance = call.request.header("X-Akiba-Instance")
-            ?.takeIf { it.isNotBlank() }
-            ?: call.request.queryParameters["instance"]?.takeIf { it.isNotBlank() }
-        if (instance == null) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance"))
-            return@get
-        }
-        val sessionId = call.parameters["id"].orEmpty()
-        if (sessionId.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@get
-        }
-        val since = call.request.queryParameters["since"]?.toLongOrNull()?.coerceAtLeast(0L) ?: 0L
-        val snap = org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.historySince(sessionId, since)
-        if (snap == null) {
-            call.respond(mapOf(
-                "active" to false,
-                "generation" to 0,
-                "latestSeq" to 0L,
-                "latestCount" to 0,
-                "done" to false,
-                "chunks" to emptyList<Any>(),
-            ))
-            return@get
-        }
-        call.respond(mapOf(
-            "active" to true,
-            "generation" to snap.generation,
-            "latestSeq" to snap.latestSeq,
-            "latestCount" to snap.latestCount,
-            "done" to snap.done,
-            "error" to snap.error,
-            "chunks" to snap.chunks.map { c ->
-                mapOf(
-                    "seq" to c.seq,
-                    "delta" to c.delta,
-                    "kind" to c.kind,
-                    "chunkCount" to c.chunkCount,
-                    "byteCount" to c.byteCount,
-                    "done" to c.done,
-                    "error" to c.error,
-                )
-            },
-        ))
-    }
-
-    // ------ Internal: report how many LLM clients are currently open -------
-    get("/agent/internal/llm/live-count") {
-        val instance = call.requireInstanceHeader() ?: return@get
-        if (instance.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance header"))
-            return@get
-        }
-        call.respond(mapOf(
-            "liveClients" to org.iotsplab.akiba.llm.client.LLMClientFactory.liveClientCount()
-        ))
-    }
-
-    // ------ Stop the tool a session is running -------------------------------
-    //
-    // A tool call can be long on purpose (a build, an emulator, a sweep). The user may want
-    // it to stop without ending the whole turn, so this asks the running call to stop and
-    // the agent gets an observation saying the work was cut short.
-    post("/agent/sessions/{sessionId}/tool/interrupt") {
-        val sessionId = call.parameters["sessionId"] ?: return@post call.respond(
-            HttpStatusCode.BadRequest, mapOf("error" to "sessionId is required")
-        )
-        // In the server the call is local; in a worker the press is parked for it to collect.
-        val local = ToolRunner.interrupt(sessionId)
-        ToolInterrupts.request(sessionId)
-        call.respond(mapOf("interrupted" to true, "runningHere" to local))
-    }
-
-    // ------ Internal: was this session's tool asked to stop? (worker → server) ---
-    get("/agent/internal/tool/interrupt") {
-        val sessionId = call.request.queryParameters["sessionId"]
-            ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "sessionId is required"))
-        call.respond(mapOf("interrupted" to ToolInterrupts.consume(sessionId)))
-    }
-
-    // ------ Internal: tool confirmation request (cross-process long-poll) ---
-    //
-    // Called by worker processes when a tool (e.g. run_shell) requires
-    // user confirmation. The worker makes an HTTP POST to this endpoint
-    // and blocks until the user responds (or the 5-minute timeout
-    // expires). The server registers the pending request in
-    // [ConfirmationManager] (visible to the frontend via
-    // `GET /agent/sessions/{id}`), then suspends until
-    // `POST /agent/sessions/{id}/confirmation/respond` arrives.
-    post("/agent/internal/confirmation/request") {
-        val req = call.receive<InternalConfirmationRequest>()
-        val approved = ConfirmationManager.requestConfirmation(
-            sessionId = req.sessionId,
-            toolName = req.toolName,
-            command = req.command,
-            workingDirectory = req.workingDirectory,
-            timeout = req.timeout,
-            action = req.action,
-            targetPath = req.targetPath
-        )
-        call.respond(mapOf("approved" to approved))
-    }
-
-    // ------ Internal: user-choice request (cross-process long-poll) ---------
-    //
-    // Called by worker processes when `ask_user_choice` needs the user to
-    // pick an option. Same long-poll pattern as the confirmation endpoint:
-    // the worker blocks on the HTTP response until the user answers, the
-    // inactivity timeout expires, or a BTW question arrives.
-    post("/agent/internal/user-choice/request") {
-        val req = call.receive<InternalUserChoiceRequest>()
-        val entry = UserChoiceManager.register(
-            sessionId = req.sessionId,
-            question = req.question,
-            options = req.options,
-            allowCustomInput = req.allowCustomInput
-        )
-        if (entry == null) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@post
-        }
-        // Worker re-entering the long-poll after answering a BTW question
-        // locally — deliver that answer first, then keep waiting.
-        if (req.btwId != null && req.btwAnswer != null) {
-            UserChoiceManager.completeBtw(req.sessionId, req.btwId, req.btwAnswer)
-        }
-        when (val ev = UserChoiceManager.awaitEvent(entry)) {
-            is org.iotsplab.akiba.llm.tool.ui.UserChoiceEvent.Resolved ->
-                call.respond(mapOf(
-                    "status" to if (ev.answer != null) "answered" else "cancelled",
-                    "choice" to ev.answer
-                ))
-            org.iotsplab.akiba.llm.tool.ui.UserChoiceEvent.TimedOut ->
-                call.respond(mapOf("status" to "timeout", "choice" to null))
-            is org.iotsplab.akiba.llm.tool.ui.UserChoiceEvent.Btw ->
-                call.respond(mapOf(
-                    "status" to "btw",
-                    "btwId" to ev.exchange.btwId,
-                    "btwQuestion" to ev.exchange.question
-                ))
-        }
-    }
-
-    // ------ List sessions -----------------------------------------------------
-    get("/agent/sessions") {
-        val instance = call.requireInstanceHeader() ?: return@get
-        val limit = call.parameters["limit"]?.toIntOrNull() ?: 50
-        val offset = call.parameters["offset"]?.toIntOrNull() ?: 0
-        val status = call.parameters["status"]?.takeIf { it.isNotBlank() }
-        val binaryId = call.parameters["binaryId"]?.toIntOrNull()
-        val moduleName = call.parameters["moduleName"]?.takeIf { it.isNotBlank() }
-        // Default behaviour: only top-level (non-sub-agent) sessions.
-        // Pass `parentSessionId=ALL` to see every session.
-        // Pass a UUID to filter to direct children of that parent.
-        val parentSessionId = call.parameters["parentSessionId"]?.takeIf { it.isNotBlank() }
-        try {
-            val sessions = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-                agentDbClient.listSessions(
-                    status = status,
-                    binaryId = binaryId,
-                    moduleName = moduleName,
-                    limit = limit,
-                    offset = offset,
-                    parentSessionId = parentSessionId
-                )
-            }
-            call.respond(mapOf("sessions" to sessions
-                .filter { it.sessionId != SYSTEM_SESSION_UUID }
-                .map { it.toResponse() }))
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    // ------ Search sessions by title / message content -------------------------
-    // Returns matching TOP-LEVEL sessions (a sub-agent hit is reported as
-    // its root session).  Used by the Agent view's search box.
-    get("/agent/sessions/search") {
-        val instance = call.requireInstanceHeader() ?: return@get
-        val query = call.parameters["q"]?.trim().orEmpty()
-        if (query.length < 2) {
-            call.respond(HttpStatusCode.BadRequest, mapOf(
-                "error" to "Query too short (min 2 characters)"))
-            return@get
-        }
-        val limit = call.parameters["limit"]?.toIntOrNull()?.coerceIn(1, 200) ?: 50
-        try {
-            val sessions = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                AgentDatabaseClient(dbClient).searchSessions(query, limit)
-            }
-            call.respond(mapOf("sessions" to sessions
-                .filter { it.sessionId != SYSTEM_SESSION_UUID }
-                .map { it.toResponse() }))
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    // ------ Get direct children of a session ----------------------------------
-    get("/agent/sessions/{id}/children") {
-        val instance = call.requireInstanceHeader() ?: return@get
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@get
-        }
-        try {
-            val children = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                AgentDatabaseClient(dbClient).getSessionChildren(id)
-            }
-            call.respond(mapOf("children" to children
-                .filter { it.sessionId != SYSTEM_SESSION_UUID }
-                .map { it.toResponse() }))
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    // ------ Get a single session by id ---------------------------------------
-    //
-    // Lightweight endpoint used by the frontend to poll the active
-    // session's status without re-downloading the full session list.
-    // The poll is what keeps the status pill in the chat header and
-    // the status badge in the session list in sync with the DB after
-    // the agent transitions to STANDBY (the chat endpoint is the
-    // only thing that flips the state, and it can happen long after
-    // the original `listSessions` returned).
-    get("/agent/sessions/{id}") {
-        val instance = call.requireInstanceHeader() ?: return@get
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@get
-        }
-        try {
-            val info = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                AgentDatabaseClient(dbClient).getSession(id)
-            }
-            // Attach any pending human-confirmation request from the
-            // in-process ConfirmationManager so the frontend can detect
-            // it via the existing status poll without a separate endpoint.
-            val pendingConf = ConfirmationManager.getPending(id)?.let { pc ->
-                PendingConfirmationDto(
-                    requestId = pc.requestId,
-                    toolName = pc.toolName,
-                    command = pc.command,
-                    workingDirectory = pc.workingDirectory,
-                    timeout = pc.timeout,
-                    action = pc.action,
-                    targetPath = pc.targetPath,
-                    createdAt = pc.createdAt
-                )
-            }
-            val pendingChoice = UserChoiceManager.getPending(id)?.toDto()
-            call.respond(info.toResponse(pendingConf, pendingChoice))
-        } catch (e: DatabaseClient.DatabaseDaemonException) {
-            // 404 from the daemon (session not found) — surface as 404
-            if (e.statusCode == HttpStatusCode.NotFound) {
-                call.respond(HttpStatusCode.NotFound, mapOf("error" to "Session not found"))
-            } else {
-                val (status, body) = errorPayload(e)
-                call.respond(status, body)
-            }
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    // ------ List ALL pending confirmations (cross-session) -------------------
-    //
-    // Returns every pending confirmation in the JVM, keyed by sessionId.
-    // The per-session poll only covers the session the user is viewing;
-    // this global view lets the frontend surface a modal even when a
-    // sub-agent is the one blocked on confirmation.
-    get("/agent/pending-confirmations") {
-        val instance = call.requireInstanceHeader() ?: return@get
-        if (instance.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance header"))
-            return@get
-        }
-        val all = ConfirmationManager.getAllPending()
-        call.respond(mapOf(
-            "pending" to all.mapValues { (_, pc) ->
-                PendingConfirmationDto(
-                    requestId = pc.requestId,
-                    toolName = pc.toolName,
-                    command = pc.command,
-                    workingDirectory = pc.workingDirectory,
-                    timeout = pc.timeout,
-                    action = pc.action,
-                    targetPath = pc.targetPath,
-                    createdAt = pc.createdAt
-                )
-            }
-        ))
-    }
-
-    // ------ List ALL pending user choices (cross-session) -------------------
-    //
-    // Same rationale as `/agent/pending-confirmations`: a sub-agent may be
-    // the one blocked on `ask_user_choice` while the user is viewing the
-    // root session — surface every pending choice JVM-wide so the frontend
-    // can show the modal regardless of the currently open session.
-    get("/agent/pending-user-choices") {
-        val instance = call.requireInstanceHeader() ?: return@get
-        if (instance.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance header"))
-            return@get
-        }
-        val all = UserChoiceManager.getAllPending()
-        call.respond(mapOf(
-            "pending" to all.mapValues { (_, snap) -> snap.toDto() }
-        ))
-    }
-
-    // ------ Create session ----------------------------------------------------
-    post("/agent/sessions") {
-        val instance = call.requireInstanceHeader() ?: return@post
-        val req = runCatching { call.receive<CreateAgentSessionRequest>() }
-            .getOrDefault(CreateAgentSessionRequest())
-        val projectDirectory = call.currentUserProjectDirectory()
-        // The index is keyed by absolute path and the Projects routes resolve the
-        // same root, so both sides must name the project the same way.
-        val indexRoot = call.currentUserGhidraProjectsRoot()
-        try {
-            val info = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-
-                // Determine the project name and whether to create a project.
-                //
-                // Path A: binaryId is provided → legacy flow, import the binary
-                //         into a (possibly new) project on the first chat turn.
-                // Path B: projectName + programName (no binaryId) → open an
-                //         existing project and use that program; no import.
-                val resolvedProjectName: String?
-                val createNewProject: Boolean
-
-                if (req.binaryId != null) {
-                    val name = req.projectName?.takeIf { it.isNotBlank() }
-                        ?: "agent-${req.binaryId}-${System.currentTimeMillis()}"
-                    resolvedProjectName = name
-                    createNewProject = req.projectMode != "existing"
-                    WorkspaceManager.openOrCreateInteractiveProject(name, createNewProject, projectDirectory)
-                    // Only create/validate here. Holding the project would lock the
-                    // worker out of the very project this session is about to use.
-                    WorkspaceManager.releaseActiveProject()
-                    // Closed again, so its tree can be read and indexed for the browser.
-                    ProjectIndex.refresh(name, indexRoot)
-                } else if (req.projectName != null && req.projectName.isNotBlank()) {
-                    resolvedProjectName = req.projectName
-                    createNewProject = req.projectMode == "new"
-                    // Open the existing project so the first chat turn can
-                    // access the requested program.
-                    WorkspaceManager.openOrCreateInteractiveProject(
-                        req.projectName, createNewProject, projectDirectory
-                    )
-                    WorkspaceManager.releaseActiveProject()
-                    ProjectIndex.refresh(req.projectName, indexRoot)
-                } else {
-                    resolvedProjectName = null
-                    createNewProject = false
-                }
-
-                val sessionId = agentDbClient.createSession(
-                    sessionName = req.sessionName ?: "Chat ${System.currentTimeMillis()}",
-                    binaryId = req.binaryId,
-                    moduleName = "chat",
-                    modelName = req.modelName,
-                    projectName = resolvedProjectName,
-                    parentSessionId = req.parentSessionId
-                )
-                // Chat sessions use a "one question → one subprocess" model.
-                // There is no agent process running between user messages, so
-                // the session starts in the "closed" (idle) state.  The
-                // /chat endpoint flips it to "running" for the duration of
-                // a single manual turn, then back to "closed" when done.
-                agentDbClient.updateSession(sessionId, status = "closed")
-                runCatching {
-                    agentDbClient.setRuntimeState(
-                        sessionId,
-                        org.iotsplab.akiba.llm.agent.runtime.RuntimeState.CLOSED.wire(),
-                        "session_created_idle",
-                    )
-                }
-                agentDbClient.getSession(sessionId)
-            }
-            call.respond(HttpStatusCode.Created, info.toResponse())
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    // ------ Get session messages ---------------------------------------------
-    get("/agent/sessions/{id}/messages") {
-        val instance = call.requireInstanceHeader() ?: return@get
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@get
-        }
-        val fromIndex = call.request.queryParameters["fromIndex"]?.toIntOrNull() ?: 0
-        val limitParam = call.request.queryParameters["limit"]?.toIntOrNull()
-
-        try {
-            val (sessionInfo, msgs) = withDaemonSession(
-                daemonHost, daemonPort, instance, serialize = false
-            ) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-                val info = agentDbClient.getSession(id)
-                val messages = if (limitParam != null) {
-                    // Preserve explicit pagination callers, but still obey the
-                    // daemon-side page cap by asking for at most one page.
-                    agentDbClient.getMessages(id, fromIndex, limitParam)
-                } else {
-                    // Frontend default path: return the full transcript so wake
-                    // selectors can segment all wake cycles, not just the first
-                    // daemon page (500 rows).
-                    fetchAllAgentMessages(agentDbClient, id, fromIndex)
-                }
-                info to messages
-            }
-            // Filter out system messages (compaction summaries etc.)
-            // BUT keep LLM retry-status notices so the frontend can show
-            // "LLM timed out, retry #N in X minutes" during outages,
-            // AND keep LLM in-flight progress heartbeats so the frontend
-            // can render "agent still working on LLM (Ns elapsed)" during
-            // long-form generations.
-            val filtered = msgs.filter { m ->
-                if (m.role != "system") return@filter true
-                val c = m.content ?: ""
-                c.startsWith(LLM_RETRY_STATUS_PREFIX) || c.startsWith(LLM_PROGRESS_PREFIX)
-            }
-            // Compute cumulative token usage from the messages we already
-            // fetched (avoid a second round-trip to the daemon).
-            // Compaction rebuilds persist kept messages as new rows with
-            // their original token counts, so collapse exact duplicate
-            // assistant rows before summing — otherwise a session that
-            // went through many compactions reports inflated usage.
-            var totalInput = 0L
-            var totalOutput = 0L
-            val seenAssistant = HashSet<String>()
-            for (m in filtered) {
-                if (m.role != "assistant") continue
-                val key = "in:${m.inputTokenCount}:out:${m.tokenCount}:len:${m.content?.length}:${m.content}"
-                if (!seenAssistant.add(key)) continue
-                totalInput += m.inputTokenCount ?: 0
-                totalOutput += m.tokenCount ?: 0
-            }
-            // Find the last input token count (from the most recent LLM call)
-            val lastInputTokens = filtered.lastOrNull { it.role == "assistant" }?.inputTokenCount
-            // Configured per-model window wins over the static table.
-            val contextLength = sessionInfo.modelName?.let { name ->
-                ModelContextWindows.resolve(
-                    name,
-                    LLMKeyFileStore.configuredContextLength(name)
-                ).contextLength
-            }
-            call.respond(mapOf(
-                "messages" to filtered.map { it.toMessageResponse() },
-                "totalInputTokens" to totalInput,
-                "totalOutputTokens" to totalOutput,
-                "lastInputTokens" to lastInputTokens,
-                "contextLength" to contextLength
-            ))
-        } catch (e: DatabaseClient.DatabaseDaemonException) {
-            if (e.statusCode == HttpStatusCode.NotFound) {
-                call.respond(HttpStatusCode.NotFound, mapOf("error" to "Session not found"))
-            } else {
-                val (status, body) = errorPayload(e)
-                call.respond(status, body)
-            }
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    // ------ List conversations (mailbox) for a session -----------------------
-    // Returns a JSON array of conversations the session is a
-    // participant in, derived from mailbox messages.  Each entry
-    // has conversationId, status, messageCount, unhandledCount,
-    // lastMessagePreview, participants, etc.  Used by the frontend's
-    // right-side conversation panel.
-    //
-    // The summary derivation lives in
-    // [org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxService.listConversations]
-    // so the LLM `query_conversations` tool and this HTTP route
-    // always return the same data.
-    get("/agent/sessions/{id}/conversations") {
-        val instance = call.requireInstanceHeader() ?: return@get
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@get
-        }
-        val statusFilter = (call.parameters["status"] ?: "all").lowercase()
-        try {
-            val summaries = withDaemonSession(
-                daemonHost, daemonPort, instance, serialize = false
-            ) { dbClient ->
-                AgentMailboxService(AgentDatabaseClient(dbClient))
-                    .listConversations(id, statusFilter = statusFilter, limit = 50)
-            }
-            call.respond(mapOf(
-                "sessionId" to id,
-                "totalConversations" to summaries.size,
-                "returned" to summaries.size,
-                "conversations" to summaries.map { s ->
-                    mapOf(
-                        "conversationId" to s.conversationId,
-                        "status" to s.status,
-                        "participants" to s.participants,
-                        "messageCount" to s.messageCount,
-                        "unhandledCount" to s.unhandledCount,
-                        "lastMessagePreview" to s.lastMessagePreview,
-                        "lastMessageKind" to s.lastMessageKind,
-                        "lastMessageAt" to s.lastMessageAt,
-                        "lastMessageSubject" to s.lastMessageSubject,
-                    )
-                },
-            ))
-        } catch (e: DatabaseClient.DatabaseDaemonException) {
-            if (e.statusCode == HttpStatusCode.NotFound) {
-                call.respond(HttpStatusCode.NotFound, mapOf("error" to "Session not found"))
-            } else {
-                val (status, body) = errorPayload(e)
-                call.respond(status, body)
-            }
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    // ------ Get full message history of a conversation -----------------------
-    // Returns all mailbox messages belonging to conversation
-    // convId, with full body, sender/recipient, kind, priority,
-    // timestamps, and ack status.  Used by the frontend when the
-    // user expands a conversation in the side panel.
-    //
-    // The chain-walking / participation filter lives in
-    // [org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxService.getConversationMessages]
-    // so the LLM `query_conversation` tool and this HTTP route
-    // always return the same data.
-    get("/agent/sessions/{id}/conversations/{convId}") {
-        val instance = call.requireInstanceHeader() ?: return@get
-        val id = call.parameters["id"].orEmpty()
-        val convIdStr = call.parameters["convId"].orEmpty()
-        if (id.isBlank() || convIdStr.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id or conversation id"))
-            return@get
-        }
-        val convId = convIdStr.toLongOrNull()
-            ?: run {
-                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "conversationId must be numeric"))
-                return@get
-            }
-        try {
-            val messages = withDaemonSession(
-                daemonHost, daemonPort, instance, serialize = false
-            ) { dbClient ->
-                AgentMailboxService(AgentDatabaseClient(dbClient))
-                    .getConversationMessages(id, convId)
-            }
-            call.respond(mapOf(
-                "conversationId" to convId,
-                "messageCount" to messages.size,
-                "messages" to messages.map { m ->
-                    mapOf(
-                        "messageId" to m.messageId,
-                        "senderSessionId" to m.senderSessionId,
-                        "recipientSessionId" to m.recipientSessionId,
-                        "kind" to m.kind,
-                        "subject" to m.subject,
-                        "body" to m.body,
-                        "priority" to m.priority,
-                        "acked" to (m.ackedAt != null),
-                        "createdAt" to m.createdAt,
-                    )
-                },
-            ))
-        } catch (e: DatabaseClient.DatabaseDaemonException) {
-            if (e.statusCode == HttpStatusCode.NotFound) {
-                call.respond(HttpStatusCode.NotFound, mapOf("error" to "Session not found"))
-            } else {
-                val (status, body) = errorPayload(e)
-                call.respond(status, body)
-            }
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    // ------ Send a chat turn --------------------------------------------------
-    post("/agent/sessions/{id}/chat") {
-        val instance = call.requireInstanceHeader() ?: return@post
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@post
-        }
-        val req = call.receive<ChatRequest>()
-        if (req.content.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Message content is empty"))
-            return@post
-        }
-
-        val systemPrompt = withCommonAgentRules(
-            req.systemPrompt?.takeIf { it.isNotBlank() } ?: DEFAULT_AGENT_SYSTEM_PROMPT
-        )
-        // The worker opens the project from its config, so it has to be told the same
-        // root the server uses. currentUserProjectDirectory() is empty here, which made
-        // the worker create an empty project in the server's working directory.
-        val projectDirectory = call.currentUserGhidraProjectsRoot()
-        // Resolved here, not inside the finally block: the index is keyed by
-        // this root and the call object must not be touched once responding.
-        val indexRoot = call.currentUserGhidraProjectsRoot()
-        val serverPort = call.request.local.serverPort
-
-        // Validate a requested model switch against the configured LLM
-        // keys (whitelist) BEFORE touching any session state — an
-        // unknown model is a client error, not a session failure.
-        val requestedModel = req.modelName?.trim()?.takeIf { it.isNotEmpty() }
-        if (requestedModel != null) {
-            val known = LLMKeyFileStore.load().any { entry ->
-                entry.modelNames.any { it.equals(requestedModel, ignoreCase = true) }
-            }
-            if (!known) {
-                call.respond(HttpStatusCode.BadRequest, mapOf(
-                    "error" to "No LLM key configured for model '$requestedModel'"
-                ))
-                return@post
-            }
-        }
-
-        try {
-            val sessionInfo = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-                var info = agentDbClient.getSession(id)
-                // Manual model switch: the chat-page picker follows the
-                // session's stored model; when the user deliberately
-                // picks a different one, persist it BEFORE launching the
-                // worker so this and all later turns use the new model.
-                if (requestedModel != null && !requestedModel.equals(info.modelName, ignoreCase = true)) {
-                    agentDbClient.updateSession(id, modelName = requestedModel)
-                    info = info.copy(modelName = requestedModel)
-                }
-                agentDbClient.updateSession(id, status = "running")
-                agentDbClient.setRuntimeState(
-                    id,
-                    org.iotsplab.akiba.llm.agent.runtime.RuntimeState.RUNNING.wire(),
-                    "manual_chat_start"
-                )
-                info
-            }
-
-            // For project-based sessions (no binaryId), locate the
-            // program in the project so the manual agent worker can
-            // open it.  FAIL FAST when the project has no program at
-            // all: the worker cannot run any analysis tool without one.
-            var programName: String? = null
-            if (sessionInfo.binaryId == null && sessionInfo.projectName != null) {
-                val project = sessionInfo.projectName
-                val root = call.currentUserGhidraProjectsRoot()
-                val boundId = sessionInfo.currentProgramId
-                val bound = sessionInfo.currentProgram?.takeIf { it.isNotBlank() }
-                if (boundId != null) {
-                    // Identity first: the name can be stale after a rename. The index is
-                    // written whenever a project is opened — by the worker that holds it —
-                    // so a resident worker's project is covered as long as it refreshes.
-                    val resolved = ProjectIndex.pathOfProgram(project, root, boundId)
-                        ?: bound?.let { name ->
-                            ProjectIndex.entries(project, root).firstOrNull { it.name == name }?.path
-                        }
-                    programName = when {
-                        resolved != null -> resolved
-                        // No index entry: the name the session already knows is still what
-                        // the worker opens by. It reports back if the file is really gone.
-                        bound != null -> {
-                            agentRouteLogger.info(
-                                "program {} ({}) is not in the index for {}; using the name",
-                                bound, boundId, project)
-                            bound
-                        }
-                        else -> {
-                            markManualChatFailed(daemonHost, daemonPort, instance, id, "program deleted")
-                            call.respond(HttpStatusCode.Conflict, mapOf(
-                                "error" to "The program this conversation was using no longer exists. " +
-                                    "Pick another program in the header and send again."
-                            ))
-                            return@post
-                        }
-                    }
-                } else if (bound != null) {
-                    programName = bound
-                } else {
-                    // No implicit "first program" any more: a conversation works
-                    // on the program the operator picked. An empty project is the
-                    // one case where a turn may run without one, because the agent
-                    // has to be able to tell the user what to do next.
-                    val hasAnyProgram = findFirstProgramName(project, root) != null
-                    if (hasAnyProgram) {
-                        markManualChatFailed(daemonHost, daemonPort, instance, id, "no program selected")
-                        call.respond(HttpStatusCode.BadRequest, mapOf(
-                            "error" to "This conversation has no program selected. " +
-                                "Pick one in the header (Program selector) and send again."
-                        ))
-                        return@post
-                    }
-                }
-            }
-            // With an empty project the turn still runs, but the agent must know
-            // there is nothing to inspect instead of reporting empty results.
-            val noProgramNotice = if (programName == null &&
-                sessionInfo.binaryId == null && sessionInfo.projectName != null
-            ) {
-                "\n\nNo program is loaded in this project, so no binary can be inspected. " +
-                    "Tell the user to import a binary into the project (Projects page → Details → Import) " +
-                    "and to select it in the header before asking for analysis."
-            } else ""
-            // Make sure the program has an identity before the worker takes the
-            // project: this is the only moment a conversation can create one,
-            // and the UI needs it while the turn is still running.
-            programName?.let { program ->
-                val programId = withContext(Dispatchers.IO) {
-                    runCatching {
-                        ProjectPrograms.ensureProgramIdentity(sessionInfo.projectName!!, indexRoot, program)
-                    }.getOrNull()
-                }
-                if (programId != null) {
-                    // Bind the session to what this turn actually opens; the
-                    // daemon accumulates it into program_ids.
-                    runCatching {
-                        withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                            AgentDatabaseClient(dbClient).updateSession(
-                                id,
-                                programName = program,
-                                programId = programId,
-                            )
-                        }
-                    }
-                }
-            }
-
-            val workerConfig = createManualAgentConfig(
-                sessionInfo = sessionInfo,
-                instanceName = instance,
-                daemonHost = daemonHost,
-                daemonPort = daemonPort,
-                projectDirectory = projectDirectory
-            )
-
-            var workerError: String? = null
-            try {
-                // A session without a project still gets a worker of its own; the key only
-                // has to be unique, and nothing else shares that project.
-                val lockedProject = sessionInfo.projectName?.takeIf { it.isNotBlank() }
-                    ?: "session:$id"
-                // The worker runs for the whole turn and this call waits for it.
-                // Doing that on the caller's Netty event loop pins the browser's
-                // keep-alive connection: every other request on it — the message
-                // and chunk polls included — queues behind the turn, so the UI
-                // freezes until the answer is finished.
-                withContext(Dispatchers.IO) {
-                    if (ProjectWorkers.poolingEnabled) {
-                        // One worker per project, shared by every session on it; the turn
-                        // carries the message, so the worker never calls back for details.
-                        ResidentWorkers.ensure(lockedProject, workerConfig, serverPort, instance)
-                        runPooledTurn(
-                            project = lockedProject,
-                            sessionId = id,
-                            programId = sessionInfo.currentProgramId,
-                            prompt = req.content,
-                            systemPrompt = systemPrompt + noProgramNotice,
-                            username = call.currentUsernameOrDefault(),
-                            programName = programName,
-                            llm = workerConfig.llm,
-                        )
-                    } else {
-                        // Without the switch there is no worker to talk to; say so instead
-                        // of silently leaving the browser waiting.
-                        throw ManualAgentWorkerException(
-                            "Project workers are disabled on this server (AKIBA_PROJECT_WORKERS).")
-                    }
-                }
-            } catch (e: Exception) {
-                workerError = e.message ?: e.javaClass.simpleName
-                throw e
-            } finally {
-                // The worker had the project open; with it gone the index can be
-                // rebuilt, which is what keeps the browser's tree current.
-                sessionInfo.projectName?.takeIf { it.isNotBlank() }?.let { name ->
-                    runCatching {
-                        withContext(Dispatchers.IO) {
-                            // The index is keyed by the Ghidra projects root, not by
-                            // the session workspace directory.
-                            ProjectIndex.refresh(name, indexRoot)
-                        }
-                    }
-                }
-                runCatching { Files.deleteIfExists(workerConfig.file) }
-                // The worker JVM exits with its terminal chunk possibly still
-                // in flight (a hung POST, a kill).  The turn is over either
-                // way, so resolve the stream here: a poller left on `done`
-                // false spun on "waiting for model…" forever.
-                org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.finish(id, workerError)
-            }
-
-            withDaemonSession(daemonHost, daemonPort, instance, serialize = false) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-                val current = agentDbClient.getSession(id)
-                if (current.status == "running") {
-                    agentDbClient.updateSession(id, status = "closed")
-                    runCatching {
-                        agentDbClient.setRuntimeState(
-                            id,
-                            org.iotsplab.akiba.llm.agent.runtime.RuntimeState.CLOSED.wire(),
-                            "manual_chat_done",
-                        )
-                    }
-                }
-            }
-
-            val msgs = withDaemonSession(daemonHost, daemonPort, instance, serialize = false) { dbClient ->
-                AgentDatabaseClient(dbClient).getMessages(id, 0, 1000)
-                    .filter { it.role != "system" }
-            }
-            val userMsg = msgs.lastOrNull { it.role == "user" }
-            val asstMsg = msgs.lastOrNull { it.role == "assistant" }
-            if (asstMsg == null || userMsg == null) {
-                // The worker ran but recorded nothing, or died before it could.
-                // These used to throw IllegalStateException, which the catch
-                // below reported as "Agent is not configured" — a wrong reason
-                // for what is almost always a model failure or a killed worker.
-                val reason = workerError?.let { "The agent worker stopped before replying ($it)." }
-                    ?: "The agent produced no reply."
-                markManualChatFailed(daemonHost, daemonPort, instance, id, reason)
-                return@post call.respond(
-                    HttpStatusCode.BadGateway,
-                    mapOf("error" to reason)
-                )
-            }
-
-            call.respond(ChatResponse(
-                sessionId = id,
-                userMessage = userMsg.toMessageResponse(),
-                assistantMessage = asstMsg.toMessageResponse(),
-                iterations = 1,
-                tokenUsage = mapOf(
-                    "input" to (asstMsg.inputTokenCount ?: 0),
-                    "output" to (asstMsg.tokenCount ?: 0)
-                )
-            ))
-        } catch (e: Exception) {
-            when {
-                // The user cancelled this turn via /cancel-chat.  That
-                // endpoint already parked the session in
-                // CLOSED/user_cancelled_chat and terminated the stream
-                // generation — do NOT overwrite the state with a
-                // failure, and do NOT dump the killed worker's log
-                // (exit code + full stdout) into the HTTP response.
-                // Respond 200 so the frontend ends the turn calmly.
-                ChatCancellations.consume(id) -> {
-                    // The agent may have written ERROR on its way out; a stop is not a
-                    // failure, so park the session where the user left it.
-                    runCatching {
-                        withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                            val agentDbClient = AgentDatabaseClient(dbClient)
-                            agentDbClient.updateSession(id, status = "closed")
-                            agentDbClient.setRuntimeState(
-                                id,
-                                org.iotsplab.akiba.llm.agent.runtime.RuntimeState.CLOSED.wire(),
-                                "user_cancelled_chat"
-                            )
-                        }
-                    }
-                    call.respond(mapOf("status" to "cancelled", "sessionId" to id))
-                }
-                e is IllegalStateException -> {
-                    markManualChatFailed(daemonHost, daemonPort, instance, id, e.message)
-                    call.respond(HttpStatusCode.ServiceUnavailable,
-                        mapOf("error" to "Agent is not configured: ${e.message}"))
-                }
-                else -> {
-                    markManualChatFailed(daemonHost, daemonPort, instance, id, e.message)
-                    val (status, body) = errorPayload(e)
-                    call.respond(status, body)
-                }
-            }
-        }
-    }
-
-    // ------ Inject a user hint into a running/standby/closed/error session --
-    //
-    // Unlike /chat (a synchronous manual turn), /inject posts an asynchronous
-    // mailbox message: RUNNING sessions pick it up in applyMailboxDrain at the
-    // next beforeIteration, STANDBY ones are woken by AgentMailboxDispatcher,
-    // and CLOSED/ERROR ones make the runtime restart the session.
-    post("/agent/sessions/{id}/inject") {
-        val instance = call.requireInstanceHeader() ?: return@post
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@post
-        }
-        val req = try {
-            call.receive<InjectRequest>()
-        } catch (e: Exception) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid request body: ${e.message}"))
-            return@post
-        }
-        if (req.message.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Message content is empty"))
-            return@post
-        }
-        val transient = req.transient
-
-        try {
-            val sessionInfo = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                AgentDatabaseClient(dbClient).getSession(id)
-            }
-            val binaryId = sessionInfo.binaryId
-                ?: return@post call.respond(
-                    HttpStatusCode.Conflict,
-                    mapOf("error" to "Session has no binaryId; cannot locate runtime")
-                )
-
-            // Send the mailbox message.
-            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-                val mailboxService = org.iotsplab.akiba.llm.agent.mailbox.AgentMailboxService(agentDbClient)
-                mailboxService.send(
-                    senderSessionId = "system",
-                    recipientSessionId = id,
-                    kind = "user-hint",
-                    subject = if (transient) "[transient]" else "[persistent]",
-                    body = req.message,
-                    priority = 10,
-                )
-            }
-
-            // Check the session's runtime state.  If it's CLOSED or
-            // ERROR, try to resume it via the runtime so the user's
-            // hint is actually processed.  If the runtime doesn't
-            // have the factory (cross-process), the hint stays in
-            // the mailbox and will be picked up the next time the
-            // owning process polls.
-            val runtimeState = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                AgentDatabaseClient(dbClient).getRuntimeState(id)?.runtimeState
-            }
-            val stateLower = runtimeState?.lowercase()
-            val resumed = if (stateLower == "closed" || stateLower == "error") {
-                try {
-                    withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                        val agentDbClient = AgentDatabaseClient(dbClient)
-                        val runtime = org.iotsplab.akiba.llm.agent.runtime.AgentRuntime.forBinary(binaryId, agentDbClient)
-                        if (runtime.canResume(id)) {
-                            runtime.resumeForUserInjection(id) != null
-                        } else {
-                            false
-                        }
-                    }
-                } catch (e: Exception) {
-                    agentRouteLogger.warn("[inject] resumeForUserInjection failed for $id: ${e.message}", e)
-                    false
-                }
-            } else {
-                false
-            }
-
-            call.respond(mapOf(
-                "status" to "sent",
-                "sessionId" to id,
-                "transient" to transient,
-                "runtimeState" to (stateLower ?: "unknown"),
-                "resumed" to resumed,
-                "hint" to if (resumed) {
-                    "Message delivered and session resumed from ${stateLower ?: "terminal"} state."
-                } else if (stateLower == "running" || stateLower == "standby" || stateLower == "msghandle") {
-                    "Message delivered. The agent will pick it up on its next iteration."
-                } else {
-                    "Message delivered to mailbox. If the session is in another process, it will be picked up when that process next polls."
-                }
-            ))
-        } catch (e: Exception) {
-            agentRouteLogger.error("[inject] failed for session $id: ${e.message}", e)
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    // ------ Pause / Resume a session -----------------------------------------
-    //
-    // Pausing halts the LLM loop: the agent finishes the current iteration,
-    // then blocks before the next LLM call, while messages from other agents
-    // keep accumulating in the mailbox.  Resume un-blocks the loop.
-
-    post("/agent/sessions/{id}/pause") {
-        val instance = call.requireInstanceHeader() ?: return@post
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@post
-        }
-        try {
-            val sessionInfo = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                AgentDatabaseClient(dbClient).getSession(id)
-            }
-            val binaryId = sessionInfo.binaryId
-                ?: return@post call.respond(
-                    HttpStatusCode.Conflict,
-                    mapOf("error" to "Session has no binaryId; cannot locate runtime")
-                )
-
-            val paused = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-                val runtime = org.iotsplab.akiba.llm.agent.runtime.AgentRuntime.forBinary(binaryId, agentDbClient)
-                runtime.pause(id)
-            }
-
-            if (paused) {
-                call.respond(mapOf("status" to "paused", "sessionId" to id))
-            } else {
-                call.respond(HttpStatusCode.Conflict, mapOf(
-                    "error" to "Session cannot be paused (not running or not in this process)"
-                ))
-            }
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    post("/agent/sessions/{id}/resume") {
-        val instance = call.requireInstanceHeader() ?: return@post
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@post
-        }
-        try {
-            val sessionInfo = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                AgentDatabaseClient(dbClient).getSession(id)
-            }
-            val binaryId = sessionInfo.binaryId
-                ?: return@post call.respond(
-                    HttpStatusCode.Conflict,
-                    mapOf("error" to "Session has no binaryId; cannot locate runtime")
-                )
-
-            val resumed = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-                val runtime = org.iotsplab.akiba.llm.agent.runtime.AgentRuntime.forBinary(binaryId, agentDbClient)
-                runtime.resume(id)
-            }
-
-            if (resumed) {
-                call.respond(mapOf("status" to "resumed", "sessionId" to id))
-            } else {
-                call.respond(HttpStatusCode.Conflict, mapOf(
-                    "error" to "Session cannot be resumed (not paused or not in this process)"
-                ))
-            }
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    // ------ Request immediate LLM retry --------------------------------------
-    //
-    // When the LLM call fails and enters the exponential-backoff retry
-    // loop, the user can skip the remaining wait and trigger an
-    // immediate retry via this endpoint.
-
-    post("/agent/sessions/{id}/retry-now") {
-        val instance = call.requireInstanceHeader() ?: return@post
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@post
-        }
-        try {
-            val sessionInfo = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                AgentDatabaseClient(dbClient).getSession(id)
-            }
-            val binaryId = sessionInfo.binaryId
-                ?: return@post call.respond(
-                    HttpStatusCode.Conflict,
-                    mapOf("error" to "Session has no binaryId; cannot locate runtime")
-                )
-
-            val applied = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-                val runtime = org.iotsplab.akiba.llm.agent.runtime.AgentRuntime.forBinary(binaryId, agentDbClient)
-                runtime.retryNow(id)
-            }
-
-            if (applied) {
-                call.respond(mapOf("status" to "retry_requested", "sessionId" to id))
-            } else {
-                call.respond(HttpStatusCode.Conflict, mapOf(
-                    "error" to "Session not found in this runtime (it may be running in a different process)"
-                ))
-            }
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    // ------ Stop a running chat turn ----------------------------------------
-    //
-    // The stop is aimed at the turn, not at the process: one worker serves every
-    // session on a project, so killing it would take the other sessions down too.
-    // The worker polls the turn's cancel flag and aborts there.
-
-    post("/agent/sessions/{id}/cancel-chat") {
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@post
-        }
-        val cancelled = ProjectWorkers.broker.cancel(id)
-        if (cancelled) {
-            ChatCancellations.mark(id)
-            // The worker ends the turn quietly, so the stream needs its terminal
-            // marker here or the bubble waits on "waiting for model…" forever.
-            org.iotsplab.akiba.llm.agent.stream.StreamChunkBus.finish(id, USER_CANCELLED_STREAM_ERROR)
-        }
-        // Release any tool threads blocked on human-in-the-loop prompts
-        // (confirmation / user choice) for this session.
-        ConfirmationManager.clear(id)
-        UserChoiceManager.clear(id)
-        if (cancelled) {
-            // Mark the session as closed so the frontend can recover.
-            val instance = call.instanceHeader()
-            // The instance must belong to the caller: the server authenticates
-            // to the daemon as the instance owner.
-            if (instance != null && !call.requireInstanceOwnership(instance))
-                return@post
-            if (instance != null) {
-                runCatching {
-                    withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                        val agentDbClient = AgentDatabaseClient(dbClient)
-                        agentDbClient.updateSession(id, status = "closed")
-                        runCatching {
-                            agentDbClient.setRuntimeState(
-                                id,
-                                org.iotsplab.akiba.llm.agent.runtime.RuntimeState.CLOSED.wire(),
-                                "user_cancelled_chat"
-                            )
-                        }
-                    }
-                }
-            }
-            call.respond(mapOf("status" to "cancelled", "sessionId" to id))
-        } else {
-            // Nothing is running: either the turn already ended, or the server
-            // restarted under it and left the row "running". Either way the
-            // session must not stay un-abortable, so close it here.
-            val instance = call.instanceHeader()
-            if (instance != null && !call.requireInstanceOwnership(instance))
-                return@post
-            var recovered = false
-            if (instance != null) {
-                runCatching {
-                    withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                        val agentDbClient = AgentDatabaseClient(dbClient)
-                        val session = agentDbClient.getSession(id)
-                        if (session != null &&
-                            (session.status == "running" || session.runtimeState == "running")
-                        ) {
-                            agentDbClient.updateSession(id, status = "closed")
-                            agentDbClient.setRuntimeState(
-                                id,
-                                org.iotsplab.akiba.llm.agent.runtime.RuntimeState.CLOSED.wire(),
-                                "orphaned_chat_closed_by_user"
-                            )
-                            recovered = true
-                        }
-                    }
-                }
-            }
-            call.respond(mapOf(
-                "status" to if (recovered) "recovered" else "idle",
-                "sessionId" to id,
-            ))
-        }
-    }
-
-    // ------ Tool confirmation (human-in-the-loop) ---------------------------
-    //
-    // When a tool (e.g. run_shell) requires user approval, the tool
-    // registers a pending confirmation in ConfirmationManager and blocks
-    // its thread. The frontend discovers it via the `pendingConfirmation`
-    // field on `GET /agent/sessions/{id}`. The user responds by POSTing
-    // to this endpoint, which completes the deferred and unblocks the tool.
-    post("/agent/sessions/{id}/confirmation/respond") {
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@post
-        }
-        val req = runCatching { call.receive<ConfirmationRespondRequest>() }
-            .getOrNull()
-        val approved = req?.approved ?: false
-
-        val delivered = ConfirmationManager.respond(id, approved)
-        call.respond(mapOf(
-            "status" to if (delivered) "delivered" else "no_pending",
-            "sessionId" to id,
-            "approved" to approved,
-            "message" to if (delivered) {
-                if (approved) "Approval delivered to the agent." else "Denial delivered to the agent."
-            } else "No pending confirmation for this session."
-        ))
-    }
-
-    // ------ User choice response (human-in-the-loop) ------------------------
-    //
-    // The frontend discovers a pending `ask_user_choice` request via
-    // `pendingUserChoice` on `GET /agent/sessions/{id}` (or the global
-    // `/agent/pending-user-choices` poll) and delivers the answer here.
-    post("/agent/sessions/{id}/user-choice/respond") {
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@post
-        }
-        val req = runCatching { call.receive<UserChoiceRespondRequest>() }
-            .getOrNull()
-        val answer: String? = when {
-            req == null || req.cancelled -> null
-            else -> req.choice?.trim()?.takeIf { it.isNotEmpty() }
-        }
-
-        val delivered = UserChoiceManager.respond(id, answer)
-        call.respond(mapOf(
-            "status" to if (delivered) "delivered" else "no_pending",
-            "sessionId" to id,
-            "answered" to (answer != null),
-            "message" to if (delivered) {
-                if (answer != null) "Answer delivered to the agent."
-                else "Cancellation delivered to the agent."
-            } else "No pending user-choice request for this session."
-        ))
-    }
-
-    // ------ User choice follow-up ("BTW") question ---------------------------
-    //
-    // While an `ask_user_choice` request is pending, the user may ask
-    // follow-up questions inside the choice modal. The question is handed
-    // to the blocked consumer (in-process tool thread, or worker via the
-    // long-poll), which answers it via BtwAssistant (read-only). Suspends
-    // until the answer is ready (up to BTW_AWAIT_TIMEOUT_MS); submitting
-    // refreshes the choice request's inactivity timeout.
-    post("/agent/sessions/{id}/user-choice/btw") {
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@post
-        }
-        val req = runCatching { call.receive<UserChoiceBtwRequest>() }.getOrNull()
-        val question = req?.question?.trim()
-        if (question.isNullOrEmpty()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing question"))
-            return@post
-        }
-        if (question.length > 4000) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Question too long (max 4000 chars)"))
-            return@post
-        }
-        val answer = UserChoiceManager.submitBtw(id, question)
-        if (answer == null) {
-            call.respond(HttpStatusCode.Conflict, mapOf(
-                "answered" to false,
-                "error" to "No pending user-choice request for this session."
-            ))
-        } else {
-            call.respond(mapOf("answered" to true, "answer" to answer))
-        }
-    }
-
-    // ------ Delete session ----------------------------------------------------
-    /**
-     * Rename a conversation or point it at a different program.
-     *
-     * Both live on the session row so the choice survives a restart and is the
-     * one the next turn starts from.
-     */
-    patch("/agent/sessions/{id}") {
-        if (!call.requireAuthenticated()) return@patch
-        val instance = call.requireInstanceHeader() ?: return@patch
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-        }
-        val req = call.receive<SessionPatchRequest>()
-        if (req.sessionName == null && req.programName == null) {
-            return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Nothing to update"))
-        }
-        val name = req.sessionName?.trim()?.takeIf { it.isNotEmpty() }
-        val targetProgram = req.programName?.trim()?.takeIf { it.isNotEmpty() }
-        try {
-            // Switching program also rebinds the identity, otherwise the next
-            // turn would resolve the old id and open the wrong program.
-            val targetProgramId = if (targetProgram != null) {
-                val project = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                    AgentDatabaseClient(dbClient).getSession(id).projectName
-                }
-                if (project != null) {
-                    withContext(Dispatchers.IO) {
-                        runCatching {
-                            ProjectPrograms.ensureProgramIdentity(
-                                project,
-                                call.currentUserGhidraProjectsRoot(),
-                                targetProgram,
-                            )
-                        }.getOrNull()
-                    }
-                } else null
-            } else null
-            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                AgentDatabaseClient(dbClient).updateSession(
-                    id,
-                    sessionName = name,
-                    programName = targetProgram,
-                    programId = targetProgramId,
-                )
-            }
-            val info = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                AgentDatabaseClient(dbClient).getSession(id)
-            }
-            call.respond(info.toResponse())
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    delete("/agent/sessions/{id}") {
-        val instance = call.requireInstanceHeader() ?: return@delete
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@delete
-        }
-        try {
-            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-
-                // Reject deletion of sessions that are still running.
-                // The user must wait for the flow to finish (or cancel
-                // it first) before deleting — otherwise we'd be yanking
-                // the rug out from under a live agent process.
-                val session = agentDbClient.getSession(id)
-                val status = session.status
-                val isRunning = status != "closed" && status != "error" &&
-                    status != "completed" && status != "cancelled" && status != "failed"
-                if (isRunning) {
-                    throw IllegalArgumentException(
-                        "Session is still running (status='$status'). " +
-                            "Please end the flow first before deleting."
-                    )
-                }
-
-                // Hard-delete the session and all descendants.
-                val deleted = agentDbClient.deleteSession(id)
-                agentRouteLogger.info("[delete-session] hard-deleted $deleted session(s) for root=$id")
-            }
-
-            // Stop anything still running for this session and clear pending
-            // confirmations (defensive — the session should already be terminal).
-            ProjectWorkers.broker.cancel(id)
-            ConfirmationManager.clear(id)
-            UserChoiceManager.clear(id)
-
-            call.respond(mapOf("message" to "Session deleted"))
-        } catch (e: IllegalArgumentException) {
-            call.respond(HttpStatusCode.Conflict, mapOf("error" to e.message))
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-
-    // ------ Export session as Markdown -----------------------------------------
-    //
-    // Query parameters:
-    //   `scope=self` (default): export only the requested session's transcript
-    //                            (legacy behaviour — matches pre-tree sessions)
-    //   `scope=tree`           : export the full agent tree starting from the
-    //                            requested session as root. The Markdown
-    //                            document starts with a "Agent Tree" section
-    //                            that lists per-layer statistics and a tree
-    //                            diagram, followed by one peer section per
-    //                            agent (each with its own statistics and the
-    //                            full transcript).
-    //
-    get("/agent/sessions/{id}/export") {
-        val instance = call.requireInstanceHeader() ?: return@get
-        val id = call.parameters["id"].orEmpty()
-        if (id.isBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing session id"))
-            return@get
-        }
-        val scope = (call.parameters["scope"] ?: "self").lowercase()
-        try {
-            val md = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                val agentDbClient = AgentDatabaseClient(dbClient)
-                val rootInfo = agentDbClient.getSession(id)
-                when (scope) {
-                    "tree" -> renderTreeExport(agentDbClient, rootInfo)
-                    else -> rootInfo.transcript?.takeIf { it.isNotBlank() }
-                        ?: "*Session has no transcript yet (not started or still running).*\n\n*Export the session once the agent has completed.*"
-                }
-            }
-            call.response.header(
-                HttpHeaders.ContentDisposition,
-                "attachment; filename=\"session_${id.take(8)}.md\""
-            )
-            call.respondText(md, ContentType.Text.Plain)
-        } catch (e: DatabaseClient.DatabaseDaemonException) {
-            if (e.statusCode == HttpStatusCode.NotFound) {
-                call.respond(HttpStatusCode.NotFound, mapOf("error" to "Session not found"))
-            } else {
-                val (status, body) = errorPayload(e)
-                call.respond(status, body)
-            }
-        } catch (e: Exception) {
-            val (status, body) = errorPayload(e)
-            call.respond(status, body)
-        }
-    }
-}
 
 /**
  * Statistics computed from a session's message history. Used in both the
  * "Agent Tree" overview and the per-agent sections of the tree-export
  * document.
  */
-private data class SessionStats(
+internal data class SessionStats(
     val totalInputTokens: Long,
     val totalOutputTokens: Long,
     val toolCallCount: Int,
@@ -1972,7 +418,7 @@ private data class SessionStats(
  * A node in the agent hierarchy being exported, paired with its own
  * statistics. Children are populated by [renderTreeExport].
  */
-private data class ExportTreeNode(
+internal data class ExportTreeNode(
     val info: AgentDatabaseClient.SessionInfo,
     val stats: SessionStats,
     val depth: Int,
@@ -2158,7 +604,7 @@ internal fun renderTreeExport(
  * when its metadata cannot be read — the caller should treat that as
  * "stop descending here".
  */
-private fun collectExportTree(
+internal fun collectExportTree(
     agentDbClient: AgentDatabaseClient,
     root: AgentDatabaseClient.SessionInfo,
     depth: Int,
@@ -2187,7 +633,7 @@ private fun collectExportTree(
  * Used by [renderTreeExport] to render the per-agent peer sections and to
  * compute aggregate counts.
  */
-private fun ExportTreeNode.descendantsFlattened(): List<ExportTreeNode> =
+internal fun ExportTreeNode.descendantsFlattened(): List<ExportTreeNode> =
     listOf(this) + children.flatMap { it.descendantsFlattened() }
 
 /**
@@ -2202,7 +648,7 @@ private fun ExportTreeNode.descendantsFlattened(): List<ExportTreeNode> =
  * this function collapses exact rewrite copies before aggregating:
  * assistant rows by (content, token counts), tool rows by toolCallId.
  */
-private fun computeSessionStats(
+internal fun computeSessionStats(
     agentDbClient: AgentDatabaseClient,
     sessionId: String
 ): SessionStats {
@@ -2264,7 +710,7 @@ private fun computeSessionStats(
  * the diagram is self-explanatory when shared without the surrounding
  * table.
  */
-private fun renderAsciiTree(
+internal fun renderAsciiTree(
     out: StringBuilder,
     root: ExportTreeNode,
     depth: Int
@@ -2278,7 +724,7 @@ private fun renderAsciiTree(
  * receives a pre-computed [prefix] so children stay aligned with their
  * parent's connector ("│   " for non-last, "    " for last).
  */
-private fun renderAsciiTreeLine(
+internal fun renderAsciiTreeLine(
     out: StringBuilder,
     node: ExportTreeNode,
     prefix: String,
@@ -2308,15 +754,15 @@ private fun renderAsciiTreeLine(
     }
 }
 
-private fun nodeDepthLabel(depth: Int): String = when (depth) {
+internal fun nodeDepthLabel(depth: Int): String = when (depth) {
     0 -> "(root)"
     else -> "($depth)"
 }
 
-private fun nowString(): String =
+internal fun nowString(): String =
     java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
 
-private fun markManualChatFailed(
+internal fun markManualChatFailed(
     daemonHost: String,
     daemonPort: Int,
     instance: String,
@@ -2340,14 +786,14 @@ private fun markManualChatFailed(
 }
 
 /** What a worker process needs to start: its config file, and the model for this session. */
-private data class ManualAgentWorkerConfig(
+internal data class ManualAgentWorkerConfig(
     val file: Path,
     val environment: Map<String, String>,
     /** Model and key for this session; the worker is told per turn, so config changes apply at once. */
     val llm: org.iotsplab.akiba.managers.TurnBroker.TurnLlm? = null,
 )
 
-private fun createManualAgentConfig(
+internal fun createManualAgentConfig(
     sessionInfo: SessionInfo,
     instanceName: String,
     daemonHost: String,
@@ -2441,7 +887,7 @@ private fun createManualAgentConfig(
  * sessions on one project impossible. One worker per project is started on demand and
  * then reused; if it dies, the next turn starts a fresh one.
  */
-private object ResidentWorkers {
+internal object ResidentWorkers {
 
     private val running = java.util.concurrent.ConcurrentHashMap<String, Process>()
 
@@ -2483,7 +929,7 @@ private object ResidentWorkers {
  * The wait is on the turn's future rather than on a process, so several sessions can be
  * waiting on one worker at the same time without any of them owning the process.
  */
-private fun runPooledTurn(
+internal fun runPooledTurn(
     project: String,
     sessionId: String,
     programId: String?,
@@ -2523,7 +969,7 @@ private fun runPooledTurn(
     }
 }
 
-private fun findFirstProgramName(projectName: String, projectDir: java.nio.file.Path): String? {
+internal fun findFirstProgramName(projectName: String, projectDir: java.nio.file.Path): String? {
     val grpFile = projectDir.resolve("$projectName.gpr")
     val repFile = projectDir.resolve("$projectName.rep")
     if (!Files.isRegularFile(grpFile) || !Files.isDirectory(repFile)) return null
@@ -2540,7 +986,7 @@ private fun findFirstProgramName(projectName: String, projectDir: java.nio.file.
     }
 }
 
-private fun findFirstProgramRecursive(
+internal fun findFirstProgramRecursive(
     folder: ghidra.framework.model.DomainFolder
 ): ghidra.framework.model.DomainFile? {
     folder.files.firstOrNull { f ->
@@ -2553,7 +999,7 @@ private fun findFirstProgramRecursive(
     return null
 }
 
-private fun findAkibaScriptForAgent(): String {
+internal fun findAkibaScriptForAgent(): String {
     try {
         val source = org.iotsplab.akiba.Main::class.java.protectionDomain.codeSource
         val loc = source.location.toURI()
@@ -2576,7 +1022,7 @@ private fun findAkibaScriptForAgent(): String {
     return "akiba"
 }
 
-private fun SessionInfo.toResponse(
+internal fun SessionInfo.toResponse(
     pendingConfirmation: PendingConfirmationDto? = null,
     pendingUserChoice: PendingUserChoiceDto? = null
 ) = AgentSessionResponse(
@@ -2600,7 +1046,7 @@ private fun SessionInfo.toResponse(
     // token totals omitted here for performance; use GET /agent/sessions/{id}/messages
 )
 
-private fun AgentDatabaseClient.MessageInfo.toMessageResponse() = AgentMessageResponse(
+internal fun AgentDatabaseClient.MessageInfo.toMessageResponse() = AgentMessageResponse(
     messageId = messageId,
     messageIndex = messageIndex,
     role = role,
@@ -2610,4 +1056,18 @@ private fun AgentDatabaseClient.MessageInfo.toMessageResponse() = AgentMessageRe
     toolResult = if (role == "tool") (toolResult ?: content) else null
 )
 
+/**
+ * Every agent route, assembled from one file per domain.
+ *
+ * Each domain keeps its own file; this function is the table of contents, and the one
+ * place the server looks to know which routes exist.
+ */
+fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
+    agentSessionRoutes(daemonHost, daemonPort)
+    agentStreamRoutes(daemonHost, daemonPort)
+    agentHumanRoutes(daemonHost, daemonPort)
+    agentChatRoutes(daemonHost, daemonPort)
 
+    // A resident worker asks for its next turn here and reports the outcome after.
+    workerTurnRoutes()
+}
