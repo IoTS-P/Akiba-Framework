@@ -14,6 +14,7 @@ import io.ktor.server.routing.*
  */
 fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
     agentSessionRoutes(daemonHost, daemonPort)
+    workspaceRoutes(daemonHost, daemonPort)
     agentStreamRoutes(daemonHost, daemonPort)
     agentHumanRoutes(daemonHost, daemonPort)
     agentChatRoutes(daemonHost, daemonPort)
