@@ -2,11 +2,12 @@ package org.iotsplab.akiba.llm.tool.core
 
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runInterruptible
-import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeoutOrNull
 import org.iotsplab.akiba.utils.AgentSettings
 import org.iotsplab.akiba.utils.GlobalConfig
@@ -28,6 +29,15 @@ object ToolRunner {
 
     /** What the agent is told, and how long it took. */
     data class Outcome(val output: String, val durationMs: Long)
+
+    /**
+     * Where the calls run.
+     *
+     * Deliberately not a child of the caller: when the limit passes we have to be able to
+     * leave the call behind. A scope tied to the turn would wait for it to finish, which is
+     * how a tool that ignores interrupts used to hold the whole agent for ten minutes.
+     */
+    private val work = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val running = ConcurrentHashMap<String, Deferred<*>>()
     private val interrupted = ConcurrentHashMap.newKeySet<String>()
@@ -53,27 +63,24 @@ object ToolRunner {
         val startedAt = System.currentTimeMillis()
         fun elapsed() = System.currentTimeMillis() - startedAt
 
-        // supervisorScope: stopping one call must not take the turn down with it.
-        return supervisorScope {
-            val work = async(Dispatchers.IO) {
-                runInterruptible { tool.safeExecute(arguments) }
+        val call = work.async {
+            runInterruptible { tool.safeExecute(arguments) }
+        }
+        if (sessionId != null) running[sessionId] = call
+        return try {
+            val output = withTimeoutOrNull(seconds * 1000L) { call.await() }
+            if (output != null) {
+                Outcome(output, elapsed())
+            } else {
+                // Cancel asks the thread to stop; we do not wait to see whether it did.
+                call.cancel()
+                Outcome(ranOutOfTime(tool, seconds), elapsed())
             }
-            if (sessionId != null) running[sessionId] = work
-            try {
-                val output = withTimeoutOrNull(seconds * 1000L) { work.await() }
-                if (output != null) {
-                    Outcome(output, elapsed())
-                } else {
-                    // The work is abandoned, not merely ignored: cancel interrupts the thread.
-                    work.cancel()
-                    Outcome(ranOutOfTime(tool, seconds), elapsed())
-                }
-            } catch (_: CancellationException) {
-                val cut = sessionId != null && interrupted.remove(sessionId)
-                Outcome(if (cut) cutByUser(tool) else "Tool '${tool.name}' was cancelled", elapsed())
-            } finally {
-                if (sessionId != null) running.remove(sessionId)
-            }
+        } catch (_: CancellationException) {
+            val cut = sessionId != null && interrupted.remove(sessionId)
+            Outcome(if (cut) cutByUser(tool) else "Tool '${tool.name}' was cancelled", elapsed())
+        } finally {
+            if (sessionId != null) running.remove(sessionId)
         }
     }
 

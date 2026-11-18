@@ -284,8 +284,17 @@ class ReActStrategy : AgentStrategy {
                     } else {
                         val callId = "${toolCall.name}:${System.nanoTime()}"
                         publishToolEvent(ctx, toolCall, StreamChunkBus.KIND_TOOL_START, 0L, callId)
-                        val executed = ctx.executeToolWithDuration(toolCall)
-                        publishToolEvent(ctx, toolCall, StreamChunkBus.KIND_TOOL_END, executed.durationMs, callId)
+                        val startedAt = System.currentTimeMillis()
+                        val executed = try {
+                            ctx.executeToolWithDuration(toolCall)
+                        } finally {
+                            // An end event is the only thing the card has to go on, so it is
+                            // sent whether the call returned, timed out or threw.
+                            publishToolEvent(
+                                ctx, toolCall, StreamChunkBus.KIND_TOOL_END,
+                                System.currentTimeMillis() - startedAt, callId,
+                            )
+                        }
                         executed
                     }
                     val observation = toolResult.output

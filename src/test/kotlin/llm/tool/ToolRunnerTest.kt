@@ -2,8 +2,10 @@ package llm.tool
 
 import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolRunner
+import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 /**
  * How long a tool call is allowed to run.
@@ -46,5 +48,29 @@ class ToolRunnerTest {
         assertEquals(300, ToolRunner.limitSeconds(tool { 0 }, emptyMap()))
         assertEquals(300, ToolRunner.limitSeconds(tool { -5 }, emptyMap()))
         assertEquals(300, ToolRunner.limitSeconds(tool { throw IllegalStateException("no") }, emptyMap()))
+    }
+
+    @Test
+    fun `a call that ignores the interrupt does not hold the agent`() = runBlocking {
+        // Thread.sleep answers an interrupt by throwing; this one swallows it and sleeps
+        // again, standing in for a tool stuck somewhere interrupt cannot reach. The agent
+        // must still get its answer back at the limit.
+        val stubborn = Tool(
+            name = "stubborn",
+            description = "does not stop",
+            timeoutSeconds = { 2 },
+            execute = {
+                runCatching { Thread.sleep(30_000) }
+                runCatching { Thread.sleep(30_000) }
+                "finally"
+            },
+        )
+
+        val startedAt = System.currentTimeMillis()
+        val outcome = ToolRunner.run(stubborn, emptyMap(), null)
+        val elapsed = System.currentTimeMillis() - startedAt
+
+        assertTrue(elapsed < 6_000, "returned after ${elapsed}ms, the limit was 2s")
+        assertTrue(outcome.output.contains("ran past its 2s limit"), outcome.output)
     }
 }
