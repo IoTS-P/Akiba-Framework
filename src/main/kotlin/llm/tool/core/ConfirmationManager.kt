@@ -53,7 +53,15 @@ data class PendingConfirmation(
      */
     val targetPath: String? = null,
     /** Epoch millis when the request was created. */
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    /**
+     * Seconds until this request is treated as denied, for the dialog to show.
+     *
+     * Null when the caller did not say; the tool still stops waiting at its own deadline.
+     */
+    val expiresInSeconds: Int? = null,
+    /** The deployment's approval limit for a long call, in seconds. */
+    val approvalLimitSeconds: Int? = null,
 )
 
 private data class PendingEntry(
@@ -148,7 +156,8 @@ object ConfirmationManager {
         timeout: Int,
         action: String = "shell_command",
         targetPath: String? = null,
-        confirmationTimeoutMs: Long = DEFAULT_CONFIRMATION_TIMEOUT_MS
+        confirmationTimeoutMs: Long = DEFAULT_CONFIRMATION_TIMEOUT_MS,
+        approvalLimitSeconds: Int? = null,
     ): Boolean {
         if (sessionId.isBlank()) {
             // No session context — auto-deny as a safety measure.
@@ -164,7 +173,9 @@ object ConfirmationManager {
             workingDirectory = workingDirectory,
             timeout = timeout,
             action = action,
-            targetPath = targetPath
+            targetPath = targetPath,
+            expiresInSeconds = (confirmationTimeoutMs / 1000).toInt(),
+            approvalLimitSeconds = approvalLimitSeconds,
         )
         val deferred = CompletableDeferred<Boolean>()
         pending[sessionId] = PendingEntry(confirmation, deferred)

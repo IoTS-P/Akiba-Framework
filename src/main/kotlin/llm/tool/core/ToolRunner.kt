@@ -156,6 +156,7 @@ object ToolRunner {
                 timeout = seconds,
                 action = "long_timeout",
                 confirmationTimeoutMs = windowSeconds * 1000L,
+                approvalLimitSeconds = policy.toolTimeoutConfirmThresholdSeconds,
             )
         }
     }
