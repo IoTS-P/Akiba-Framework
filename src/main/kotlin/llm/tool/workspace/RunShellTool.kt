@@ -5,6 +5,7 @@ import kotlinx.coroutines.*
 import org.iotsplab.akiba.llm.agent.module.AgentModule
 import org.iotsplab.akiba.llm.tool.core.ConfirmationManager
 import org.iotsplab.akiba.llm.tool.core.Tool
+import org.iotsplab.akiba.managers.ConfigManager
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
 import org.iotsplab.akiba.llm.tool.core.detectWorkerServerPort
 import org.iotsplab.akiba.llm.tool.core.requestConfirmationViaHttp
@@ -36,6 +37,8 @@ fun RunShellTool(
     requireConfirmation: Boolean = true,
     maxOutputChars: Int = 40000
 ): Tool = Tool(
+    // A margin over the process timeout below, so the process gets to say why it stopped.
+    timeoutSeconds = { args -> ((args["timeout"] as? Number)?.toInt() ?: 60) + 30 },
     name = "run_shell",
     description = buildString {
         appendLine("Execute a shell command in the module's workspace directory.")
@@ -92,7 +95,10 @@ fun RunShellTool(
         return@Tool "Error: command is empty"
     }
 
-    val timeout = ((args["timeout"] as? Number)?.toInt() ?: 60).coerceIn(1, 300)
+    // The agent may ask for a long run (a build, an emulator); ToolRunner asks the user
+    // before anything over the approval limit, and this is the ceiling for anything else.
+    val cap = ConfigManager.config.agent?.maxToolTimeoutSeconds ?: 86_400
+    val timeout = ((args["timeout"] as? Number)?.toInt() ?: 60).coerceIn(1, cap)
     val workDirRel = args["workDir"] as? String
 
     // Resolve working directory

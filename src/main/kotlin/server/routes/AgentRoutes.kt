@@ -32,6 +32,8 @@ import org.iotsplab.akiba.llm.config.LLMKeyFileStore
 import org.iotsplab.akiba.llm.tool.core.BuiltInTools
 import org.iotsplab.akiba.llm.tool.core.ConfirmationManager
 import org.iotsplab.akiba.llm.tool.core.Tool
+import org.iotsplab.akiba.llm.tool.core.ToolInterrupts
+import org.iotsplab.akiba.llm.tool.core.ToolRunner
 import org.iotsplab.akiba.llm.tool.ui.PendingChoiceSnapshot
 import org.iotsplab.akiba.llm.tool.ui.UserChoiceEvent
 import org.iotsplab.akiba.llm.tool.ui.UserChoiceManager
@@ -558,6 +560,28 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
         call.respond(mapOf(
             "liveClients" to org.iotsplab.akiba.llm.client.LLMClientFactory.liveClientCount()
         ))
+    }
+
+    // ------ Stop the tool a session is running -------------------------------
+    //
+    // A tool call can be long on purpose (a build, an emulator, a sweep). The user may want
+    // it to stop without ending the whole turn, so this asks the running call to stop and
+    // the agent gets an observation saying the work was cut short.
+    post("/agent/sessions/{sessionId}/tool/interrupt") {
+        val sessionId = call.parameters["sessionId"] ?: return@post call.respond(
+            HttpStatusCode.BadRequest, mapOf("error" to "sessionId is required")
+        )
+        // In the server the call is local; in a worker the press is parked for it to collect.
+        val local = ToolRunner.interrupt(sessionId)
+        ToolInterrupts.request(sessionId)
+        call.respond(mapOf("interrupted" to true, "runningHere" to local))
+    }
+
+    // ------ Internal: was this session's tool asked to stop? (worker → server) ---
+    get("/agent/internal/tool/interrupt") {
+        val sessionId = call.request.queryParameters["sessionId"]
+            ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "sessionId is required"))
+        call.respond(mapOf("interrupted" to ToolInterrupts.consume(sessionId)))
     }
 
     // ------ Internal: tool confirmation request (cross-process long-poll) ---

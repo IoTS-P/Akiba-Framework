@@ -80,6 +80,12 @@ class Tool(
      * [ToolDedupStrategy.ARGS_ONLY] to catch redundant writes.
      */
     val dedupStrategyResolver: ((Map<String, Any?>) -> ToolDedupStrategy)? = null,
+    /**
+     * Seconds this tool needs for this call, read from its own arguments, or null to take
+     * the configured default. [ToolRunner] enforces it and asks the user first when the
+     * number is large enough to matter.
+     */
+    val timeoutSeconds: ((Map<String, Any?>) -> Int)? = null,
     val execute: (Map<String, Any?>) -> String
 ) {
     private val mapper = AkibaJson.mapper
@@ -177,6 +183,14 @@ class Tool(
      * Safely execute this tool, catching any exceptions and returning
      * an error message instead of propagating the exception.
      */
+    /** What [timeoutSeconds] answers for this call, if the tool asked for anything. */
+    fun requestedTimeoutSeconds(args: Map<String, Any?>): Int? =
+        try {
+            timeoutSeconds?.invoke(args)?.takeIf { it > 0 }
+        } catch (_: Exception) {
+            null
+        }
+
     fun safeExecute(args: Map<String, Any?>): String {
         validateArguments(args)?.let { return it }
         return try {

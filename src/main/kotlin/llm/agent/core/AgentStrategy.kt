@@ -17,6 +17,7 @@ import org.iotsplab.akiba.llm.memory.MemoryManager
 import org.iotsplab.akiba.llm.memory.MemoryScope
 import org.iotsplab.akiba.llm.memory.MemoryType
 import org.iotsplab.akiba.llm.tool.core.ToolRegistry
+import org.iotsplab.akiba.llm.tool.core.ToolRunner
 
 // ============================================================
 //  Agent Strategy — interface
@@ -279,10 +280,11 @@ class StrategyContext(
             toolCall.name, toolCall.argumentsJson, toolCall.arguments, stats.iterations
         )
 
-        var rawResult: String
-        val durationMs = measureTimeMillis {
-            rawResult = tool.safeExecute(toolCall.arguments)
-        }
+        // A tool blocks its thread, so the time limit has to come from outside it: the
+        // runner owns a thread per call, and can interrupt it when the limit passes.
+        val outcome = ToolRunner.run(tool, toolCall.arguments, sessionId)
+        val rawResult: String = outcome.output
+        val durationMs = outcome.durationMs
 
         stats.toolCallsMade++
 
