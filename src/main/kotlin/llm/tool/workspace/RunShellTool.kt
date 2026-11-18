@@ -5,7 +5,7 @@ import kotlinx.coroutines.*
 import org.iotsplab.akiba.llm.agent.module.AgentModule
 import org.iotsplab.akiba.llm.tool.core.ConfirmationManager
 import org.iotsplab.akiba.llm.tool.core.Tool
-import org.iotsplab.akiba.managers.ConfigManager
+import org.iotsplab.akiba.utils.GlobalConfig
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
 import org.iotsplab.akiba.llm.tool.core.detectWorkerServerPort
 import org.iotsplab.akiba.llm.tool.core.requestConfirmationViaHttp
@@ -97,7 +97,7 @@ fun RunShellTool(
 
     // The agent may ask for a long run (a build, an emulator); ToolRunner asks the user
     // before anything over the approval limit, and this is the ceiling for anything else.
-    val cap = ConfigManager.config.agent?.maxToolTimeoutSeconds ?: 86_400
+    val cap = GlobalConfig.load().agent.maxToolTimeoutSeconds
     val timeout = ((args["timeout"] as? Number)?.toInt() ?: 60).coerceIn(1, cap)
     val workDirRel = args["workDir"] as? String
 

@@ -1,139 +1,103 @@
 package org.iotsplab.akiba.llm.tool.core
 
-import java.util.concurrent.CancellationException
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ExecutionException
-import java.util.concurrent.Executors
-import java.util.concurrent.Future
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
-import org.iotsplab.akiba.managers.ConfigManager
-import org.iotsplab.akiba.utils.AgentTuning
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.withTimeoutOrNull
+import org.iotsplab.akiba.utils.AgentSettings
+import org.iotsplab.akiba.utils.GlobalConfig
 
 /**
  * Runs one tool call under a time limit, and lets a person cut it short.
  *
- * A tool is a plain lambda, so it blocks whichever thread calls it: a coroutine timeout
- * cannot stop it. Every call therefore runs on its own virtual thread, and when the limit
- * passes the call is abandoned and its thread interrupted. A tool that ignores interrupts
- * keeps its thread, but the agent gets an answer back and carries on instead of waiting.
+ * A tool is a plain lambda, so it blocks whichever thread runs it — a coroutine cannot
+ * suspend inside it. [runInterruptible] is the bridge: the block still blocks a thread, but
+ * cancelling the coroutine interrupts that thread, which is what stops `waitFor`, a socket
+ * read, or a `sleep`. A tool that ignores interrupts keeps its thread; the agent is not
+ * waiting on it any more, so the turn carries on.
  *
- * A call may ask for more than the default limit — a long analysis, a slow emulator. Above
- * the configured threshold that is the user's decision, not the agent's, so the call waits
- * for an approval first and is refused when there is none.
+ * A call may ask for more than the default limit — a long build, a slow emulator. Above the
+ * configured threshold that is the user's decision, not the agent's, so the call waits for
+ * an approval first and is refused when none comes.
  */
 object ToolRunner {
 
     /** What the agent is told, and how long it took. */
     data class Outcome(val output: String, val durationMs: Long)
 
-    private val threads = Executors.newVirtualThreadPerTaskExecutor()
-    private val running = ConcurrentHashMap<String, Future<*>>()
+    private val running = ConcurrentHashMap<String, Deferred<*>>()
     private val interrupted = ConcurrentHashMap.newKeySet<String>()
 
-    private const val POLL_INTERVAL_MS = 1500L
-
-    private val policy: AgentTuning
-        get() = if (ConfigManager.isConfigInitialized) {
-            ConfigManager.config.agent ?: AgentTuning()
-        } else {
-            AgentTuning()
-        }
+    private val policy: AgentSettings
+        get() = GlobalConfig.load().agent
 
     /** Seconds this call may take: what the tool asked for, otherwise the default. */
     fun limitSeconds(tool: Tool, arguments: Map<String, Any?>): Int {
-        val tuning = policy
-        val asked = tool.requestedTimeoutSeconds(arguments) ?: tuning.toolTimeoutSeconds
-        return asked.coerceIn(1, tuning.maxToolTimeoutSeconds)
+        val settings = policy
+        val asked = tool.requestedTimeoutSeconds(arguments) ?: settings.toolTimeoutSeconds
+        return asked.coerceIn(1, settings.maxToolTimeoutSeconds)
     }
 
     /**
      * Runs [tool] with [arguments], refusing calls that ask for more time than the user
      * allowed to hand out without being asked.
      */
-    fun run(tool: Tool, arguments: Map<String, Any?>, sessionId: String?): Outcome {
+    suspend fun run(tool: Tool, arguments: Map<String, Any?>, sessionId: String?): Outcome {
         val seconds = limitSeconds(tool, arguments)
         deniedBecause(tool, seconds, sessionId)?.let { return Outcome(it, 0L) }
 
         val startedAt = System.currentTimeMillis()
-        val future = threads.submit<String> { tool.safeExecute(arguments) }
-        if (sessionId != null) {
-            running[sessionId] = future
-            watchForInterrupt(sessionId, future)
-        }
-        return try {
-            val output = future.get(seconds.toLong(), TimeUnit.SECONDS)
-            Outcome(output, System.currentTimeMillis() - startedAt)
-        } catch (_: TimeoutException) {
-            future.cancel(true)
-            Outcome(ranOutOfTime(tool, seconds), System.currentTimeMillis() - startedAt)
-        } catch (_: CancellationException) {
-            val cut = sessionId != null && interrupted.remove(sessionId)
-            Outcome(if (cut) cutByUser(tool) else "$tool.name was cancelled", System.currentTimeMillis() - startedAt)
-        } catch (e: ExecutionException) {
-            Outcome("Tool '${tool.name}' failed: ${e.cause?.message ?: e.message}", System.currentTimeMillis() - startedAt)
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            Outcome(cutByUser(tool), System.currentTimeMillis() - startedAt)
-        } finally {
-            if (sessionId != null) running.remove(sessionId, future)
+        fun elapsed() = System.currentTimeMillis() - startedAt
+
+        // supervisorScope: stopping one call must not take the turn down with it.
+        return supervisorScope {
+            val work = async(Dispatchers.IO) {
+                runInterruptible { tool.safeExecute(arguments) }
+            }
+            if (sessionId != null) running[sessionId] = work
+            try {
+                val output = withTimeoutOrNull(seconds * 1000L) { work.await() }
+                if (output != null) {
+                    Outcome(output, elapsed())
+                } else {
+                    // The work is abandoned, not merely ignored: cancel interrupts the thread.
+                    work.cancel()
+                    Outcome(ranOutOfTime(tool, seconds), elapsed())
+                }
+            } catch (_: CancellationException) {
+                val cut = sessionId != null && interrupted.remove(sessionId)
+                Outcome(if (cut) cutByUser(tool) else "Tool '${tool.name}' was cancelled", elapsed())
+            } finally {
+                if (sessionId != null) running.remove(sessionId)
+            }
         }
     }
 
     /**
      * Stops the call this session is running, if there is one.
      *
-     * The tool is interrupted rather than killed — code that blocks on a process or a
-     * sleep stops, code that never checks simply finishes on its own thread.
+     * The tool is interrupted rather than killed — code that blocks on a process or a sleep
+     * stops, code that never checks simply finishes on its own thread.
      */
     fun interrupt(sessionId: String): Boolean {
-        val future = running[sessionId] ?: return false
+        val work = running[sessionId] ?: return false
         interrupted.add(sessionId)
-        future.cancel(true)
+        work.cancel()
         return true
     }
 
     /** True when this session has a tool call in flight. */
     fun isRunning(sessionId: String): Boolean = running.containsKey(sessionId)
 
-    /**
-     * In a worker process the tool call lives here, but the press happens in the server, so
-     * the wish has to be fetched. In the server itself [interrupt] reaches us directly.
-     */
-    private fun watchForInterrupt(sessionId: String, future: Future<*>) {
-        val port = detectWorkerServerPort() ?: return
-        Thread.ofVirtual().start {
-            while (!future.isDone) {
-                if (pollInterrupt(port, sessionId)) {
-                    interrupted.add(sessionId)
-                    future.cancel(true)
-                    return@start
-                }
-                Thread.sleep(POLL_INTERVAL_MS)
-            }
-        }
-    }
-
-    private fun pollInterrupt(serverPort: Int, sessionId: String): Boolean = try {
-        val request = java.net.http.HttpRequest.newBuilder()
-            .uri(java.net.URI.create("http://127.0.0.1:$serverPort/api/agent/internal/tool/interrupt?sessionId=$sessionId"))
-            .timeout(java.time.Duration.ofSeconds(5))
-            .GET()
-            .build()
-        val response = java.net.http.HttpClient.newBuilder()
-            .connectTimeout(java.time.Duration.ofSeconds(5))
-            .build()
-            .send(request, java.net.http.HttpResponse.BodyHandlers.ofString())
-        response.statusCode() == 200 && response.body().contains("true")
-    } catch (_: Exception) {
-        false
-    }
-
     private fun deniedBecause(tool: Tool, seconds: Int, sessionId: String?): String? {
-        val tuning = policy
-        if (seconds <= tuning.toolTimeoutConfirmThresholdSeconds) return null
+        val settings = policy
+        if (seconds <= settings.toolTimeoutConfirmThresholdSeconds) return null
 
-        val window = tuning.toolTimeoutApprovalSeconds.coerceAtLeast(1)
+        val window = settings.toolTimeoutApprovalSeconds.coerceAtLeast(1)
         val minutes = seconds / 60
         val startedAt = System.currentTimeMillis()
         val approved = sessionId != null && askForApproval(
@@ -152,7 +116,7 @@ object ToolRunner {
             "Nobody answered within ${window}s when asked, so it counts as declined."
         }
         return "$why '${tool.name}' asked to run for up to $minutes minutes, which is over the " +
-            "${tuning.toolTimeoutConfirmThresholdSeconds / 60}-minute limit that needs approval. " +
+            "${settings.toolTimeoutConfirmThresholdSeconds / 60}-minute limit that needs approval. " +
             "Nothing was run. Either ask for less time or explain why this call needs that long."
     }
 

@@ -267,7 +267,7 @@ class StrategyContext(
         val duplicateDetection: ToolResultDuplicateDetection? = null,
     )
 
-    fun executeToolWithDuration(toolCall: ParsedToolCall): ToolResult {
+    suspend fun executeToolWithDuration(toolCall: ParsedToolCall): ToolResult {
         val tool = toolRegistry.get(toolCall.name)
         if (tool == null) {
             val errMsg = "Unknown tool: ${toolCall.name}. Available: ${toolRegistry.names()}"
@@ -363,7 +363,7 @@ class StrategyContext(
     }
 
     // Backward-compatible wrapper
-    fun executeTool(toolCall: ParsedToolCall): String = executeToolWithDuration(toolCall).output
+    suspend fun executeTool(toolCall: ParsedToolCall): String = executeToolWithDuration(toolCall).output
 
     /**
      * Update session status in the database.

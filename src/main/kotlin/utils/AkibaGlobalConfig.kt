@@ -19,6 +19,24 @@ import org.apache.logging.log4j.LogManager
  */
 data class AkibaGlobalConfig(
     val projectLock: ProjectLockSettings = ProjectLockSettings(),
+    val agent: AgentSettings = AgentSettings(),
+)
+
+/**
+ * How long a tool call may run, and when a person has to agree to more.
+ *
+ * This answers "how does this deployment behave" for every session on it, which is why it
+ * lives here and not in the per-run config.
+ */
+data class AgentSettings(
+    /** Every call stops at this many seconds unless the tool asks for something else. */
+    val toolTimeoutSeconds: Int = 300,
+    /** A call asking for longer than this waits for the user's approval first. */
+    val toolTimeoutConfirmThresholdSeconds: Int = 3600,
+    /** How long that approval waits before the call counts as declined. */
+    val toolTimeoutApprovalSeconds: Int = 300,
+    /** Nothing may ask for more than this, approved or not. */
+    val maxToolTimeoutSeconds: Int = 86400,
 )
 
 /**

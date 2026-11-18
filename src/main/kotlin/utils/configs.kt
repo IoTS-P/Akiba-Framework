@@ -30,8 +30,6 @@ data class Configs (
     var sqlSource: SqlSource = SqlSource(),
     /** Global LLM configuration shared by all AgentModules. */
     var llm: LLMSource? = null,
-    /** How long a tool call may run, and when a person has to agree to more. */
-    var agent: AgentTuning? = null,
     var globalPreTasks: List<ProcedureArguments> = listOf(),
     var packages: List<String>? = null,
     // Database data generated in previous tasks to import
@@ -39,17 +37,6 @@ data class Configs (
     // If all columns of a table are needed, use "table_name.*"
     var dbImports: List<String>? = null,
     var tasks: List<ProcedureArguments> = listOf()
-)
-
-data class AgentTuning(
-    // Every tool call stops at this many seconds unless the tool asks for something else
-    var toolTimeoutSeconds: Int = 300,
-    // A call asking for longer than this waits for the user's approval first
-    var toolTimeoutConfirmThresholdSeconds: Int = 3600,
-    // How long that approval waits before the call counts as declined
-    var toolTimeoutApprovalSeconds: Int = 300,
-    // Nothing may ask for more than this, approved or not
-    var maxToolTimeoutSeconds: Int = 86400
 )
 
 data class General(
