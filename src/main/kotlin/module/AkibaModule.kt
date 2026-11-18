@@ -201,8 +201,30 @@ abstract class AkibaModule (
      * A copy of the binary sits at the program root and is linked in as `binary`, so scripts can
      * use `./binary` without touching the file in `binariesRoot`.
      */
+    /**
+     * Whether each run gets its own directory.
+     *
+     * A script run may overwrite what the previous one produced; a conversation must not, because
+     * two answers that cite "the output file" would point at the same place.
+     */
+    open val workspaceOutputIsTimestamped: Boolean
+        get() = false
+
+    /**
+     * Whether this module *is* the scope rather than a tool inside it.
+     *
+     * A conversation's own directory is its workspace; timestamping it would move the agent's
+     * files out from under it on every start.
+     */
+    open val workspaceIsScopeRoot: Boolean
+        get() = false
+
     val workspaceDir: Path by lazy {
-        val dir = WorkspacePaths.moduleOutput(workspaceScopeRoot, this.javaClass.simpleName, false, "")
+        val stamp = java.time.LocalDateTime.now()
+            .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))
+        val dir = if (workspaceIsScopeRoot) workspaceScopeRoot else WorkspacePaths.moduleOutput(
+            workspaceScopeRoot, this.javaClass.simpleName, workspaceOutputIsTimestamped, stamp,
+        )
         if (!Files.exists(dir)) Files.createDirectories(dir)
         provisionBinaryLink(dir)
         dir
@@ -217,6 +239,17 @@ abstract class AkibaModule (
             if (sourceFile.exists() && !Files.exists(binaryCopy)) {
                 Files.createDirectories(binaryCopy.parent)
                 sourceFile.copyTo(binaryCopy.toFile())
+            }
+            if (workspaceScopeRoot != programWorkspaceRoot) {
+                val scopeLink = workspaceScopeRoot.resolve("binary")
+                if (!Files.exists(scopeLink)) {
+                    Files.createDirectories(workspaceScopeRoot)
+                    try {
+                        Files.createSymbolicLink(scopeLink, binaryCopy)
+                    } catch (_: java.nio.file.FileSystemException) {
+                        if (!Files.exists(scopeLink)) sourceFile.copyTo(scopeLink.toFile())
+                    }
+                }
             }
             val link = dir.resolve("binary")
             if (Files.exists(binaryCopy) && !Files.exists(link)) {

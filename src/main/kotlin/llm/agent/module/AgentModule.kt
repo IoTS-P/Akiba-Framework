@@ -97,7 +97,28 @@ abstract class AgentModule(
      * showing the user a modal).
      */
     var agentSessionId: String? = null
-        protected set
+
+    /**
+     * A conversation keeps its files in `<workspaceRoot>/<project>/sessions/<id>/`, beside the
+     * programs it may work on rather than inside one of them: the program can change, the files
+     * must not, and deleting a program must leave the conversation intact.
+     */
+    override val workspaceScopeRoot: java.nio.file.Path
+        get() {
+            val sessionId = agentSessionId
+            if (sessionId == null) return super.workspaceScopeRoot
+            val project = org.iotsplab.akiba.managers.WorkspaceManager.projectName ?: "default"
+            return org.iotsplab.akiba.managers.WorkspacePaths
+                .sessionRoot(org.iotsplab.akiba.managers.ConfigManager.mainConf.workspaceRoot, project, sessionId)
+        }
+
+    /** Two calls to the same module in one conversation must not overwrite each other. */
+    override val workspaceOutputIsTimestamped: Boolean
+        get() = true
+
+    /** The session directory is the workspace the agent lives in. */
+    override val workspaceIsScopeRoot: Boolean
+        get() = true
 
     /**
      * The agent instance (created during [startProcess]).

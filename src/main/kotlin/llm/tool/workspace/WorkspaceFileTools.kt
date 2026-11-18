@@ -113,7 +113,7 @@ private fun resolveAndValidateWorkspacePath(parent: AkibaModule, relativePath: S
         try {
             val realPath = resolved.toRealPath()
             val realWorkspaceRoot = workspaceRoot.toRealPath()
-            if (!realPath.startsWith(realWorkspaceRoot)) return null
+            if (!realPath.startsWith(realWorkspaceRoot) && !isLinkedBinary(parent, resolved, realPath)) return null
         } catch (e: Exception) {
             swallowedLog.warn("resolveAndValidateWorkspacePath: {}", e.message)
             return null
@@ -121,6 +121,24 @@ private fun resolveAndValidateWorkspacePath(parent: AkibaModule, relativePath: S
     }
 
     return resolved
+}
+
+/**
+ * The single path allowed to resolve outside the workspace.
+ *
+ * A conversation keeps its files in the session directory but the binary lives with the program,
+ * so `binary` is a link that leaves the tree by design. Only that name, only when it really is
+ * the bound program's binary, and only when the request is exactly `binary` itself.
+ */
+private fun isLinkedBinary(parent: AkibaModule, resolved: Path, realPath: Path): Boolean {
+    if (resolved.fileName?.toString() != "binary") return false
+    return try {
+        val programBinary = parent.programWorkspaceRoot.resolve("binary")
+        Files.exists(programBinary) && programBinary.toRealPath() == realPath
+    } catch (e: Exception) {
+        swallowedLog.warn("isLinkedBinary: {}", e.message)
+        false
+    }
 }
 
 /**
