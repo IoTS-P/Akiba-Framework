@@ -47,6 +47,7 @@ import org.iotsplab.akiba.managers.GarImporter
 import org.iotsplab.akiba.managers.ProjectIndex
 import org.iotsplab.akiba.managers.ProjectLock
 import org.iotsplab.akiba.managers.ProjectLockOwner
+import org.iotsplab.akiba.managers.ProgramWorkspace
 import org.iotsplab.akiba.managers.ProjectPrograms
 import org.iotsplab.akiba.managers.WorkspaceManager
 
@@ -138,6 +139,8 @@ data class CopyProgramRequest(
     val fromProject: String,
     val programName: String,
     val asName: String? = null,
+    /** Copying files is opt-in: most copies are a fresh start for the same binary. */
+    val withWorkspace: Boolean = false,
 )
 
 /** Body of `POST /projects/{name}/programs/import`. */
@@ -167,6 +170,8 @@ data class TransferEntryRequest(
     val path: String,
     val targetFolder: String = "",
     val move: Boolean = false,
+    /** A cross-project copy may carry the files along; a plain move always does. */
+    val withWorkspace: Boolean = false,
 )
 
 /** Copy an entry into a folder of the same project. */
@@ -842,6 +847,17 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             )
             // A conversation bound to the moved program follows it: otherwise it
             // keeps pointing at a project that no longer holds its program.
+            if (req.move) {
+                ProgramWorkspace.move(
+                    ProgramWorkspace.dir(ConfigManager.mainConf.workspaceRoot, req.fromProject, req.path),
+                    ProgramWorkspace.dir(ConfigManager.mainConf.workspaceRoot, targetProject, path),
+                )
+            } else if (req.withWorkspace) {
+                ProgramWorkspace.copy(
+                    ProgramWorkspace.dir(ConfigManager.mainConf.workspaceRoot, req.fromProject, req.path),
+                    ProgramWorkspace.dir(ConfigManager.mainConf.workspaceRoot, targetProject, path),
+                )
+            }
             val migrated = if (req.move) {
                 runCatching {
                     withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
@@ -895,7 +911,11 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
         }
         try {
             ProjectPrograms.deleteEntry(name, call.currentUserGhidraProjectsRoot(), path)
-            call.respond(mapOf("status" to "ok"))
+            // The program is gone from Ghidra; its files follow. Failing here is reported, not
+            // thrown: there is nothing left to roll back to.
+            val removed = ProgramWorkspace.delete(
+                ConfigManager.mainConf.workspaceRoot, name, path)
+            call.respond(mapOf("status" to "ok", "workspaceRemoved" to removed))
         } catch (e: IllegalArgumentException) {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Cannot delete")))
         } catch (e: Exception) {
@@ -936,6 +956,15 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                 projectDirectory = call.currentUserGhidraProjectsRoot(),
                 asName = req.asName,
             )
+            if (req.withWorkspace) {
+                val sourcePath = req.programName
+                val targetPath = listOf(outcome.target.trim('/'), outcome.program.trim('/'))
+                    .filter { it.isNotEmpty() }.joinToString("/")
+                ProgramWorkspace.copy(
+                    ProgramWorkspace.dir(ConfigManager.mainConf.workspaceRoot, req.fromProject, sourcePath),
+                    ProgramWorkspace.dir(ConfigManager.mainConf.workspaceRoot, targetProject, targetPath),
+                )
+            }
             call.respond(mapOf(
                 "source" to outcome.source,
                 "target" to outcome.target,
