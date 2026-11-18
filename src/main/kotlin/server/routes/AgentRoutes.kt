@@ -287,6 +287,8 @@ data class StreamChunkRequest(
     val done: Boolean = false,
     val error: String? = null,
     val newGeneration: Boolean = false,
+    /** `text` for answer deltas, `tool_start` / `tool_end` for tool events. */
+    val kind: String = "text",
     val chunks: List<StreamChunkPayload> = emptyList(),
 )
 
@@ -300,6 +302,8 @@ data class StreamChunkPayload(
     val done: Boolean = false,
     val error: String? = null,
     val newGeneration: Boolean = false,
+    /** `text` for answer deltas, `tool_start` / `tool_end` for tool events. */
+    val kind: String = "text",
 )
 
 /** Sessions whose last turn the user stopped, so /chat answers calmly. */
@@ -461,6 +465,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     done = req.done,
                     error = req.error,
                     newGeneration = req.newGeneration,
+                    kind = req.kind,
                 )
             )
         } else {
@@ -476,6 +481,7 @@ fun Route.agentRoutes(daemonHost: String, daemonPort: Int) {
                     done = payload.done,
                     error = payload.error,
                     newGeneration = payload.newGeneration,
+                    kind = payload.kind,
                 )
             )
         }
