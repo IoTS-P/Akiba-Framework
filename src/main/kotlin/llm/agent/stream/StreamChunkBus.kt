@@ -104,10 +104,13 @@ object StreamChunkBus {
             // generation: their payload is not answer text.
             val implicitStart = isText && chunk.delta.isNotEmpty() && chunk.chunkCount <= 1
             if (chunk.newGeneration || (!hist.generationExplicit && implicitStart)) {
-                // New LLM generation — drop anything from the previous one.
+                // New LLM generation — drop the previous one's text, but keep its tool
+                // events: a fast model starts the next generation before the browser has
+                // polled, and clearing them there left a card spinning with no end in
+                // sight.  The client matches start and end by id, so a late end is fine.
                 hist.generation++
                 hist.generationExplicit = chunk.newGeneration
-                hist.chunks.clear()
+                hist.chunks.removeAll { it.kind == KIND_TEXT }
                 hist.done = false
                 hist.error = null
                 hist.maxDeltaCount = 0

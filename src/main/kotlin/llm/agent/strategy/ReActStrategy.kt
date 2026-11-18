@@ -282,9 +282,10 @@ class ReActStrategy : AgentStrategy {
                             0L,
                         )
                     } else {
-                        publishToolEvent(ctx, toolCall, StreamChunkBus.KIND_TOOL_START, 0L)
+                        val callId = "${toolCall.name}:${System.nanoTime()}"
+                        publishToolEvent(ctx, toolCall, StreamChunkBus.KIND_TOOL_START, 0L, callId)
                         val executed = ctx.executeToolWithDuration(toolCall)
-                        publishToolEvent(ctx, toolCall, StreamChunkBus.KIND_TOOL_END, executed.durationMs)
+                        publishToolEvent(ctx, toolCall, StreamChunkBus.KIND_TOOL_END, executed.durationMs, callId)
                         executed
                     }
                     val observation = toolResult.output
@@ -504,15 +505,18 @@ class ReActStrategy : AgentStrategy {
             // showing the raw JSON as the final message.  Bounded like the text
             // protocol so a model that keeps emitting an unknown call still
             // ends the run instead of looping to max iterations.
-            usesNativeToolProtocol(ctx) ->
-                if (ToolCallParser.hasExplicitTextCall(text) &&
-                    ctx.stats.consecutiveNoActionTurns <= MAX_NO_ACTION_TURNS
-                ) null else text
+            // Native protocol: reaching here means the API field carried no tool
+            // call, so this text is the answer.  (An old guard looked for a call
+            // object in the prose and suppressed answers that merely quoted JSON,
+            // which then produced a "you did not call a tool" reminder.)
+            usesNativeToolProtocol(ctx) -> text
             // No tools registered at all: any normal stop is the answer.
             ctx.toolRegistry.isEmpty() -> text
-            // Text protocol: only after the reminder failed to produce a call.
+            // Text protocol: give one reminder, but only when the reply looks like a
+            // call that was cut off — plain prose is an answer, not a failed call.
             ctx.stats.consecutiveNoActionTurns >= MAX_NO_ACTION_TURNS -> text
-            else -> null
+            ToolCallParser.looksInterrupted(text) -> null
+            else -> text
         }
     }
 
@@ -531,12 +535,13 @@ class ReActStrategy : AgentStrategy {
         toolCall: ParsedToolCall,
         kind: String,
         durationMs: Long,
+        callId: String,
     ) {
         val sessionId = ctx.sessionId ?: return
         val payload = runCatching {
             AkibaJson.mapper.writeValueAsString(
                 mapOf(
-                    "id" to "${toolCall.name}:${toolCall.argumentsJson.hashCode()}",
+                    "id" to callId,
                     "name" to toolCall.name,
                     "args" to toolCall.argumentsJson.take(300),
                     "ms" to durationMs,
