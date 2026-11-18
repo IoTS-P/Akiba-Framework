@@ -1,5 +1,7 @@
 package org.iotsplab.akiba.llm.tool.analysis
 
+import org.apache.logging.log4j.LogManager
+
 import kotlin.system.measureTimeMillis
 import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
@@ -11,6 +13,9 @@ import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.module.RuntimeReport
 import org.iotsplab.akiba.script.ScriptInstance
 import org.iotsplab.akiba.utils.AkibaJson
+
+/** Where ignored failures are reported for this file. */
+private val swallowedLog = LogManager.getLogger("ScriptLibraryTool")
 
 /**
  * A library of pre-built, battle-tested Kotlin scripts for common binary
@@ -285,7 +290,8 @@ private fun loadDbLibraryScripts(agentDbClient: AgentDatabaseClient): List<Scrip
                 dbId = info.id
             )
         }
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+        swallowedLog.warn("loadDbLibraryScripts: {}", e.message)
         emptyList()
     }
 }
@@ -523,12 +529,17 @@ private fun runLibraryScript(
             ?: agentDbClient.createScript(
                 name = script.name, code = finalSource, maxOutputSize = 10 * 1024 * 1024
             )
-    } catch (_: Exception) { -1 }
+    } catch (e: Exception) {
+        swallowedLog.warn("runLibraryScript: {}", e.message)
+        -1
+    }
     if (scriptDbId >= 0) {
         try {
             executionId = agentDbClient.createScriptExecution(scriptDbId, targetBinaryId)
             agentDbClient.updateScriptExecution(executionId, null, "running", null)
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            swallowedLog.warn("runLibraryScript: {}", e.message)
+        }
     }
 
     return try {
@@ -581,12 +592,16 @@ private fun runLibraryScript(
             if (executionId != null) {
                 agentDbClient.updateScriptExecution(executionId, outputText, "completed", null)
             }
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            swallowedLog.warn("runLibraryScript: {}", e.message)
+        }
         try {
             if (scriptDbId >= 0) {
                 agentDbClient.updateScriptOutput(scriptDbId, outputText, "completed")
             }
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            swallowedLog.warn("runLibraryScript: {}", e.message)
+        }
 
         finalResult
     } catch (e: org.iotsplab.akiba.script.CompilationException) {
@@ -595,7 +610,9 @@ private fun runLibraryScript(
                 agentDbClient.updateScriptExecution(executionId, null, "failed", "Compilation: ${e.message}")
             if (scriptDbId >= 0)
                 agentDbClient.updateScriptOutput(scriptDbId, "Compilation: ${e.message}", "failed")
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            swallowedLog.warn("runLibraryScript: {}", e.message)
+        }
         "Error: library script '${script.name}' compilation failed: ${e.message}"
     } catch (e: Exception) {
         val detail = e.message ?: buildString {
@@ -608,7 +625,9 @@ private fun runLibraryScript(
                 agentDbClient.updateScriptExecution(executionId, null, "failed", "${e.javaClass.simpleName}: $detail")
             if (scriptDbId >= 0)
                 agentDbClient.updateScriptOutput(scriptDbId, "Error: $detail", "failed")
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            swallowedLog.warn("runLibraryScript: {}", e.message)
+        }
         "Error running library script '${script.name}': $detail"
     }
 }

@@ -50,6 +50,9 @@ import org.iotsplab.akiba.managers.ProjectLockOwner
 import org.iotsplab.akiba.managers.ProjectPrograms
 import org.iotsplab.akiba.managers.WorkspaceManager
 
+/** Where ignored failures are reported for this file. */
+private val swallowedLog = LogManager.getLogger("ProjectRoutes")
+
 data class GhidraProjectInfo(
     val name: String,
     val sessionCount: Int,
@@ -205,7 +208,8 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                             .mapNotNull { it.projectName?.takeIf { p -> p.isNotBlank() } }
                             .forEach { sessionCounts[it] = (sessionCounts[it] ?: 0) + 1 }
                     }
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    swallowedLog.warn("projectRoutes: {}", e.message)
                     // DB unavailable / not selected — keep zero counts and proceed.
                 }
             }
@@ -397,7 +401,10 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                 WorkspaceManager.activeProjectName == projectName) {
                 WorkspaceManager.releaseActiveProject()
             }
-        } catch (_: Exception) { /* best-effort */ }
+        } catch (e: Exception) {
+            swallowedLog.warn("projectRoutes: {}", e.message)
+            /* best-effort */
+        }
 
         val deletedFiles = mutableListOf<String>()
         val errors = mutableListOf<String>()
@@ -468,7 +475,10 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
                                             deletedLogDirs.add(logDir.name)
                                         }
                                     }
-                                } catch (_: Exception) { /* skip unreadable config */ }
+                                } catch (e: Exception) {
+                                    swallowedLog.warn("projectRoutes: {}", e.message)
+                                    /* skip unreadable config */
+                                }
                             } else if (logDir.name == projectName) {
                                 // No config.json but directory name matches — delete it.
                                 logDir.toFile().deleteRecursively()
@@ -571,7 +581,10 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
 
             try {
                 project.projectData.refresh(true)
-            } catch (_: Exception) { /* best-effort */ }
+            } catch (e: Exception) {
+                swallowedLog.warn("projectRoutes: {}", e.message)
+                /* best-effort */
+            }
 
             val programs = mutableListOf<Map<String, Any?>>()
             collectDomainFilesForListing(project.projectData.rootFolder).forEach { domainFile: DomainFile ->
@@ -1194,7 +1207,9 @@ fun Route.projectRoutes(daemonHost: String, daemonPort: Int) {
             val (status, body) = errorPayload(e)
             call.respond(status, body)
         } finally {
-            try { uploadDir.toFile().deleteRecursively() } catch (_: Exception) {}
+            try { uploadDir.toFile().deleteRecursively() } catch (e: Exception) {
+                swallowedLog.warn("projectRoutes: {}", e.message)
+            }
         }
     }
 }
@@ -1250,7 +1265,10 @@ private fun archiveProject(
         //    and `createProjectMarkerFile()` recreates it), so a marker missing
         //    on disk still gets a 0-byte placeholder to keep indices correct.
         val markerBytes = if (markerFile.isFile) {
-            try { Files.readAllBytes(markerFile.toPath()) } catch (_: Exception) { ByteArray(0) }
+            try { Files.readAllBytes(markerFile.toPath()) } catch (e: Exception) {
+                swallowedLog.warn("archiveProject: {}", e.message)
+                ByteArray(0)
+            }
         } else {
             ByteArray(0)
         }
@@ -1360,7 +1378,9 @@ private fun findAkibaScript(): String {
             val script = File(distRoot, "bin/akiba")
             if (script.isFile) return script.absolutePath
         }
-    } catch (_: Exception) { }
+    } catch (e: Exception) {
+        swallowedLog.warn("findAkibaScript: {}", e.message)
+    }
     val cwd = System.getProperty("user.dir", ".")
     for (candidate in listOf(File(cwd, "bin/akiba"), File(cwd, "../bin/akiba"))) {
         if (candidate.isFile) return candidate.absolutePath
@@ -1419,7 +1439,8 @@ private fun findProjectLockFiles(projectDirectory: Path, projectName: String): L
                     .limit(8)
                     .forEach { lockNames += repDir.relativize(it).toString() }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.warn("findProjectLockFiles: {}", e.message)
             // Best-effort only: failing to scan lock files must not break the
             // status endpoint; openProject will still fail safely if locked.
         }

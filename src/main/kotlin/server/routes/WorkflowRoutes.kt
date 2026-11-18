@@ -22,6 +22,9 @@ import org.iotsplab.akiba.llm.config.LLMKeyFileStore
 import org.iotsplab.akiba.managers.WorkspaceManager
 import org.iotsplab.akiba.utils.AkibaJson
 
+/** Where ignored failures are reported for this file. */
+private val swallowedLog = LogManager.getLogger("WorkflowRoutes")
+
 private val logger: Logger = LogManager.getLogger("WorkflowRoutes")
 private val mapper = AkibaJson.mapper
 
@@ -182,7 +185,9 @@ object WorkflowManager {
                             }
                         }
                     }
-                } catch (_: Exception) { }
+                } catch (e: Exception) {
+                    swallowedLog.warn("startWorkflowAsync: {}", e.message)
+                }
 
                 if (exitCode == 0) {
                     ProgressManager.updateStatus(progressToken, "completed")
@@ -248,7 +253,8 @@ object WorkflowManager {
                             Runtime.getRuntime().exec(arrayOf("kill", "-INT", pid.toString()))
                                 .waitFor(2, java.util.concurrent.TimeUnit.SECONDS)
                             logger.info("Sent SIGINT to workflow subprocess (pid $pid)")
-                        } catch (_: Exception) {
+                        } catch (e: Exception) {
+                            swallowedLog.warn("stopWorkflow: {}", e.message)
                             // Fallback: SIGTERM via destroy()
                             process.destroy()
                             logger.info("Sent SIGTERM to workflow subprocess (pid $pid)")
@@ -272,7 +278,8 @@ object WorkflowManager {
                 } else {
                     logger.info("Workflow subprocess (pid ${process.pid()}) exited cleanly")
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                swallowedLog.warn("stopWorkflow: {}", e.message)
                 process.destroyForcibly()
             }
             runningProcesses.remove(workflowId)
@@ -392,7 +399,9 @@ private fun findAkibaScript(): String {
             val script = File(distRoot, "bin/akiba")
             if (script.isFile) return script.absolutePath
         }
-    } catch (_: Exception) { }
+    } catch (e: Exception) {
+        swallowedLog.warn("findAkibaScript: {}", e.message)
+    }
     val cwd = System.getProperty("user.dir", ".")
     val candidates = listOf(
         File(cwd, "bin/akiba"),
@@ -525,7 +534,10 @@ fun Route.workflowRoutes(daemonHost: String, daemonPort: Int) {
                                     .toList()
                                 for (logFile in logFiles) {
                                     val moduleName = logFile.fileName.toString().removeSuffix(".log")
-                                    val logContent = try { Files.readString(logFile) } catch (_: Exception) { "" }
+                                    val logContent = try { Files.readString(logFile) } catch (e: Exception) {
+                                        swallowedLog.warn("workflowRoutes: {}", e.message)
+                                        ""
+                                    }
                                     modules.add(mapOf(
                                         "name" to moduleName,
                                         "status" to "completed",
@@ -536,7 +548,9 @@ fun Route.workflowRoutes(daemonHost: String, daemonPort: Int) {
                         }
                     }
                 }
-            } catch (_: Exception) { }
+            } catch (e: Exception) {
+                swallowedLog.warn("workflowRoutes: {}", e.message)
+            }
         }
         call.respond(mapOf("modules" to modules))
     }

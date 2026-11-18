@@ -1,5 +1,7 @@
 package org.iotsplab.akiba.managers
 
+import org.apache.logging.log4j.LogManager
+
 import com.google.errorprone.annotations.FormatString
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager
 import ghidra.app.util.importer.ProgramLoader
@@ -46,6 +48,9 @@ import org.iotsplab.akiba.utils.ProgressReporter
 import org.iotsplab.akiba.utils.WithTableColumn
 import org.iotsplab.akiba.utils.WithView
 import sun.misc.Signal
+
+/** Where ignored failures are reported for this file. */
+private val swallowedLog = LogManager.getLogger("ProgramManager")
 
 object ProgramManager {
     private val db: DatabaseClient get() = DatabaseClient.global!!
@@ -245,7 +250,8 @@ object ProgramManager {
         if (propertyFile.exists()) {
             return try {
                 Json.decodeFromString<List<BinaryMetadata>>(propertyFile.toFile().readText())
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                swallowedLog.warn("readMetadata: {}", e.message)
                 throw RuntimeException("Failed to deserialize properties.json")
             }
         }
@@ -469,7 +475,9 @@ object ProgramManager {
 
         if (stopRequested) {
             globalLogger.info("Stop requested before #${metadata.id} started setup; skipping")
-            try { logDir.moveTo(runtimeErrorDir.resolve(logDir.fileName)) } catch (_: Exception) {}
+            try { logDir.moveTo(runtimeErrorDir.resolve(logDir.fileName)) } catch (e: Exception) {
+                swallowedLog.warn("workOnBinary: {}", e.message)
+            }
             ProgressReporter.report("[FILE:${metadata.id}] stopped")
             return
         }
@@ -507,7 +515,9 @@ object ProgramManager {
                     globalLogger.error("Unable to find program in the project, skipped.")
                     try {
                         logDir.moveTo(notFoundDir.resolve(logDir.fileName))
-                    } catch (_: Exception) {}
+                    } catch (e: Exception) {
+                        swallowedLog.warn("workOnBinary: {}", e.message)
+                    }
                     return
                 } else {
                     programInitLock.withLock {
@@ -598,13 +608,17 @@ object ProgramManager {
                 finalized = true
             } else {
                 ProgressReporter.report("[FILE:${metadata.id}] failed")
-                try { logDir.moveTo(failedDir.resolve(logDir.fileName)) } catch (_: Exception) {}
+                try { logDir.moveTo(failedDir.resolve(logDir.fileName)) } catch (e: Exception) {
+                    swallowedLog.warn("workOnBinary: {}", e.message)
+                }
                 finalized = true
             }
         } catch (e: NoSuchMethodError) {
             // Ensure tx is closed on error paths
             if (program != null && moduleTxId >= 0) {
-                try { program!!.endTransaction(moduleTxId, false) } catch (_: Exception) {}
+                try { program!!.endTransaction(moduleTxId, false) } catch (e: Exception) {
+                    swallowedLog.warn("workOnBinary: {}", e.message)
+                }
             }
             globalLogger.error("Fatal error, there exists a method not found. It may be caused by incorrect module" +
                     "dependencies or incorrect module definitions. Check your module code.")
@@ -612,12 +626,16 @@ object ProgramManager {
             Signal.raise(Signal("INT"))
         } catch (e: DuplicateFileException) {
             if (program != null && moduleTxId >= 0) {
-                try { program!!.endTransaction(moduleTxId, false) } catch (_: Exception) {}
+                try { program!!.endTransaction(moduleTxId, false) } catch (e: Exception) {
+                    swallowedLog.warn("workOnBinary: {}", e.message)
+                }
             }
             globalLogger.error("duplicated file found: ${e.message}")
         } catch (e: Exception) {     // If we reach here, it means that something bad happens.
             if (program != null && moduleTxId >= 0) {
-                try { program!!.endTransaction(moduleTxId, false) } catch (_: Exception) {}
+                try { program!!.endTransaction(moduleTxId, false) } catch (e: Exception) {
+                    swallowedLog.warn("workOnBinary: {}", e.message)
+                }
             }
             globalLogger.error(
                 "Exception occurred while running #${metadata.id}: ${e.message} (${e.javaClass.simpleName})")
@@ -729,7 +747,8 @@ object ProgramManager {
                 // If not raw binary, it seems Ghidra has identified the format
                 if (it.executableFormat != "Raw Binary") it else null
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.warn("tryCreateProgramWithAutoDetect: {}", e.message)
             null
         }
     }
@@ -814,7 +833,8 @@ object ProgramManager {
 
         val loadResults = try {
             builder.load()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.warn("loadProgram: {}", e.message)
             return null
         }
 

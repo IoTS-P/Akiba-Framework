@@ -1,5 +1,7 @@
 package org.iotsplab.akiba.llm.tool.ui
 
+import org.apache.logging.log4j.LogManager
+
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -21,6 +23,9 @@ import org.iotsplab.akiba.llm.tool.core.Tool
 import org.iotsplab.akiba.llm.tool.core.ToolParameter
 import org.iotsplab.akiba.llm.tool.core.detectWorkerServerPort
 import org.iotsplab.akiba.utils.AkibaJson
+
+/** Where ignored failures are reported for this file. */
+private val swallowedLog = LogManager.getLogger("UserChoiceTool")
 
 // ============================================================
 //  UserChoiceManager — in-process "ask the user to pick one" gate
@@ -181,7 +186,8 @@ object UserChoiceManager {
         } catch (_: TimeoutCancellationException) {
             removeEntry(entry, "Choice request timed out.")
             UserChoiceEvent.TimedOut
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.warn("awaitEvent: {}", e.message)
             removeEntry(entry, "Choice request closed.")
             UserChoiceEvent.Resolved(null)
         }
@@ -256,7 +262,8 @@ object UserChoiceManager {
         entry.btwChannel.send(exchange)
         return try {
             withTimeout(awaitTimeoutMs) { exchange.deferred.await() }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.warn("submitBtw: {}", e.message)
             "(the assistant did not answer in time — you may still pick an option)"
         }
     }
@@ -367,7 +374,8 @@ fun requestChoiceViaHttp(
                 .connectTimeout(Duration.ofSeconds(10))
                 .build()
                 .send(request, HttpResponse.BodyHandlers.ofString())
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.warn("requestChoiceViaHttp: {}", e.message)
             return null
         }
         if (response.statusCode() !in 200..299) return null
@@ -381,7 +389,8 @@ fun requestChoiceViaHttp(
                 btwId = raw["btwId"] as? String,
                 btwQuestion = raw["btwQuestion"] as? String
             )
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.warn("requestChoiceViaHttp: {}", e.message)
             return null
         }
 
@@ -478,7 +487,8 @@ fun AskUserChoiceTool(
                 try {
                     mapper.readValue(trimmed, Array<String>::class.java)
                         .map { it.trim() }.filter { it.isNotEmpty() }
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    swallowedLog.warn("AskUserChoiceTool: {}", e.message)
                     return@Tool "Error: 'options' is not a valid JSON array of strings"
                 }
             } else {
@@ -558,7 +568,8 @@ fun AskUserChoiceTool(
             System.err.flush()
             val response = try {
                 System.`in`.bufferedReader().readLine()?.trim()
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                swallowedLog.warn("AskUserChoiceTool: {}", e.message)
                 null
             }
             when {

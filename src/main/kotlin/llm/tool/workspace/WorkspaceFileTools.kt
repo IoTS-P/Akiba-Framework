@@ -1,5 +1,7 @@
 package org.iotsplab.akiba.llm.tool.workspace
 
+import org.apache.logging.log4j.LogManager
+
 import java.io.IOException
 import java.nio.charset.Charset
 import java.nio.file.FileVisitResult
@@ -18,6 +20,9 @@ import org.iotsplab.akiba.llm.tool.core.detectWorkerServerPort
 import org.iotsplab.akiba.llm.tool.core.requestConfirmationViaHttp
 import org.iotsplab.akiba.module.AkibaModule
 import org.iotsplab.akiba.utils.AkibaJson
+
+/** Where ignored failures are reported for this file. */
+private val swallowedLog = LogManager.getLogger("WorkspaceFileTools")
 
 // ============================================================
 //  WorkspaceFileTools — sandboxed file I/O for LLM agents
@@ -109,7 +114,8 @@ private fun resolveAndValidateWorkspacePath(parent: AkibaModule, relativePath: S
             val realPath = resolved.toRealPath()
             val realWorkspaceRoot = workspaceRoot.toRealPath()
             if (!realPath.startsWith(realWorkspaceRoot)) return null
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.warn("resolveAndValidateWorkspacePath: {}", e.message)
             return null
         }
     }
@@ -172,7 +178,8 @@ private fun resolvePathWithBoundary(parent: AkibaModule, rawPath: String): Resol
             val realPath = resolved.toRealPath()
             val realWorkspaceRoot = workspaceRoot.toRealPath()
             inside = realPath.startsWith(realWorkspaceRoot)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.warn("resolvePathWithBoundary: {}", e.message)
             return null
         }
     }
@@ -760,7 +767,10 @@ private fun ListWorkspaceDirTool(parent: AkibaModule): Tool = Tool(
                 stream.forEach { entry ->
                     val isDir = Files.isDirectory(entry)
                     val size = if (!isDir) {
-                        try { Files.size(entry) } catch (_: Exception) { 0L }
+                        try { Files.size(entry) } catch (e: Exception) {
+                            swallowedLog.warn("preVisitDirectory: {}", e.message)
+                            0L
+                        }
                     } else 0L
                     entries.add(mapOf(
                         "path" to entry.fileName.toString(),
@@ -1159,7 +1169,10 @@ private fun GrepWorkspaceTool(parent: AkibaModule): Tool = Tool(
      */
     fun grepFile(file: Path) {
         // Skip files larger than the size limit
-        val size = try { Files.size(file) } catch (_: Exception) { -1L }
+        val size = try { Files.size(file) } catch (e: Exception) {
+            swallowedLog.warn("grepFile: {}", e.message)
+            -1L
+        }
         if (size < 0 || size > MAX_GREP_FILE_SIZE) {
             filesSkipped++
             return
@@ -1172,7 +1185,8 @@ private fun GrepWorkspaceTool(parent: AkibaModule): Tool = Tool(
                 filesSkipped++
                 return
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.warn("grepFile: {}", e.message)
             filesSkipped++
             return
         }
@@ -1198,7 +1212,8 @@ private fun GrepWorkspaceTool(parent: AkibaModule): Tool = Tool(
                     }
                 }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.warn("grepFile: {}", e.message)
             // File could not be read as text — skip
             filesSkipped++
         }

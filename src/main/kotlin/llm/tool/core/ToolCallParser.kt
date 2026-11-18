@@ -1,10 +1,15 @@
 package org.iotsplab.akiba.llm.tool.core
 
+import org.apache.logging.log4j.LogManager
+
 import com.fasterxml.jackson.module.kotlin.readValue
 import kotlin.collections.get
 import org.iotsplab.akiba.llm.agent.core.ParsedToolCall
 import org.iotsplab.akiba.llm.client.ChatCompletion
 import org.iotsplab.akiba.utils.AkibaJson
+
+/** Where ignored failures are reported for this file. */
+private val swallowedLog = LogManager.getLogger("ToolCallParser")
 
 // ============================================================
 //  Tool call parsing — shared across strategies
@@ -212,7 +217,8 @@ object ToolCallParser {
         return try {
             val parsed = mapper.readValue<Map<String, Any?>>(jsonStr)
             parseToolCallsFromMap(parsed)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.debug("tryParseToolCallJson: {}", e.message)
             emptyList()
         }
     }
@@ -322,7 +328,10 @@ object ToolCallParser {
             val trimmed = raw.trim()
             if (trimmed.isEmpty()) emptyMap()
             else try { mapper.readValue(trimmed, Map::class.java) as Map<String, Any?> }
-            catch (_: Exception) { mapOf("_raw" to raw) }
+catch (e: Exception) {
+                swallowedLog.debug("parseArguments: {}", e.message)
+                mapOf("_raw" to raw)
+            }
         }
         else -> mapOf("_raw" to raw)
     }
@@ -433,7 +442,8 @@ object ToolCallParser {
             val first = completion.toolCalls.first()
             val args: Map<String, Any?> = try {
                 mapper.readValue(first.argumentsJson)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                swallowedLog.debug("parseFromCompletion: {}", e.message)
                 emptyMap()
             }
             return ParsedToolCall(
@@ -463,7 +473,8 @@ object ToolCallParser {
             return completion.toolCalls.map { tc ->
                 val args: Map<String, Any?> = try {
                     mapper.readValue(tc.argumentsJson)
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    swallowedLog.debug("parseAllFromCompletion: {}", e.message)
                     emptyMap()
                 }
                 ParsedToolCall(
@@ -572,7 +583,8 @@ object ToolCallParser {
     private fun isExplicitCallObject(jsonStr: String, inFence: Boolean): Boolean {
         val parsed = try {
             mapper.readValue<Map<String, Any?>>(jsonStr)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.debug("isExplicitCallObject: {}", e.message)
             return false
         }
         if (parsed["tool_call"] is Map<*, *>) return true
@@ -676,7 +688,8 @@ object ToolCallParser {
 
         val parsed = try {
             mapper.readValue<Map<String, Any?>>(jsonStr)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.debug("looksLikeToolCallJson: {}", e.message)
             return null
         }
 

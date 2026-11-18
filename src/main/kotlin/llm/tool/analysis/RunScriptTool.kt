@@ -1,5 +1,7 @@
 package org.iotsplab.akiba.llm.tool.analysis
 
+import org.apache.logging.log4j.LogManager
+
 import com.fasterxml.jackson.databind.node.ObjectNode
 import kotlin.system.measureTimeMillis
 import kotlinx.coroutines.runBlocking
@@ -13,6 +15,9 @@ import org.iotsplab.akiba.script.CompilationException
 import org.iotsplab.akiba.script.ScriptCompiler
 import org.iotsplab.akiba.script.ScriptInstance
 import org.iotsplab.akiba.utils.AkibaJson
+
+/** Where ignored failures are reported for this file. */
+private val swallowedLog = LogManager.getLogger("RunScriptTool")
 
 /**
  * Create a tool that dynamically compiles and runs a Kotlin script.
@@ -231,7 +236,8 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
         )
         executionId = agentDbClient.createScriptExecution(scriptDbId, targetId)
         agentDbClient.updateScriptExecution(executionId, null, "running", null)
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+        swallowedLog.warn("execute: {}", e.message)
         // Recording is best-effort; don't block execution if it fails
     }
 
@@ -243,7 +249,9 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
             if (executionId != null) {
                 agentDbClient.updateScriptExecution(executionId, null, "failed", errorMsg)
             }
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            swallowedLog.warn("execute: {}", e.message)
+        }
         return@Tool "Error: script validation failed: ${validationIssues.joinToString("; ")}"
     }
 
@@ -259,7 +267,9 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
                             executionId, null, "failed", "Program not found for binary id=$targetId"
                         )
                     }
-                } catch (_: Exception) { }
+                } catch (e: Exception) {
+                    swallowedLog.warn("execute: {}", e.message)
+                }
                 return@Tool mapper.writeValueAsString(mapOf(
                     "success" to false,
                     "error" to "Program not found for binary id=$targetId"
@@ -304,7 +314,8 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
             val node = mapper.readTree(resultJson)
             (node as? ObjectNode)?.put("totalTimeMs", totalElapsed)
             node?.toString() ?: resultJson
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            swallowedLog.warn("execute: {}", e.message)
             resultJson
         }
 
@@ -314,12 +325,16 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
             if (executionId != null) {
                 agentDbClient.updateScriptExecution(executionId, outputText, "completed", null)
             }
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            swallowedLog.warn("execute: {}", e.message)
+        }
         try {
             if (scriptDbId >= 0) {
                 agentDbClient.updateScriptOutput(scriptDbId, outputText, "completed")
             }
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            swallowedLog.warn("execute: {}", e.message)
+        }
 
         // Save to script library if requested and execution was successful
         if (saveToLibrary) {
@@ -341,7 +356,9 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
                         maxOutputSize = 10 * 1024 * 1024
                     )
                 }
-            } catch (_: Exception) { }
+            } catch (e: Exception) {
+                swallowedLog.warn("execute: {}", e.message)
+            }
         }
 
         finalResult
@@ -350,21 +367,27 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
         try {
             if (executionId != null) agentDbClient.updateScriptExecution(executionId, null, "failed", errorMsg)
             if (scriptDbId >= 0) agentDbClient.updateScriptOutput(scriptDbId, errorMsg, "failed")
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            swallowedLog.warn("execute: {}", e.message)
+        }
         "Error: script compilation failed: ${e.message}"
     } catch (e: IllegalStateException) {
         val errorMsg = "Instantiation error: ${e.message}"
         try {
             if (executionId != null) agentDbClient.updateScriptExecution(executionId, null, "failed", errorMsg)
             if (scriptDbId >= 0) agentDbClient.updateScriptOutput(scriptDbId, errorMsg, "failed")
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            swallowedLog.warn("execute: {}", e.message)
+        }
         "Error: script instantiation failed: ${e.message}"
     } catch (e: Exception) {
         val errorMsg = "${e.javaClass.simpleName}: ${e.message}"
         try {
             if (executionId != null) agentDbClient.updateScriptExecution(executionId, null, "failed", errorMsg)
             if (scriptDbId >= 0) agentDbClient.updateScriptOutput(scriptDbId, errorMsg, "failed")
-        } catch (_: Exception) { }
+        } catch (e: Exception) {
+            swallowedLog.warn("execute: {}", e.message)
+        }
         "Error running script: ${e.message}"
     }
 }
