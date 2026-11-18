@@ -52,6 +52,7 @@ import org.iotsplab.akiba.managers.ConfigManager.mainConf
 import org.iotsplab.akiba.managers.ConfigManager.parseModuleConfig
 import org.iotsplab.akiba.managers.ImportManager
 import org.iotsplab.akiba.managers.WorkspaceManager
+import org.iotsplab.akiba.managers.WorkspacePaths
 import org.iotsplab.akiba.utils.*
 import org.iotsplab.akiba.utils.CoroutineTaskMonitor
 import org.iotsplab.akiba.utils.CoroutineTaskMonitor.Companion.asCoroutineAware
@@ -171,40 +172,65 @@ abstract class AkibaModule (
      * workspace as `binary`, so scripts can use `./binary` without risking the
      * original file in `binariesRoot`.
      */
-    val workspaceDir: Path by lazy {
+    /**
+     * The directory this program owns, shared by every module run against it:
+     * `<workspaceRoot>/<project>/programs/<path inside Ghidra>/`.
+     *
+     * Bringing a file into Akiba is what makes an id; a program's identity for the filesystem is
+     * its path, which is also what a person would look for.
+     */
+    val programWorkspaceRoot: Path by lazy {
         val projectName = WorkspaceManager.projectName ?: "default"
-        val idDir = Path.of(mainConf.workspaceRoot)
-            .resolve(projectName)
-            .resolve(id.toString())
-        val dir = idDir.resolve(this.javaClass.simpleName)
+        val programPath = program?.domainFile?.pathname ?: "/${program?.name ?: "program"}"
+        WorkspacePaths.programRoot(mainConf.workspaceRoot, projectName, programPath)
+    }
+
+    /**
+     * The root this module's output hangs under.
+     *
+     * A script runs a module against a program, so the program's directory is the root. A
+     * conversation owns its own directory, so it overrides this and takes its files with it when
+     * it moves to another program.
+     */
+    open val workspaceScopeRoot: Path
+        get() = programWorkspaceRoot
+
+    /**
+     * Per-module workspace directory, created lazily on first access.
+     *
+     * A copy of the binary sits at the program root and is linked in as `binary`, so scripts can
+     * use `./binary` without touching the file in `binariesRoot`.
+     */
+    val workspaceDir: Path by lazy {
+        val dir = WorkspacePaths.moduleOutput(workspaceScopeRoot, this.javaClass.simpleName, false, "")
         if (!Files.exists(dir)) Files.createDirectories(dir)
-
-        // Provision a binary copy at the <id>/ level and symlink it
-        // into this module's workspace so shell tools / scripts can
-        // access the binary via ./binary without touching the original.
-        if (id > 0) {
-            try {
-                val binaryCopy = idDir.resolve("binary")
-                val sourceFile = usingFile
-                if (sourceFile.exists() && !Files.exists(binaryCopy)) {
-                    sourceFile.copyTo(binaryCopy.toFile())
-                }
-                val link = dir.resolve("binary")
-                if (Files.exists(binaryCopy) && !Files.exists(link)) {
-                    try {
-                        Files.createSymbolicLink(link, binaryCopy)
-                    } catch (_: java.nio.file.FileSystemException) {
-                        // Fallback: some filesystems / containers don't
-                        // support symlinks. Copy the file directly.
-                        if (!Files.exists(link)) {
-                            sourceFile.copyTo(link.toFile())
-                        }
-                    }
-                }
-            } catch (_: Exception) { /* best-effort; workspace still works without the link */ }
-        }
-
+        provisionBinaryLink(dir)
         dir
+    }
+
+    /** Copy the binary once per program and expose it inside [dir] as `binary`. */
+    private fun provisionBinaryLink(dir: Path) {
+        if (id <= 0) return
+        try {
+            val binaryCopy = programWorkspaceRoot.resolve("binary")
+            val sourceFile = usingFile
+            if (sourceFile.exists() && !Files.exists(binaryCopy)) {
+                Files.createDirectories(binaryCopy.parent)
+                sourceFile.copyTo(binaryCopy.toFile())
+            }
+            val link = dir.resolve("binary")
+            if (Files.exists(binaryCopy) && !Files.exists(link)) {
+                try {
+                    Files.createSymbolicLink(link, binaryCopy)
+                } catch (_: java.nio.file.FileSystemException) {
+                    // Some filesystems / containers refuse symlinks; a copy is just as correct.
+                    if (!Files.exists(link)) sourceFile.copyTo(link.toFile())
+                }
+            }
+        } catch (e: Exception) {
+            // Best effort: the workspace still works without the link.
+            logger.warn("workspace: could not link the binary into ${dir.fileName}: ${e.message}")
+        }
     }
 
     /**
