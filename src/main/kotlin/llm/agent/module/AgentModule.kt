@@ -716,6 +716,32 @@ abstract class AgentModule(
     ): Boolean {
         val meta = parseScriptMeta(source, fileName) ?: return false
         return try {
+            // A bundled script whose name is taken is the *same* script from an
+            // earlier build. Inserting again fails on the unique name and leaves
+            // the old code in place forever, so a fix never reached anyone.
+            val existing = runCatching { agentDbClient.listScripts(limit = 500) }
+                .getOrNull()
+                ?.firstOrNull { it.name == meta.name }
+            if (existing != null) {
+                if (existing.author != author) {
+                    logger.info(
+                        "AgentModule {}: keeping script '{}' — it belongs to author '{}'",
+                        this.javaClass.simpleName, meta.name, existing.author,
+                    )
+                    return true
+                }
+                if (existing.code == source) return true
+                agentDbClient.updateScript(
+                    scriptId = existing.id,
+                    description = meta.description,
+                    code = source,
+                )
+                logger.info(
+                    "AgentModule {}: refreshed bundled script '{}' (author='{}') from '{}'",
+                    this.javaClass.simpleName, meta.name, author, resourcePath,
+                )
+                return true
+            }
             agentDbClient.createScript(
                 name = meta.name,
                 description = meta.description,
