@@ -3,6 +3,8 @@ package org.iotsplab.akiba.llm.tool.analysis
 import org.apache.logging.log4j.LogManager
 
 import com.fasterxml.jackson.databind.node.ObjectNode
+import java.nio.file.Files
+import java.nio.file.Path
 import kotlin.system.measureTimeMillis
 import kotlinx.coroutines.runBlocking
 import org.iotsplab.akiba.data.database.AgentDatabaseClient
@@ -145,8 +147,16 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
         ToolParameter(
             "source", "string",
             "Full Kotlin source code of the script. Must define a class extending AkibaScript " +
-                "with `override suspend fun execute()`. Use appendLine() for output.",
-            required = true
+                "with `override suspend fun execute()`. Use appendLine() for output. " +
+                "Mutually exclusive with `scriptPath`.",
+            required = false
+        ),
+        ToolParameter(
+            "scriptPath", "string",
+            "Workspace-relative path of a previously saved script, e.g. scripts/AnalyzeStrings.kts. " +
+                "Read the file and run it, so an earlier script can be edited and re-run without " +
+                "pasting the whole source again. Mutually exclusive with `source`.",
+            required = false
         ),
         ToolParameter(
             "className", "string",
@@ -176,14 +186,35 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
         )
     )
 ) { args ->
-    val source = args["source"] as? String
-        ?: return@Tool "Error: 'source' parameter is required"
+    val inlineSource = (args["source"] as? String)?.takeIf { it.isNotBlank() }
+    val requestedPath = (args["scriptPath"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
 
-    if (source.isBlank()) {
-        return@Tool "Error: source code is empty"
+    if (inlineSource != null && requestedPath != null) {
+        return@Tool "Error: pass either 'source' or 'scriptPath', not both"
+    }
+    if (inlineSource == null && requestedPath == null) {
+        return@Tool "Error: provide 'source' (inline Kotlin) or 'scriptPath' (a script already in the workspace)"
     }
 
-    val className = args["className"] as? String ?: "AkibaDynamicScript"
+    val workspaceRoot: Path = parent.workspaceDir
+
+    // A script read from the workspace is the source of truth: it was saved by an
+    // earlier run so that the agent can edit it in place and run it again.
+    val source: String = if (requestedPath != null) {
+        val candidate = workspaceRoot.resolve(requestedPath).normalize()
+        if (!candidate.startsWith(workspaceRoot.normalize())) {
+            return@Tool "Error: '$requestedPath' is outside the workspace"
+        }
+        if (!Files.isRegularFile(candidate)) {
+            return@Tool "Error: '$requestedPath' does not exist in the workspace"
+        }
+        Files.readString(candidate)
+    } else {
+        inlineSource!!
+    }
+
+    val declaredClass = Regex("""\bclass\s+(\w+)""").find(source)?.groupValues?.get(1)
+    val className = args["className"] as? String ?: declaredClass ?: "AkibaDynamicScript"
     val targetId = (args["targetId"] as? Number)?.toInt() ?: parent.id
     val saveToLibrary = args["saveToLibrary"] as? Boolean ?: false
     val scriptDescription = args["description"] as? String ?: ""
@@ -224,10 +255,22 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
         }
     }
 
-    // 1. Record the script in the per-instance DB (best-effort, before any processing)
+    // The source is saved before it is compiled: a script that fails is exactly the
+    // one the agent wants to open, fix and run again.
+    val savedRelative = "scripts/$className.kts"
+    try {
+        val scriptsDir = workspaceRoot.resolve("scripts")
+        Files.createDirectories(scriptsDir)
+        Files.writeString(scriptsDir.resolve("$className.kts"), source)
+    } catch (e: Exception) {
+        swallowedLog.warn("execute: {}", e.message)
+    }
+
+    // 1. Record the run in the per-instance DB only when the script is meant to be kept.
+    //    Every probe used to land here, and the library filled with one-off scripts.
     var executionId: Int? = null
     var scriptDbId: Int = -1
-    try {
+    if (saveToLibrary) try {
         scriptDbId = agentDbClient.createScript(
             name = className,
             code = source,
@@ -252,7 +295,8 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
         } catch (e: Exception) {
             swallowedLog.warn("execute: {}", e.message)
         }
-        return@Tool "Error: script validation failed: ${validationIssues.joinToString("; ")}"
+        return@Tool "Error: script validation failed: ${validationIssues.joinToString("; ")}" +
+            "\nThe source is saved at $savedRelative — edit it there and re-run with scriptPath."
     }
 
     // 3. Resolve program
@@ -300,6 +344,10 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
                 val data = report?.get(RuntimeReport.KEY_DATA) as? Map<String, Any?>
 
                 resultJson = mapper.writeValueAsString(mapOf(
+                    "savedTo" to savedRelative,
+                    "note" to "The source is saved at $savedRelative in the workspace. " +
+                        "To change it, edit that file and call run_script again with " +
+                        "{scriptPath: \"$savedRelative\"} — there is no need to paste the source.",
                     "success" to success,
                     "failureSign" to script.failureSign,
                     "output" to script.getOutput(),
@@ -370,7 +418,7 @@ fun RunScriptTool(parent: AkibaModule, agentDbClient: AgentDatabaseClient): Tool
         } catch (e: Exception) {
             swallowedLog.warn("execute: {}", e.message)
         }
-        "Error: script compilation failed: ${e.message}"
+        "Error: script compilation failed: ${e.message}\nThe source is saved at $savedRelative — edit it there and re-run with scriptPath."
     } catch (e: IllegalStateException) {
         val errorMsg = "Instantiation error: ${e.message}"
         try {
