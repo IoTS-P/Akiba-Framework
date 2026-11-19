@@ -112,7 +112,7 @@ object AkibaServer {
         // The startup pass only sees restarts. A turn killed while the server
         // keeps running would leave its row "running" and the conversation
         // spinning, so the same reconciliation repeats on a timer.
-        runCatching { AgentSessionSweeper.start(config.daemonHost, config.daemonPort) }
+        runCatching { AgentSessionSweeper.start(dbConfig) }
             .onFailure { logger.warn("AkibaServer: session sweeper did not start: ${it.message}") }
 
         // Drop project-owner notes left by a process that no longer exists. The

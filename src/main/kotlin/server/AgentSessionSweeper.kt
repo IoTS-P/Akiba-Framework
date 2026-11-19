@@ -1,42 +1,43 @@
 package org.iotsplab.akiba.server
 
 import org.apache.logging.log4j.LogManager
-import org.iotsplab.akiba.data.database.AgentDatabaseClient
-import org.iotsplab.akiba.llm.agent.runtime.AgentSessionReconciler
-import org.iotsplab.akiba.server.routes.DaemonIdentities
-import org.iotsplab.akiba.server.routes.withDaemonSession
+import org.iotsplab.akiba.server.db.ServerDbConfig
+import java.sql.Connection
+import java.sql.DriverManager
 import kotlin.concurrent.thread
 
 /**
- * Closes session rows that a dead process left in a running state.
+ * Closes conversation rows that a dead turn left in a running state.
  *
- * The startup pass only covers restarts: a turn killed while the server stays up
- * (a worker that dies, a container stop during a long turn) keeps its row
- * "running" until something clears it, and the conversation spins forever. The
- * pass here repeats on a timer, using the credentials of whoever is signed in —
- * the same ones the routes use, so no service account has to be configured.
+ * The previous attempt reused [org.iotsplab.akiba.llm.agent.runtime.AgentSessionReconciler],
+ * which talks to the daemon as a signed-in user — so it had nothing to say until
+ * somebody logged in, and after every restart it went quiet exactly when its
+ * cleanup was needed. This one talks to PostgreSQL directly with the server's own
+ * credentials, so it works whether anyone is signed in or not.
  *
- * Safety comes from [AgentSessionReconciler] itself: it only closes rows whose
- * `updated_at` is older than the stale window, and a live turn appends messages
- * continuously, so a working conversation is never touched.
+ * Rows are only closed after [staleMinutes] of complete silence: a live turn
+ * writes messages and tool results continuously, so a live conversation is never
+ * touched.
  */
 object AgentSessionSweeper {
 
     private val logger = LogManager.getLogger(AgentSessionSweeper::class.java)
 
+    private const val DEFAULT_INTERVAL_MINUTES = 5L
+    private const val DEFAULT_STALE_MINUTES = 15L
+
     /** Interval between passes; 0 disables the sweeper. */
     private fun intervalMinutes(): Long =
-        System.getenv("AKIBA_AGENT_SWEEP_INTERVAL_MINUTES")
-            ?.trim()?.toLongOrNull()
-            ?: 5L
+        System.getenv("AKIBA_AGENT_SWEEP_INTERVAL_MINUTES")?.trim()?.toLongOrNull()
+            ?: DEFAULT_INTERVAL_MINUTES
 
-    /** How long a session may sit unchanged before it is treated as orphaned. */
+    /** How long a row may sit unchanged before it is treated as orphaned. */
     private fun staleMinutes(): Long =
-        System.getenv("AKIBA_AGENT_SWEEP_STALE_MINUTES")
-            ?.trim()?.toLongOrNull()?.takeIf { it > 0 }
-            ?: 15L
+        System.getenv("AKIBA_AGENT_SWEEP_STALE_MINUTES")?.trim()?.toLongOrNull()
+            ?.takeIf { it > 0 }
+            ?: DEFAULT_STALE_MINUTES
 
-    fun start(daemonHost: String, daemonPort: Int) {
+    fun start(dbConfig: ServerDbConfig) {
         val interval = intervalMinutes()
         if (interval <= 0L) {
             logger.info("AkibaServer: session sweeper disabled (AKIBA_AGENT_SWEEP_INTERVAL_MINUTES=$interval)")
@@ -51,7 +52,7 @@ object AgentSessionSweeper {
             while (true) {
                 try {
                     Thread.sleep(interval * 60_000L)
-                    sweep(daemonHost, daemonPort, stale)
+                    sweep(dbConfig, stale)
                 } catch (e: InterruptedException) {
                     return@thread
                 } catch (e: Exception) {
@@ -61,31 +62,58 @@ object AgentSessionSweeper {
         }
     }
 
-    /**
-     * One pass over every instance someone is signed in to. Instances with no
-     * cached identity are skipped: without credentials there is nothing to
-     * connect with, and the next sign-in registers them.
-     */
-    private fun sweep(daemonHost: String, daemonPort: Int, staleMinutes: Long) {
-        for (instance in DaemonIdentities.instances()) {
+    private fun sweep(dbConfig: ServerDbConfig, staleMinutes: Long) {
+        for (database in instanceDatabases(dbConfig)) {
             try {
-                withDaemonSession(daemonHost, daemonPort, instance, serialize = false) { db ->
-                    val report = AgentSessionReconciler(
-                        agentDbClient = AgentDatabaseClient(db),
-                        reasonTag = "periodic_sweep",
-                        staleMinutes = staleMinutes,
-                    ).reconcile()
-                    if (report.reconciled > 0 || report.failed > 0) {
+                connect(dbConfig, database).use { conn ->
+                    val closed = closeStaleRows(conn, staleMinutes)
+                    if (closed > 0) {
                         logger.info(
-                            "AkibaServer: sweep of '$instance' — scanned={}, reconciled={}, failed={}",
-                            report.scanned, report.reconciled, report.failed,
+                            "AkibaServer: sweep of '{}' closed {} stale session(s)", database, closed,
                         )
                     }
                 }
             } catch (e: Exception) {
-                // Signed out, daemon busy, instance gone: all recoverable, none worth a stack trace.
-                logger.debug("AkibaServer: sweep of '{}' skipped: {}", instance, e.message)
+                // A database dropped between the listing and the connect is not an event.
+                logger.debug("AkibaServer: sweep of '{}' skipped: {}", database, e.message)
             }
         }
     }
+
+    /** Every per-instance database the deployment has; instances are databases, not schemas. */
+    private fun instanceDatabases(dbConfig: ServerDbConfig): List<String> {
+        val sql = "SELECT datname FROM pg_database WHERE datname LIKE 'inst\\_%\\_instance'"
+        return connect(dbConfig, dbConfig.dbName).use { conn ->
+            conn.prepareStatement(sql).use { ps ->
+                ps.executeQuery().use { rs ->
+                    buildList { while (rs.next()) add(rs.getString(1)) }
+                }
+            }
+        }
+    }
+
+    private fun closeStaleRows(conn: Connection, staleMinutes: Long): Int {
+        val sql = """
+            UPDATE agent_sessions
+               SET status = 'closed',
+                   runtime_state = 'closed',
+                   closing_reason = 'reconciled:session_sweep:' ||
+                       COALESCE(NULLIF(runtime_state, ''), status) || ':' || EXTRACT(EPOCH FROM now())::bigint,
+                   updated_at = now()
+             WHERE (runtime_state IN ('running', 'msghandle', 'cancelling')
+                    OR status IN ('running', 'msghandle', 'cancelling'))
+               AND updated_at < now() - (? * INTERVAL '1 minute')
+        """.trimIndent()
+        return conn.prepareStatement(sql).use { ps ->
+            ps.setLong(1, staleMinutes)
+            ps.executeUpdate()
+        }
+    }
+
+    private fun connect(dbConfig: ServerDbConfig, database: String): Connection =
+        DriverManager.getConnection(
+            "jdbc:postgresql://${dbConfig.host}:${dbConfig.port}/$database",
+            dbConfig.user,
+            dbConfig.password,
+        )
 }
