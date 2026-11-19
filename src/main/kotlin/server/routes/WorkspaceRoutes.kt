@@ -35,6 +35,7 @@ private const val MAX_EDIT_BYTES = 4L * 1024 * 1024
  */
 internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
 
+    post("/agent/sessions/{id}/workspace/directory") { call.makeDirectory(daemonHost, daemonPort) }
     get("/agent/sessions/{id}/workspace/tree") { call.tree(daemonHost, daemonPort) }
     get("/agent/sessions/{id}/workspace/file") { call.readFile(daemonHost, daemonPort) }
     put("/agent/sessions/{id}/workspace/file") { call.writeFile(daemonHost, daemonPort) }
@@ -42,6 +43,7 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
     delete("/agent/sessions/{id}/workspace/entry") { call.deleteEntry(daemonHost, daemonPort) }
     get("/agent/sessions/{id}/workspace/download") { call.download(daemonHost, daemonPort) }
 
+    post("/skills/{skillId}/workspace/directory") { call.makeDirectory(daemonHost, daemonPort) }
     get("/skills/{skillId}/workspace/tree") { call.tree(daemonHost, daemonPort) }
     get("/skills/{skillId}/workspace/file") { call.readFile(daemonHost, daemonPort) }
     put("/skills/{skillId}/workspace/file") { call.writeFile(daemonHost, daemonPort) }
@@ -49,6 +51,7 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
     delete("/skills/{skillId}/workspace/entry") { call.deleteEntry(daemonHost, daemonPort) }
     get("/skills/{skillId}/workspace/download") { call.download(daemonHost, daemonPort) }
 
+    post("/projects/{name}/workspace/directory") { call.makeDirectory(daemonHost, daemonPort) }
     get("/projects/{name}/workspace/tree") { call.tree(daemonHost, daemonPort) }
     get("/projects/{name}/workspace/file") { call.readFile(daemonHost, daemonPort) }
     put("/projects/{name}/workspace/file") { call.writeFile(daemonHost, daemonPort) }
@@ -80,6 +83,17 @@ private suspend fun ApplicationCall.tree(daemonHost: String, daemonPort: Int) {
             )
         }
     respond(mapOf("path" to relative(root, target), "entries" to entries))
+}
+
+private suspend fun ApplicationCall.makeDirectory(daemonHost: String, daemonPort: Int) {
+    val root = scopeRoot(daemonHost, daemonPort) ?: return
+    val target = WorkspacePaths.resolveInside(root, request.queryParameters["path"].orEmpty())
+        ?: return respond(HttpStatusCode.BadRequest, mapOf("error" to "Path escapes the workspace"))
+    if (isReservedRootTarget(root, target)) {
+        return respond(HttpStatusCode.BadRequest, mapOf("error" to "'binary' is reserved by Akiba"))
+    }
+    Files.createDirectories(target)
+    respond(mapOf("status" to "ok", "path" to relative(root, target)))
 }
 
 private suspend fun ApplicationCall.readFile(daemonHost: String, daemonPort: Int) {
