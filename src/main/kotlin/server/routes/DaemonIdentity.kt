@@ -59,6 +59,9 @@ object DaemonIdentities {
         instances.forEach { ownerByInstance[it] = username }
     }
 
+    /** Instances someone is currently signed in to; drives the periodic sweep. */
+    fun instances(): Set<String> = ownerByInstance.keys.toSet()
+
     fun forgetInstance(instanceName: String) {
         ownerByInstance.remove(instanceName)
     }

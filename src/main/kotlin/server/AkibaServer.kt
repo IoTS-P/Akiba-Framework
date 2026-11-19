@@ -109,6 +109,12 @@ object AkibaServer {
         // starts; [AgentWatchdog] + [OrphanReaper] catch what this misses.
         runStartupReconciliation(config)
 
+        // The startup pass only sees restarts. A turn killed while the server
+        // keeps running would leave its row "running" and the conversation
+        // spinning, so the same reconciliation repeats on a timer.
+        runCatching { AgentSessionSweeper.start(config.daemonHost, config.daemonPort) }
+            .onFailure { logger.warn("AkibaServer: session sweeper did not start: ${it.message}") }
+
         // Drop project-owner notes left by a process that no longer exists. The
         // Ghidra channel lock dies with that process; the note does not.
         runCatching {
