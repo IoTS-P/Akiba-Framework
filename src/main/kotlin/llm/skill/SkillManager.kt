@@ -274,7 +274,13 @@ object SkillManager {
         throw IllegalArgumentException("Skill zip must contain skill.json, SKILL.md, or instructions.md at root or inside one top-level directory")
     }
 
-    private fun resolveSkillDir(username: String, skillId: String): Path {
+    /**
+     * The directory a skill actually lives in.
+     *
+     * Built-in skills sit under the service user `akiba`, user skills under the user's own root;
+     * this is the one place that decides which, so callers do not have to guess from a name.
+     */
+    fun resolveSkillDir(username: String, skillId: String): Path {
         val id = safeSkillId(skillId)
         val roots = listOf(skillsRootForUser(username), skillsRootForUser("akiba")).distinct()
         for (candidateRoot in roots) {

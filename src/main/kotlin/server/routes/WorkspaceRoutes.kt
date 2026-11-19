@@ -199,10 +199,16 @@ private suspend fun ApplicationCall.scopeRoot(daemonHost: String, daemonPort: In
     val skillId = parameters["skillId"]
     if (skillId != null) {
         // A skill is a directory of documents, so it borrows the same handlers a workspace uses.
-        val root = org.iotsplab.akiba.llm.skill.SkillManager
-            .skillsRootForUser(currentUsernameOrDefault())
-            .resolve(WorkspacePaths.sanitizeSegment(skillId))
-        Files.createDirectories(root)
+        // The resolver knows that built-in skills live under the service user, which is why a
+        // name-based guess showed an empty folder for an installed skill.
+        val root = runCatching {
+            org.iotsplab.akiba.llm.skill.SkillManager
+                .resolveSkillDir(currentUsernameOrDefault(), skillId)
+        }.getOrNull()
+        if (root == null) {
+            respond(HttpStatusCode.NotFound, mapOf("error" to "No such skill"))
+            return null
+        }
         return root
     }
 
