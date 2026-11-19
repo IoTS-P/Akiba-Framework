@@ -152,11 +152,14 @@ class AgentSessionReconciler(
 
         for (s in sessions) {
             scanned++
-            val current = s.runtimeState?.lowercase()
+            // runtime_state is the authority, but the legacy `status` column is
+            // written separately and can keep saying "running" while
+            // runtime_state is empty or idle — a turn killed between the two
+            // writes ends up there, and the status pill spins forever. Either
+            // column saying "running" counts as live.
+            val current = s.runtimeState?.lowercase()?.takeIf { it.isNotBlank() }
+                ?: s.status.lowercase().takeIf { it.isNotBlank() }
             if (current == null || current !in reconcilableStates) continue
-            // Skip the empty-string case too — that's how the
-            // daemon encodes "no value" for legacy rows.
-            if (current.isBlank()) continue
 
             // Ownership proxy: only rows frozen for longer than the
             // staleness window can belong to a dead process.  Rows
