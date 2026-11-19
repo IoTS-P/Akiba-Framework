@@ -42,6 +42,13 @@ internal fun Route.workspaceRoutes(daemonHost: String, daemonPort: Int) {
     delete("/agent/sessions/{id}/workspace/entry") { call.deleteEntry(daemonHost, daemonPort) }
     get("/agent/sessions/{id}/workspace/download") { call.download(daemonHost, daemonPort) }
 
+    get("/skills/{skillId}/workspace/tree") { call.tree(daemonHost, daemonPort) }
+    get("/skills/{skillId}/workspace/file") { call.readFile(daemonHost, daemonPort) }
+    put("/skills/{skillId}/workspace/file") { call.writeFile(daemonHost, daemonPort) }
+    post("/skills/{skillId}/workspace/upload") { call.upload(daemonHost, daemonPort) }
+    delete("/skills/{skillId}/workspace/entry") { call.deleteEntry(daemonHost, daemonPort) }
+    get("/skills/{skillId}/workspace/download") { call.download(daemonHost, daemonPort) }
+
     get("/projects/{name}/workspace/tree") { call.tree(daemonHost, daemonPort) }
     get("/projects/{name}/workspace/file") { call.readFile(daemonHost, daemonPort) }
     put("/projects/{name}/workspace/file") { call.writeFile(daemonHost, daemonPort) }
@@ -189,6 +196,16 @@ private suspend fun ApplicationCall.download(daemonHost: String, daemonPort: Int
  * program it is bound to does. `{name}` means a program: the client names it with `program=`.
  */
 private suspend fun ApplicationCall.scopeRoot(daemonHost: String, daemonPort: Int): Path? {
+    val skillId = parameters["skillId"]
+    if (skillId != null) {
+        // A skill is a directory of documents, so it borrows the same handlers a workspace uses.
+        val root = org.iotsplab.akiba.llm.skill.SkillManager
+            .skillsRootForUser(currentUsernameOrDefault())
+            .resolve(WorkspacePaths.sanitizeSegment(skillId))
+        Files.createDirectories(root)
+        return root
+    }
+
     val sessionId = parameters["id"]
     if (sessionId != null) {
         val instance = requireInstanceHeader() ?: return null
