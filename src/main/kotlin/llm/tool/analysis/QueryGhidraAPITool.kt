@@ -27,6 +27,10 @@ object GhidraDocsManager {
 
     private const val GHIDRA_VERSION = "12.2"
 
+    /** Optional path to a javadoc zip prepared at image build time. */
+    private val BUNDLED_DOCS_ZIP: Path? =
+        System.getenv("AKIBA_GHIDRA_DOCS_ZIP")?.takeIf { it.isNotBlank() }?.let { Path.of(it) }
+
     /** URL of the official Ghidra release zip (pinned, since version cadence is low). */
     private const val GHIDRA_RELEASE_URL =
         "https://github.com/NationalSecurityAgency/ghidra/releases/download/" +
@@ -120,6 +124,16 @@ object GhidraDocsManager {
         return try {
             Files.createDirectories(GHIDRA_DIR)
             Files.createDirectories(DOCS_DIR)
+
+            // A prebuilt javadoc zip ships with the deployment: taking it avoids pulling the
+            // whole Ghidra release (hundreds of megabytes) for one file inside it.
+            val bundled = BUNDLED_DOCS_ZIP
+                ?: Path.of("/home/akiba/akiba_docs/GhidraAPI_javadoc.zip")
+            if (Files.exists(bundled) && isReadableZip(bundled)) {
+                extractZip(bundled, DOCS_DIR, renameTopLevelDir = GHIDRA_API_DIR_NAME)
+                return if (isDocsAvailable()) null else
+                    "Extracted bundled API docs but '${resolveDocsRoot().resolve("type-search-index.js")}' is still missing."
+            }
 
             val releaseRoot = GHIDRA_DIR.resolve(RELEASE_TOP_DIR)
             if (!releaseRoot.exists()) {
