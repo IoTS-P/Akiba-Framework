@@ -640,7 +640,7 @@ private fun WriteWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
                 "mode" to "edit",
                 "replacements" to if (replaceAll) occurrences else 1,
                 "message" to "Local edit applied successfully."
-            ))
+            ).withDiff(current, updated))
         } catch (e: Exception) {
             wsMapper.writeValueAsString(mapOf(
                 "success" to false,
@@ -671,6 +671,12 @@ private fun WriteWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
             Files.createDirectories(parentDir)
         }
 
+        // Read before writing: the diff has to describe the change, and after the
+        // write the previous text is gone.
+        val previous = if (Files.exists(resolvedPath)) {
+            runCatching { Files.readString(resolvedPath) }.getOrNull()
+        } else null
+
         if (append) {
             Files.writeString(resolvedPath, content, java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND)
         } else {
@@ -685,7 +691,7 @@ private fun WriteWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
             "appended" to append,
             "mode" to if (append) "append" else "write",
             "message" to "File ${if (append) "appended" else "written"} successfully."
-        ))
+        ).withDiff(previous, if (append) (previous ?: "") + content else content))
     } catch (e: Exception) {
         wsMapper.writeValueAsString(mapOf(
             "success" to false,
@@ -693,6 +699,24 @@ private fun WriteWorkspaceFileTool(parent: AkibaModule): Tool = Tool(
             "path" to pathStr
         ))
     }
+}
+
+/**
+ * Attach the diff to the tool result.
+ *
+ * It belongs in the result, not in the browser: the result is what the
+ * transcript stores, so the numbers survive a reload and a new machine.
+ */
+private fun Map<String, Any?>.withDiff(oldText: String?, newText: String): Map<String, Any?> {
+    val diff = FileDiff.compute(oldText, newText)
+    return this + mapOf(
+        "diff" to diff.rows.map {
+            mapOf("k" to it.kind, "t" to it.text, "o" to it.oldLine, "n" to it.newLine)
+        },
+        "diffAdded" to diff.added,
+        "diffRemoved" to diff.removed,
+        "diffTruncated" to diff.truncated,
+    )
 }
 
 // ============================================================
