@@ -12,6 +12,7 @@ import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import org.iotsplab.akiba.utils.GlobalConfig
 import java.util.UUID
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -318,6 +319,80 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
             logger.error("File list failed: {}", e.message, e)
             val (status, body) = errorPayload(e)
             call.respond(status, body)
+        }
+    }
+
+    // ------ Every table that holds a row for this binary --------------------
+    get("/files/{id}/records") {
+        val instance = call.parameters["instanceName"] ?: call.instanceHeader()
+            ?: run {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance selection"))
+                return@get
+            }
+        if (!call.requireInstanceOwnership(instance)) return@get
+        val id = call.parameters["id"]?.toLongOrNull()
+            ?: run {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid file id"))
+                return@get
+            }
+        try {
+            val records = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                dbClient.getBinaryRecords(id)
+            }
+            val editing = GlobalConfig.load().editing
+            call.respond(mapOf(
+                "records" to records,
+                "canEdit" to editing.userCanEditRecords,
+            ))
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    // ------ One column of one row ------------------------------------------
+    //
+    // The single write path for a record. The daemon checks that the table and
+    // column exist and refuses the ones that carry identity or provenance; the
+    // switch here is deployment-wide, so a read-only installation has no way in.
+    patch("/records/{table}/{id}") {
+        val instance = call.parameters["instanceName"] ?: call.instanceHeader()
+            ?: run {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance selection"))
+                return@patch
+            }
+        if (!call.requireInstanceOwnership(instance)) return@patch
+        if (!GlobalConfig.load().editing.userCanEditRecords) {
+            call.respond(HttpStatusCode.Forbidden, mapOf(
+                "error" to "Editing records is disabled on this deployment."))
+            return@patch
+        }
+        val table = call.parameters["table"].orEmpty()
+        val id = call.parameters["id"]?.toLongOrNull()
+        if (table.isBlank() || id == null) {
+            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid table or row id"))
+            return@patch
+        }
+        val body = runCatching { call.receive<Map<String, String?>>() }.getOrNull()
+            ?: run {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Expected a JSON object"))
+                return@patch
+            }
+        val column = body["column"]
+        val value = body["value"]
+        if (column.isNullOrBlank() || value == null) {
+            call.respond(HttpStatusCode.BadRequest, mapOf(
+                "error" to "Send {column, value}"))
+            return@patch
+        }
+        try {
+            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                dbClient.updateRecord(table, id, column, value)
+            }
+            call.respond(mapOf("table" to table, "id" to id, "column" to column, "updated" to true))
+        } catch (e: Exception) {
+            val (status, body2) = errorPayload(e)
+            call.respond(status, body2)
         }
     }
 

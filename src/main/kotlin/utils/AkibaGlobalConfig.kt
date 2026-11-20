@@ -20,6 +20,22 @@ import org.apache.logging.log4j.LogManager
 data class AkibaGlobalConfig(
     val projectLock: ProjectLockSettings = ProjectLockSettings(),
     val agent: AgentSettings = AgentSettings(),
+    val editing: EditingSettings = EditingSettings(),
+)
+
+/**
+ * Who may change a stored record.
+ *
+ * The importer guesses, and the guess is sometimes wrong — so editing has to exist. It
+ * also has to be switchable off: a deployment that only reads data should not carry a
+ * write path at all, and an operator may want the agent hands-off while people still fix
+ * their own rows.
+ */
+data class EditingSettings(
+    /** Whether a person may edit a record from the interface. */
+    val userCanEditRecords: Boolean = true,
+    /** Whether the agent's tools may write to the record tables. */
+    val agentCanEditRecords: Boolean = true,
 )
 
 /**

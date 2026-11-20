@@ -261,6 +261,37 @@ class DatabaseClient(
     }
 
     /**
+     * Every row that belongs to one binary, table by table.
+     *
+     * The binary row alone is a fragment of the record: sessions and executions point at
+     * the same id, and a module may have written its own table for it.
+     */
+    @Throws(DatabaseDaemonException::class)
+    @Suppress("UNCHECKED_CAST")
+    fun getBinaryRecords(id: Long): Map<String, Any?> = runBlocking {
+        val response = post("/get/binary-records", mapOf("id" to id)).let {
+            if (it.first == HttpStatusCode.OK) it.second
+            else throw failure(it.first, it.second)
+        }
+        AkibaJson.mapper.readValue(response, Map::class.java) as Map<String, Any?>
+    }
+
+    /**
+     * Change one column of one row.
+     *
+     * The daemon decides whether the table and column exist and whether they may be
+     * written; this call only carries the request.
+     */
+    @Throws(DatabaseDaemonException::class)
+    fun updateRecord(table: String, id: Long, column: String, value: String) = runBlocking {
+        val body = mapOf("table" to table, "id" to id, "column" to column, "value" to value)
+        post("/set/record", body).let {
+            if (it.first == HttpStatusCode.OK) it.second
+            else throw failure(it.first, it.second)
+        }
+    }
+
+    /**
      * Correct the recorded metadata of a binary.
      *
      * A binary imported without a recognised format comes in as `arch = "n/a"`, and the
