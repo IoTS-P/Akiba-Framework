@@ -12,6 +12,8 @@ import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import org.iotsplab.akiba.server.db.RecordsRepository
+import org.iotsplab.akiba.server.db.ServerDatabase
 import org.iotsplab.akiba.utils.GlobalConfig
 import java.util.UUID
 import kotlinx.coroutines.*
@@ -336,9 +338,7 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
                 return@get
             }
         try {
-            val records = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                dbClient.getBinaryRecords(id)
-            }
+            val records = RecordsRepository(ServerDatabase.config).read(instance, id)
             val editing = GlobalConfig.load().editing
             call.respond(mapOf(
                 "records" to records,
@@ -386,9 +386,7 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
             return@patch
         }
         try {
-            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                dbClient.updateRecord(table, id, column, value)
-            }
+            RecordsRepository(ServerDatabase.config).write(instance, table, id, column, value)
             call.respond(mapOf("table" to table, "id" to id, "column" to column, "updated" to true))
         } catch (e: Exception) {
             val (status, body2) = errorPayload(e)
@@ -415,10 +413,19 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
                 return@get
             }
         try {
-            val meta = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                dbClient.getMetadata(id)
+            val records = RecordsRepository(ServerDatabase.config).read(instance, id)
+            val binaries = (records["tables"] as? List<*>)
+                ?.filterIsInstance<Map<*, *>>()
+                ?.firstOrNull { it["name"] == "binaries" }
+            val row = (binaries?.get("rows") as? List<*>)
+                ?.filterIsInstance<Map<*, *>>()
+                ?.firstOrNull()
+                ?.get("values") as? Map<*, *>
+            if (row == null) {
+                call.respond(HttpStatusCode.NotFound, mapOf("error" to "No binary with id $id"))
+                return@get
             }
-            call.respond(meta)
+            call.respond(row)
         } catch (e: Exception) {
             val (status, body) = errorPayload(e)
             call.respond(status, body)
@@ -456,13 +463,19 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
             return@patch
         }
         try {
-            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                dbClient.updateBinaryMetadata(id, arch, format, compilerSpec)
-            }
-            val meta = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
-                dbClient.getMetadata(id)
-            }
-            call.respond(meta)
+            val repository = RecordsRepository(ServerDatabase.config)
+            arch?.let { repository.write(instance, "binaries", id, "arch", it) }
+            format?.let { repository.write(instance, "binaries", id, "format", it) }
+            compilerSpec?.let { repository.write(instance, "binaries", id, "compiler_spec", it) }
+            val records = repository.read(instance, id)
+            val binaries = (records["tables"] as? List<*>)
+                ?.filterIsInstance<Map<*, *>>()
+                ?.firstOrNull { it["name"] == "binaries" }
+            val row = (binaries?.get("rows") as? List<*>)
+                ?.filterIsInstance<Map<*, *>>()
+                ?.firstOrNull()
+                ?.get("values") as? Map<*, *>
+            call.respond(row ?: emptyMap<String, Any?>())
         } catch (e: Exception) {
             val (status, body) = errorPayload(e)
             call.respond(status, body)

@@ -269,11 +269,17 @@ class DatabaseClient(
     @Throws(DatabaseDaemonException::class)
     @Suppress("UNCHECKED_CAST")
     fun getBinaryRecords(id: Long): Map<String, Any?> = runBlocking {
-        val response = post("/get/binary-records", mapOf("id" to id)).let {
-            if (it.first == HttpStatusCode.OK) it.second
-            else throw failure(it.first, it.second)
+        val (status, body) = post("/get/binary-records", mapOf("id" to id))
+        if (status != HttpStatusCode.OK) throw failure(status, body)
+        // An empty body is not a record with no tables — it means the daemon answered
+        // without content, and parsing it blindly throws away the reason.
+        if (body.isBlank()) {
+            org.apache.logging.log4j.LogManager.getLogger("DatabaseClient").warn(
+                "getBinaryRecords({}): the daemon returned {} with an empty body", id, status
+            )
+            return@runBlocking emptyMap<String, Any?>()
         }
-        AkibaJson.mapper.readValue(response, Map::class.java) as Map<String, Any?>
+        AkibaJson.mapper.readValue(body, Map::class.java) as Map<String, Any?>
     }
 
     /**
