@@ -23,8 +23,19 @@ class RecordsRepository(private val config: ServerDbConfig) {
     /** Identity, size and provenance: shown, never rewritten. */
     private val protectedBinaries = setOf("id", "size", "checksum", "original_path")
 
+    /**
+     * The instance name is what the request carries (`test_instance`), and its database
+     * is the prefix plus that name. A caller that already passes the full database name
+     * is accepted too — being wrong about which of the two it has is how the first
+     * version asked for `inst_test_instance_instance`.
+     */
+    private fun databaseName(instance: String): String = when {
+        instance.startsWith("inst_") -> instance
+        else -> "inst_$instance"
+    }
+
     private fun connect(instance: String): Connection = DriverManager.getConnection(
-        "jdbc:postgresql://${config.host}:${config.port}/inst_${instance}_instance",
+        "jdbc:postgresql://${config.host}:${config.port}/${databaseName(instance)}",
         config.user,
         config.password,
     )
@@ -75,22 +86,30 @@ class RecordsRepository(private val config: ServerDbConfig) {
 
         connect(instance).use { conn ->
             val type = conn.prepareStatement(
-                "SELECT data_type FROM information_schema.columns " +
+                "SELECT data_type, udt_name FROM information_schema.columns " +
                     "WHERE table_schema = 'public' AND table_name = ? AND column_name = ?"
             ).use { stmt ->
                 stmt.setString(1, table)
                 stmt.setString(2, column)
-                stmt.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else null }
+                stmt.executeQuery().use { rs ->
+                    if (!rs.next()) null else {
+                        val declared = rs.getString(1)
+                        val udt = rs.getString(2)
+                        // An array reports its type as "ARRAY"; the cast has to name the
+                        // element type, and the catalogue spells it "_text" for text[].
+                        if (declared.equals("ARRAY", ignoreCase = true)) {
+                            udt.removePrefix("_") + "[]"
+                        } else {
+                            declared
+                        }
+                    }
+                }
             } ?: throw IllegalArgumentException("No column '$column' in '$table'")
 
-            // The column's own type validates the text: a bad timestamp fails here, with
-            // the database's wording, instead of being accepted and breaking later.
-            val numeric = type.contains("int") || type.contains("numeric") ||
-                type.contains("double") || type.contains("real")
-            val sql = if (numeric)
-                "UPDATE $table SET $column = CAST(? AS $type) WHERE id = ?"
-            else
-                "UPDATE $table SET $column = ? WHERE id = ?"
+            // Every value is cast to the column's own type: that is what validates a
+            // timestamp, an array literal or jsonb, and the error comes back in the
+            // database's words instead of being accepted and breaking later.
+            val sql = "UPDATE $table SET $column = CAST(? AS $type) WHERE id = ?"
 
             val updated = conn.prepareStatement(sql).use { stmt ->
                 stmt.setString(1, value)
