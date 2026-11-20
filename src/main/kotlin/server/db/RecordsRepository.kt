@@ -111,13 +111,38 @@ class RecordsRepository(private val config: ServerDbConfig) {
             // database's words instead of being accepted and breaking later.
             val sql = "UPDATE $table SET $column = CAST(? AS $type) WHERE id = ?"
 
-            val updated = conn.prepareStatement(sql).use { stmt ->
-                stmt.setString(1, value)
-                stmt.setLong(2, id)
-                stmt.executeUpdate()
+            val updated = try {
+                conn.prepareStatement(sql).use { stmt ->
+                    stmt.setString(1, value)
+                    stmt.setLong(2, id)
+                    stmt.executeUpdate()
+                }
+            } catch (e: java.sql.SQLException) {
+                // The database's own words, then what it would have accepted: "invalid
+                // input syntax for type date" without an example leaves the reader
+                // guessing which of the several date spellings this column takes.
+                val hint = hintFor(type)
+                val message = e.message?.lineSequence()?.firstOrNull().orEmpty()
+                throw IllegalArgumentException(if (hint.isEmpty()) message else "$message — $hint")
             }
             if (updated == 0) throw IllegalArgumentException("No row $id in '$table'")
         }
+    }
+
+    /** What this column type accepts, in the same order a person would try it. */
+    private fun hintFor(type: String): String = when {
+        type.contains("timestamp") ->
+            "expected ISO 8601 with an offset, e.g. 2026-11-19T12:00:00+08:00"
+        type == "date" -> "expected YYYY-MM-DD, e.g. 2026-11-19"
+        type.startsWith("time") -> "expected HH:MM:SS, e.g. 12:00:00"
+        type.contains("uuid") -> "expected 8-4-4-4-12 hex, e.g. 8c519a5b-1604-48f5-aad7-49aef6c3bec7"
+        type.equals("ARRAY", ignoreCase = true) || type.endsWith("[]") ->
+            "expected a PostgreSQL array literal, e.g. {alpha,beta}"
+        type.contains("json") -> "expected JSON text, e.g. {\"k\": \"v\"}"
+        type.contains("bool") -> "expected true or false"
+        type.contains("int") || type.contains("numeric") ||
+            type.contains("double") || type.contains("real") -> "expected a number"
+        else -> ""
     }
 
     private fun candidateTables(conn: Connection): List<String> {
@@ -152,10 +177,20 @@ class RecordsRepository(private val config: ServerDbConfig) {
         return columns
     }
 
-    /** Long cells are cut before they reach the browser; their real length rides along. */
+    /**
+     * Turns a column value into something the browser can read.
+     *
+     * The driver does not hand back plain values for every type: `jsonb` arrives as a
+     * `PGobject` and an array as a `java.sql.Array`, and neither survives JSON
+     * serialisation — which is exactly what a table with those columns looked like when
+     * it silently failed to appear.
+     */
     private fun display(value: Any?): Any? = when (value) {
         null -> null
         is ByteArray -> "<${value.size} bytes>"
+        is java.sql.Array -> runCatching { (value.array as Array<*>).joinToString(",", "{", "}") }
+            .getOrElse { value.toString() }
+        is org.postgresql.util.PGobject -> value.value
         is String -> if (value.length > MAX_TEXT) value.take(MAX_TEXT) else value
         else -> value
     }
