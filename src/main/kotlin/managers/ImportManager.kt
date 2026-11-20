@@ -281,9 +281,7 @@ object ImportManager {
         val id = db.insertBinary(
             DatabaseClient.InsertData(
                 originalPath = originalPath.absolutePathString(),
-                processedPath = null,
                 checksum = originalChecksum,
-                processedChecksum = null,
                 size = originalPath.fileSize(),
                 processedSize = -1,
                 arch = dataLanguage.languageID.toString(),

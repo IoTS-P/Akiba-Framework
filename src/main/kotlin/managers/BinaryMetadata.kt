@@ -14,13 +14,11 @@ import kotlinx.serialization.Serializable
 data class BinaryMetadata(
     val id: Int,
     val originalPath: String,
-    val processedPath: String? = null,
     val arch: String? = null,           // Binary arch (x86, ARM, MIPS, ...)
     val format: String? = null,         // Binary format (ELF, Microcode, PE, ...)
     val compilerSpec: String? = null,   // Compiler spec (Visual Studio, eabi, ...)
     val size: Long? = null,             // File size in bytes, as recorded at import
     val checksum: String,               // File checksum
-    val processedChecksum: String? = null
 ) {
     /** True when this describes a program that was never written to the binaries table. */
     val isRegistered: Boolean
@@ -41,12 +39,10 @@ data class BinaryMetadata(
             id = row?.id ?: NOT_REGISTERED,
             originalPath = row?.originalPath ?: runCatching { program.domainFile?.pathname }
                 .getOrNull() ?: program.name,
-            processedPath = row?.processedPath,
             arch = row?.arch ?: runCatching { program.languageID.toString() }.getOrNull(),
             format = row?.format ?: runCatching { program.executableFormat }.getOrNull(),
             compilerSpec = row?.compilerSpec ?: runCatching { program.compiler }.getOrNull(),
             checksum = row?.checksum ?: "",
-            processedChecksum = row?.processedChecksum,
         )
     }
 }

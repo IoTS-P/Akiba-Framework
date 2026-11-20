@@ -422,9 +422,9 @@ class DatabaseClient(
 
     data class InsertData(
         val originalPath: String,
-        val processedPath: String? = null,
+
         val checksum: String,
-        val processedChecksum: String? = null,
+
         val size: Long,
         val processedSize: Long = -1,
         /**
