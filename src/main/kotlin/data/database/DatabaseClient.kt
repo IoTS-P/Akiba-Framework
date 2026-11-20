@@ -261,6 +261,33 @@ class DatabaseClient(
     }
 
     /**
+     * Correct the recorded metadata of a binary.
+     *
+     * A binary imported without a recognised format comes in as `arch = "n/a"`, and the
+     * loader then cannot choose a language. Fixing that row is a normal operation for an
+     * analyst; it is kept to the three columns the importer guesses.
+     */
+    @Throws(DatabaseDaemonException::class)
+    fun updateBinaryMetadata(
+        id: Long,
+        arch: String? = null,
+        format: String? = null,
+        compilerSpec: String? = null,
+    ) = runBlocking {
+        val body = buildMap<String, Any> {
+            put("id", id)
+            arch?.let { put("arch", it) }
+            format?.let { put("format", it) }
+            compilerSpec?.let { put("compilerSpec", it) }
+        }
+        val response = post("/set/binary-metadata", body).let {
+            if (it.first == HttpStatusCode.OK) it.second
+            else throw failure(it.first, it.second)
+        }
+        check(response.isNotBlank()) { "the daemon returned no confirmation" }
+    }
+
+    /**
      * Search binaries by name, id, architecture, format, or checksum.
      *
      * @param query Free-text search term; matches against original_path, arch, and format.

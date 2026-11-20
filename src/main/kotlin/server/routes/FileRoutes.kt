@@ -321,6 +321,79 @@ fun Route.fileRoutes(daemonHost: String, daemonPort: Int) {
         }
     }
 
+    // ------ One file, and its editable metadata ----------------------------
+    //
+    // The list used to show a file's name and nothing else, although the row
+    // carries the architecture the loader will use. Correcting that value is a
+    // normal analyst task when the importer guessed wrong; the write is narrow on
+    // purpose — three columns, whitelisted, bound as parameters.
+    get("/files/{id}") {
+        val instance = call.parameters["instanceName"] ?: call.instanceHeader()
+            ?: run {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance selection"))
+                return@get
+            }
+        if (!call.requireInstanceOwnership(instance)) return@get
+        val id = call.parameters["id"]?.toLongOrNull()
+            ?: run {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid file id"))
+                return@get
+            }
+        try {
+            val meta = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                dbClient.getMetadata(id)
+            }
+            call.respond(meta)
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
+    patch("/files/{id}") {
+        val instance = call.parameters["instanceName"] ?: call.instanceHeader()
+            ?: run {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance selection"))
+                return@patch
+            }
+        if (!call.requireInstanceOwnership(instance)) return@patch
+        val id = call.parameters["id"]?.toLongOrNull()
+            ?: run {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Invalid file id"))
+                return@patch
+            }
+        val body = runCatching { call.receive<Map<String, String?>>() }.getOrNull()
+            ?: run {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Expected a JSON object"))
+                return@patch
+            }
+        val arch = body["arch"]
+        val format = body["format"]
+        val compilerSpec = body["compilerSpec"]
+        if (arch == null && format == null && compilerSpec == null) {
+            call.respond(HttpStatusCode.BadRequest, mapOf(
+                "error" to "Nothing to update: send arch, format or compilerSpec"))
+            return@patch
+        }
+        if (listOfNotNull(arch, format, compilerSpec).any { it.isBlank() }) {
+            call.respond(HttpStatusCode.BadRequest, mapOf(
+                "error" to "A value cannot be blank: send null to leave a field alone"))
+            return@patch
+        }
+        try {
+            withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                dbClient.updateBinaryMetadata(id, arch, format, compilerSpec)
+            }
+            val meta = withDaemonSession(daemonHost, daemonPort, instance) { dbClient ->
+                dbClient.getMetadata(id)
+            }
+            call.respond(meta)
+        } catch (e: Exception) {
+            val (status, body) = errorPayload(e)
+            call.respond(status, body)
+        }
+    }
+
     // ------ Delete files ---------------------------------------------------
     delete("/files") {
         val instance = call.parameters["instanceName"]
